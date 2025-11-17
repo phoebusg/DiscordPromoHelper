@@ -837,7 +837,10 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                             max_scrolls: int = 12, scroll_amount: int = 300, duplicate_thresh: int = 4000,
                             wait_for_focus: bool = False,
                             wait_timeout_seconds: int = 30,
-                            allow_fullscreen_fallback: bool = False):
+                            allow_fullscreen_fallback: bool = False,
+                            start_from_top: bool = False,
+                            top_skip_px: int = 48,
+                            bottom_skip_px: int = 64):
     """Scan Discord's server list, capture each server icon and hover to read its name.
 
     Saves PNGs into `save_dir/images` and metadata into `save_dir/servers.json`.
@@ -947,8 +950,8 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
     col_w = max(40, int(width * 0.06))
     col_box = (left, top, left + col_w, top + height)
 
-    # scrolling capture loop: scroll to top first to ensure consistent start
-    if _HAS_PYAUTOGUI and pyautogui:
+    # scrolling capture loop: optionally scroll to top first to ensure consistent start
+    if start_from_top and _HAS_PYAUTOGUI and pyautogui:
         try:
             # move to column center and scroll up gently to reach the top
             pyautogui.moveTo(left + (col_w // 2), top + 60, duration=0.25)
@@ -982,10 +985,12 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
     except Exception:
         ImageChops = None
 
-    while scrolls < max_scrolls and consecutive_no_new < 3:
-        added_in_pass = False
-        col_img = ImageGrab.grab(bbox=col_box)
-        gray = col_img.convert('L')
+    # nested helper to scan the current viewport and process icon regions
+    def _scan_viewport():
+        nonlocal server_list, seen_thumbs
+        added = False
+        col_img_local = ImageGrab.grab(bbox=col_box)
+        gray = col_img_local.convert('L')
         w, h = gray.size
         arr = list(gray.getdata())
 
@@ -1015,67 +1020,41 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
         if in_region:
             regions.append((start, h))
 
-        # If no regions detected, try a more permissive threshold and/or sliding-window fallback
         if not regions:
-            alt_thresh = max(6, int(maxp * 0.06))
-            if alt_thresh < thresh:
-                in_region = False
-                start = 0
-                for y, v in enumerate(proj):
-                    if v >= alt_thresh and not in_region:
-                        in_region = True
-                        start = y
-                    elif v < alt_thresh and in_region:
-                        end = y
-                        regions.append((start, end))
-                        in_region = False
-                if in_region:
-                    regions.append((start, h))
-
-        # If still no regions, fall back to sliding-window candidates down the column
-        sliding_candidates = []
-        if not regions:
+            # sliding window fallback
             win_h = 48
             step = max(24, int(win_h * 0.6))
-            for y0 in range(0, max(1, h - win_h + 1), step):
-                sliding_candidates.append((y0, y0 + win_h))
-            # convert sliding candidates into 'merged'-like list for processing
-            merged = sliding_candidates
-        else:
-            # merge close regions
-            merged = []
-            for r in regions:
-                if not merged:
-                    merged.append(r)
-                    continue
-                prev = merged[-1]
-                if r[0] - prev[1] <= merge_gap:
-                    merged[-1] = (prev[0], r[1])
-                else:
-                    merged.append(r)
-        # debug info
-        try:
-            print(f"[capture] col_img size={w}x{h}, regions={len(regions)}, merged_candidates={len(merged)}")
-        except Exception:
-            pass
-        for i, (s, e) in enumerate(merged):
+            regions = [(y0, y0 + win_h) for y0 in range(0, max(1, h - win_h + 1), step)]
+
+        # merge regions
+        merged_local = []
+        for r in regions:
+            if not merged_local:
+                merged_local.append(r)
+                continue
+            prev = merged_local[-1]
+            if r[0] - prev[1] <= merge_gap:
+                merged_local[-1] = (prev[0], r[1])
+            else:
+                merged_local.append(r)
+
+        for (s, e) in merged_local:
             pad_v = min(28, int((e - s) * 0.35) + 8)
             top_y = max(0, s - pad_v)
             bot_y = min(h, e + pad_v)
-            crop = col_img.crop((0, top_y, w, bot_y))
+            crop = col_img_local.crop((0, top_y, w, bot_y))
 
-            # create a small thumbnail for dedup comparison
             try:
                 thumb = crop.convert('L').resize((32, 32), resample=Image.BILINEAR)
             except Exception:
                 thumb = None
 
+            # dedup by thumb
             is_dup = False
             matched_icon_path = None
             if thumb is not None and ImageChops is not None:
                 for existing_thumb, existing_icon_path in seen_thumbs:
                     try:
-                        # compare resized thumbnails
                         d = ImageChops.difference(thumb, existing_thumb)
                         if hasattr(d, 'histogram'):
                             hist = d.histogram()
@@ -1089,14 +1068,18 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                     except Exception:
                         continue
 
+            center_x = left + (col_w // 2)
+            center_y = top + top_y + ((bot_y - top_y) // 2)
+            if center_y - top <= top_skip_px:
+                continue
+            if (top + height - center_y) <= bottom_skip_px:
+                continue
+
             if is_dup:
-                # Update existing server_list entry with pos and name if found
                 try:
                     if matched_icon_path:
                         for s in server_list:
                             if s.get('icon') == matched_icon_path:
-                                if name and (not s.get('name')):
-                                    s['name'] = name
                                 if s.get('pos') is None:
                                     s['pos'] = (center_x, center_y)
                                 break
@@ -1104,25 +1087,18 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                     pass
                 continue
 
-            # compute center screen position for hovering relative to window
-            center_x = left + (col_w // 2)
-            center_y = top + top_y + ((bot_y - top_y) // 2)
-
-            # hover to reveal tooltip and OCR name
+            # Hover and OCR
             name = ""
             try:
                 if _HAS_PYAUTOGUI and pyautogui:
                     pyautogui.moveTo(center_x, center_y, duration=0.28)
-                    # give tooltip a bit more time to render
                     time.sleep(max(hover_delay, 0.9))
-                    # Try multiple candidate tooltip boxes to accommodate different displays/themes
-                    tip_text = ""
                     candidate_boxes = [
                         (center_x + 24, center_y - 40, center_x + 260, center_y + 40),
                         (center_x - 120, center_y - 60, center_x + 120, center_y - 10),
                         (center_x + 10, center_y - 40, center_x + 220, center_y + 10),
                     ]
-                    tip_img = None
+                    tip_text = ""
                     for tb in candidate_boxes:
                         try:
                             tip_img = ImageGrab.grab(bbox=tb)
@@ -1136,7 +1112,6 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                             if cand and len(cand.strip()) > 1:
                                 tip_text = cand
                                 break
-                        # conservative nudge to trigger dynamic tooltips
                         try:
                             pyautogui.moveRel(0, 4, duration=0.12)
                             time.sleep(0.12)
@@ -1148,46 +1123,24 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
             except Exception:
                 name = ""
 
-            # save unique icon image
             idx = len(list(imgs.glob('server_*.png')))
             icon_path = imgs / f"server_{idx}.png"
             try:
                 crop.save(icon_path)
             except Exception:
                 continue
-
             if thumb is not None:
-                seen_thumbs.append(thumb)
+                seen_thumbs.append((thumb, str(icon_path)))
+            server_list.append({"name": name, "icon": str(icon_path), "pos": (center_x, center_y)})
+            added = True
+        return added
 
-            server_list.append({
-                "name": name,
-                "icon": str(icon_path),
-                "pos": (center_x, center_y)
-            })
-            added_in_pass = True
-            # dedupe by position (near-equal coordinates) and merge if position matches
-            try:
-                def _near(a, b, tol=6):
-                    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
-                merged = False
-                for s in server_list:
-                    if 'pos' in s and _near((center_x, center_y), tuple(s['pos'])):
-                        # update existing entry with better name/icon if available
-                        if name and (not s.get('name')):
-                            s['name'] = name
-                        if icon_path and not s.get('icon'):
-                            s['icon'] = str(icon_path)
-                        merged = True
-                        break
-                if merged:
-                    # discard newly captured duplicate
-                    server_list.pop()
-                    added_in_pass = False
-                else:
-                    if thumb is not None:
-                        seen_thumbs.append(thumb)
-            except Exception:
-                pass
+    while scrolls < max_scrolls and consecutive_no_new < 3:
+        added_in_pass = False
+        try:
+            added_in_pass = _scan_viewport()
+        except Exception:
+            added_in_pass = False
 
         # scroll down to reveal more servers
         scrolls += 1
@@ -1201,6 +1154,37 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                 pyautogui.moveTo(left + (col_w // 2), top + height - 40, duration=0.15)
                 pyautogui.scroll(-scroll_amount)
                 time.sleep(0.32)
+            except Exception:
+                break
+
+    # After scanning downwards, attempt to return upward and sweep for servers above the initial viewport
+    if _HAS_PYAUTOGUI and pyautogui:
+        try:
+            for _ in range(4):
+                pyautogui.moveTo(left + (col_w // 2), top + 80, duration=0.15)
+                pyautogui.scroll(scroll_amount)
+                time.sleep(0.18)
+        except Exception:
+            pass
+
+    # Sweep upwards to find servers above initial view
+    up_scrolls = 0
+    consecutive_no_new_up = 0
+    while up_scrolls < max_scrolls and consecutive_no_new_up < 3:
+        try:
+            added_up = _scan_viewport()
+        except Exception:
+            added_up = False
+        if added_up:
+            consecutive_no_new_up = 0
+        else:
+            consecutive_no_new_up += 1
+        up_scrolls += 1
+        if _HAS_PYAUTOGUI and pyautogui:
+            try:
+                pyautogui.moveTo(left + (col_w // 2), top + 80, duration=0.15)
+                pyautogui.scroll(scroll_amount)
+                time.sleep(0.28)
             except Exception:
                 break
 
