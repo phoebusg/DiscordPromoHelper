@@ -1,1 +1,35 @@
 discord_automation_env/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and temp
+*.log
+tmp/
+temp/
+
+# Generated/discovered server assets (icons/screenshots)
+data/servers/images/
+data/servers/*.png
+
+# Test artifacts and coverage
+.pytest_cache/
+coverage/
+htmlcov/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
