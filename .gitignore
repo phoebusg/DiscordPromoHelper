@@ -23,6 +23,7 @@ temp/
 # Generated/discovered server assets (icons/screenshots)
 data/servers/images/
 data/servers/*.png
+data/servers/servers.json
 
 # Test artifacts and coverage
 .pytest_cache/
