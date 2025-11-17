@@ -23,6 +23,8 @@ temp/
 # Generated/discovered server assets (icons/screenshots)
 data/servers/images/
 data/servers/*.png
+# Local runtime data (don't commit server icons or state)
+data/
 
 # Test artifacts and coverage
 .pytest_cache/

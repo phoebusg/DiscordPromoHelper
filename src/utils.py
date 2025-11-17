@@ -833,6 +833,55 @@ def normalize_ocr_name(s: str) -> str:
     return s
 
 
+def ocr_image_to_text(img):
+    """Return the best-effort OCR text from an image using multiple pre-processing steps."""
+    if img is None or not _HAS_PYTESSERACT or not pytesseract:
+        return ""
+    try:
+        # Try direct OCR first
+        txt = pytesseract.image_to_string(img, config='--psm 7')
+        if txt and txt.strip():
+            return txt.strip()
+    except Exception:
+        txt = ""
+    try:
+        # Convert to grayscale, resize, and increase contrast
+        tmp = img.convert('L')
+        w, h = tmp.size
+        tmp = tmp.resize((max(32, w * 3), max(32, h * 3)), resample=Image.BILINEAR)
+        try:
+            from PIL import ImageEnhance, ImageOps
+            enhancer = ImageEnhance.Contrast(tmp)
+            tmp = enhancer.enhance(1.8)
+            # Try auto-contrast as well
+            ac = ImageOps.autocontrast(tmp)
+        except Exception:
+            ac = tmp
+        # try different psm settings for robustness
+        for cfg in ('--psm 7', '--psm 6'):
+            try:
+                txt2 = pytesseract.image_to_string(ac, config=cfg)
+                if txt2 and txt2.strip():
+                    return txt2.strip()
+            except Exception:
+                pass
+        # If still nothing, try an inverted variant
+        try:
+            inv = ImageOps.invert(ac)
+            for cfg in ('--psm 7', '--psm 6'):
+                try:
+                    txt3 = pytesseract.image_to_string(inv, config=cfg)
+                    if txt3 and txt3.strip():
+                        return txt3.strip()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return ""
+
+
 def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float = 0.6, merge_gap: int = 8,
                             max_scrolls: int = 12, scroll_amount: int = 300, duplicate_thresh: int = 4000,
                             wait_for_focus: bool = False,
@@ -970,13 +1019,7 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                 server_list = json.load(fh)
     except Exception:
         server_list = []
-    # If servers.json did not exist, and we have captured icons, populate server_list with placeholders
-    if not server_list:
-        try:
-            for pth in sorted(imgs.glob('server_*.png')):
-                server_list.append({'name': '', 'icon': str(pth), 'pos': None})
-        except Exception:
-            pass
+    # Do not prepopulate server_list from existing images; only use servers.json if present.
     scrolls = 0
     added_in_pass = True
     consecutive_no_new = 0
@@ -1094,8 +1137,10 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                     pyautogui.moveTo(center_x, center_y, duration=0.28)
                     time.sleep(max(hover_delay, 0.9))
                     candidate_boxes = [
-                        (center_x + 24, center_y - 40, center_x + 260, center_y + 40),
-                        (center_x - 120, center_y - 60, center_x + 120, center_y - 10),
+                        (center_x + 15, center_y - 30, center_x + 200, center_y + 10),
+                        (center_x + 8, center_y - 15, center_x + 130, center_y + 15),
+                        (center_x + 15, center_y - 60, center_x + 300, center_y + 10),
+                        (center_x - 60, center_y - 45, center_x + 90, center_y - 5),
                         (center_x + 10, center_y - 40, center_x + 220, center_y + 10),
                     ]
                     tip_text = ""
@@ -1106,7 +1151,7 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
                             tip_img = None
                         if tip_img is not None and _HAS_PYTESSERACT and pytesseract:
                             try:
-                                cand = pytesseract.image_to_string(tip_img)
+                                cand = ocr_image_to_text(tip_img)
                             except Exception:
                                 cand = ""
                             if cand and len(cand.strip()) > 1:
@@ -1193,6 +1238,41 @@ def capture_discord_servers(save_dir: str = "data/servers", hover_delay: float =
     try:
         with open(meta_path, 'w', encoding='utf-8') as fh:
             json.dump(server_list, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # Attempt to repair blank names by re-hovering recorded positions
+    try:
+        blanks = [s for s in server_list if not s.get('name') and s.get('pos')]
+        if blanks and (_HAS_PYAUTOGUI and pyautogui) and _HAS_PYTESSERACT and pytesseract:
+            for s in blanks:
+                try:
+                    x, y = s['pos']
+                    pyautogui.moveTo(x, y, duration=0.18)
+                    time.sleep(max(hover_delay, 0.9))
+                    # capture tooltip area and OCR
+                    candidate_boxes = [
+                        (x + 24, y - 40, x + 260, y + 40),
+                        (x - 120, y - 60, x + 120, y - 10),
+                        (x + 10, y - 40, x + 220, y + 10),
+                    ]
+                    for tb in candidate_boxes:
+                        try:
+                            tip_img = ImageGrab.grab(bbox=tb)
+                        except Exception:
+                            tip_img = None
+                        if tip_img is not None:
+                            txt = ocr_image_to_text(tip_img)
+                            if txt and txt.strip():
+                                s['name'] = normalize_ocr_name(txt)
+                                break
+                except Exception:
+                    continue
+            try:
+                with open(meta_path, 'w', encoding='utf-8') as fh:
+                    json.dump(server_list, fh, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
     except Exception:
         pass
 
