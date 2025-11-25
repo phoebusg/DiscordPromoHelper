@@ -3,56 +3,54 @@
 Summary:
 - The helper now focuses Discord, captures the server column, and determines discrete centers for server icons using grayscale vertical projection and a second peak-based detector.
 - Hover-based OCR is required to confirm a server; empty OCR is ignored and candidate selection prefers the first valid, non-DM OCR result.
-- DM detection is enforced if DM/home is detected in the viewport; the helper attempts to hover icons right after DM to select the first server deterministically.
+- DM detection uses both color-based detection (Discord's blurple #5865F2) and OCR fallback.
+- Peak detection merges nearby peaks (within 40px) to avoid spurious centers.
+
+Recent Improvements (Nov 2025):
+- Fixed peak detection: increased merge gap from 8px to 40px, raised threshold to 15% of max projection
+- Improved OCR capture: wider tooltip boxes, contrast enhancement via ImageOps.autocontrast
+- Added DM color detection: checks for Discord's blurple color before falling back to OCR
+- Increased hover delays to allow tooltips to appear
 
 Known Current Behavior:
-- Starts at a spacing-detected index; spacing can pick a later server cluster if the top icons produce no tooltip text.
-- Peak-based detection helps split merged icon regions; still sometimes returns a single center if column crop or theme merges icons.
-- Cursor is clamped to avoid titlebar interference; fallback heuristics adjust hover position when initial OCR is empty.
+- Detects 3-5 centers in typical Discord sidebar (down from 33 spurious peaks)
+- Starts at spacing-detected index 0 or 1 depending on DM detection
+- Final OCR captures partial server names - tooltip box positioning needs tuning
+- Cursor is clamped to avoid titlebar interference
 
 Outstanding Issues & What To Fix Next:
-1. Improve stability of center detection when single center is detected:
-   - Refine `_vertical_projection_centers()` thresholding and merging rules.
-   - Add color/alpha detection (RGB channel or alpha) in addition to grayscale to help with custom themes.
-   - Add a column-left/right expansion test to ensure full icon area is captured.
+1. Tooltip capture box positioning:
+   - Final OCR captures partial text ("eat" instead of "Brave Alice Games")
+   - Need to adjust capture box coordinates to be more centered on tooltip
 
-2. Precisely find DM (home) icon and the server right after it in all layouts:
-   - Detect DM via icon pixel pattern/color rather than relying solely on OCR text (Direct Messages), which helps with localization and different tooltip styles.
-   - If DM is detected, ensure `start_idx == dm_idx + 1` unless `start-index-offset` is explicitly set.
+2. OCR during hover iteration returns empty:
+   - Tooltip appears after hover but OCR capture timing may be off
+   - Consider adding explicit wait-for-tooltip logic
 
-3. Reduce skipped icons during iteration:
-   - Use a calibrated pixel step (median) derived from `vertical_projection` but also cross-check with measured distances between hover successes.
-   - Add a single-pass fine-grained scan between the chosen indices to find adjacent icons.
+3. Consistent center detection:
+   - Peak detection gives 3-5 centers depending on scroll position
+   - May need to normalize projection values before peak detection
 
-4. Improve OCR success for tooltips:
-   - Try different OCR psm configs for tooltips, and try enhancing contrast before passing to Tesseract.
-   - Implement more jitter patterns for hidden tooltips (vertical + horizontal micro-movements).
-
-5. Add unit and regression tests using saved column and hover debug images (data/debug):
-   - Tests for `vertical_projection_centers()` with known images; evaluate step size detection and top-gap recognition.
-   - Tests for `peak` fallback scenarios where icons merge.
-
-6. Add CLI flags for tuning and runtime testing (done partially):
-   - `--start-index-offset`, `--max-centers`, `--hover-delay`, `--debug-save` should be kept and expanded with `--force-top` and `--force-peaks` for testing.
-
-7. Tuning and heuristics: fine tune `FIRST_SERVER_SCAN_MAX`, `var_threshold`, `merge_gap` and `top_skip_px` for different Discord themes and UI configurations.
+4. DM color detection:
+   - Color-based detection added but not triggering in tests
+   - May need to capture RGB image before grayscale conversion
 
 Quick Tests To Run Locally:
 ```
 source .venv/bin/activate
-python src/discord_nav.py --debug-save --wait-top --hover-delay 0.6
+python src/discord_nav.py --debug-save --hover-delay 0.7
 ```
 
 Developer Notes:
-- The default `start-index-offset` has been set to `0` (no offset) to avoid unintended shifts.
-- The code attempts broader column captures when only one center is found; the peak detector tries to split merged regions.
-- The fallback logic is conservative: prefer earliest OCR-confirmed server; if DM is detected, prefer DM+1.
+- Peak merge gap set to 40px (typical icon spacing is 48-56px)
+- Projection threshold raised to 15% to filter noise
+- Tooltip boxes widened to 280-350px width
+- Added ImageOps.autocontrast for better OCR
 
 Next Iteration (High Priority):
-- Add color matching to detect DM icon and server icons.
-- Refine center detection thresholds and add tests for merged-case scenarios.
-- Add an option to log the centers and OCR results to a test file for further offline analysis.
-
-If you want, I can add color-based detection and unit tests next (recommended).
+- Fix tooltip capture box positioning to get full server names
+- Add wait-for-tooltip logic before OCR capture
+- Debug why DM color detection isn't triggering
+- Add unit tests for projection and peak detection
 
 End of SPEC

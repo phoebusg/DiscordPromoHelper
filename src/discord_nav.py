@@ -131,6 +131,37 @@ def _is_icon_by_variance(img, cx, cy, size=28, var_threshold=8.0):
         return True
 
 
+def _is_dm_icon_by_color(img, cx, cy, size=36):
+    """Check if the icon at (cx, cy) has the characteristic Discord DM blue color.
+    
+    Discord DM icon typically has a blue/indigo background (#5865F2 or similar).
+    Returns True if the icon area has significant blue content.
+    """
+    try:
+        half = size // 2
+        bbox = (max(0, cx - half), max(0, cy - half), cx + half, cy + half)
+        crop = img.crop(bbox).convert('RGB')
+        px = list(crop.getdata())
+        if not px:
+            return False
+        # Count pixels with significant blue component (Discord's blurple is ~88,101,242)
+        blue_count = 0
+        for r, g, b in px:
+            # Check for Discord blurple-ish colors (blue dominant, moderate red/green)
+            if b > 150 and b > r and b > g * 0.9:
+                blue_count += 1
+            # Also check for lighter blue variants
+            elif b > 180 and b > r * 1.1:
+                blue_count += 1
+            # Check for Discord's exact blurple (#5865F2 = 88,101,242)
+            elif 70 < r < 110 and 85 < g < 120 and b > 200:
+                blue_count += 1
+        ratio = blue_count / len(px)
+        return ratio > 0.08  # At least 8% blue pixels suggests DM icon
+    except Exception:
+        return False
+
+
 def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float = 0.6, test_target: str | None = None,
                                 force_run: bool = False, debug_save: bool = False, max_centers: int | None = None,
                                 max_icon_retries: int = 3, start_index_offset: int = 0):
@@ -271,22 +302,25 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
             return txt
         try:
             pyautogui.moveTo(cx, cy, duration=0.14)
-            time.sleep(max(hover_delay, 0.28))
+            time.sleep(max(hover_delay, 0.35))
         except Exception:
             pass
-        offsets = [(0, 0), (-6, 0), (6, 0), (-10, 0), (10, 0), (0, 6), (0, -6)]
+        offsets = [(0, 0), (-8, 0), (8, 0), (-12, 0), (12, 0), (0, 8), (0, -8)]
+        # Wider tooltip capture boxes to catch Discord tooltips at different positions
         candidate_boxes = [
-            (cx + 15, cy - 30, cx + 200, cy + 10),
-            (cx + 8, cy - 15, cx + 130, cy + 15),
-            (cx + 15, cy - 60, cx + 300, cy + 10),
-            (cx - 160, cy - 28, cx - 10, cy + 26),
-            (cx - 200, cy - 60, cx + 80, cy + 32),
+            (cx + 50, cy - 20, cx + 280, cy + 20),   # right of icon, centered
+            (cx + 40, cy - 35, cx + 320, cy + 15),   # right, slightly above
+            (cx + 15, cy - 30, cx + 250, cy + 10),   # original right
+            (cx + 8, cy - 20, cx + 200, cy + 20),    # close right
+            (cx + 15, cy - 60, cx + 350, cy + 15),   # wide right capture
+            (cx - 180, cy - 30, cx - 10, cy + 30),   # left tooltip
+            (cx - 250, cy - 50, cx + 100, cy + 40),  # wide left capture
         ]
         for dx, dy in offsets:
             try:
                 if dx or dy:
                     pyautogui.moveRel(dx, dy, duration=0.08)
-                    time.sleep(0.06)
+                    time.sleep(0.08)
             except Exception:
                 pass
             for tb in candidate_boxes:
@@ -297,10 +331,13 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                 if tbimg is None:
                     continue
                 try:
-                    t = pytesseract.image_to_string(tbimg, config='--psm 7')
+                    # Enhance contrast before OCR
+                    if ImageOps:
+                        tbimg = ImageOps.autocontrast(tbimg.convert('RGB'))
+                    t = pytesseract.image_to_string(tbimg, config='--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ')
                 except Exception:
                     t = ''
-                if t and t.strip():
+                if t and t.strip() and len(t.strip()) > 1:
                     return t.strip()
         return txt
 
@@ -376,8 +413,9 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                     s += 255 - arr[offset + x]
                 proj[y] = s
             maxp = max(proj) if proj else 0
-            thresh = max(6, int(maxp * 0.07))
-            # smooth with 3-row window
+            # Require peak to be at least 15% of max projection to filter noise
+            thresh = max(10, int(maxp * 0.15))
+            # smooth with 5-row window for better stability
             smooth = [0] * h
             for i in range(h):
                 total = 0
@@ -388,20 +426,23 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                 smooth[i] = total // max(1, cnt)
             peaks = []
             for i in range(1, h - 1):
+                # require local maximum AND above threshold
                 if smooth[i] > smooth[i - 1] and smooth[i] >= smooth[i + 1] and smooth[i] >= thresh:
                     peaks.append(i)
             if peaks:
+                # Merge peaks closer than 40px (icon spacing is typically 48-56px)
                 merged = []
                 for p in peaks:
                     if not merged:
                         merged.append(p)
                         continue
-                    if p - merged[-1] <= 8:
+                    if p - merged[-1] <= 40:
+                        # average nearby peaks
                         merged[-1] = (merged[-1] + p) // 2
                     else:
                         merged.append(p)
                 centers = merged
-                print('Peak-based centers found:', centers)
+                print('Peak-based centers found:', len(centers), 'positions:', centers[:12])
         except Exception:
             pass
     print('Detected centers count:', len(centers), 'first few centers:', centers[:8])
@@ -641,7 +682,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                         pyautogui.moveTo(cx, int(y_for_hover))
                     except Exception:
                         pass
-                time.sleep(max(hover_delay, 0.32))
+                time.sleep(max(hover_delay, 0.45))  # Give tooltip time to appear
             print(f"Hover candidate #{i} at ({cx},{int(cy)})")
             # try to read tooltip text
             txt = ''
@@ -830,9 +871,30 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
     # End helper _run_detection_once
 
     def _find_dm_index(centers_list):
-        """Return index of DM/home icon or None."""
+        """Return index of DM/home icon or None.
+        
+        Uses color-based detection first (Discord's blue DM icon), then falls back to OCR.
+        """
         if not centers_list:
             return None
+        # Capture fresh RGB image for color detection
+        col_img_rgb = _safe_grab(col_box)
+        # First pass: try color-based detection for DM icon (faster and more reliable)
+        for i, cy in enumerate(centers_list):
+            if cy - top <= 48:
+                # skip header region
+                continue
+            try:
+                # Check if icon has Discord's characteristic blue color
+                local_cy = cy - top  # convert to local coordinates
+                if col_img_rgb and _is_dm_icon_by_color(col_img_rgb, cx - left, local_cy, size=40):
+                    print('DM icon found via color detection at index', i, 'y', cy)
+                    return i
+            except Exception as e:
+                print(f'  Color detection error at index {i}: {e}')
+                pass
+        
+        # Second pass: fallback to OCR-based detection
         for i, cy in enumerate(centers_list):
             if cy - top <= 48:
                 # skip header region
