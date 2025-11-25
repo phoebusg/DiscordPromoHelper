@@ -1356,29 +1356,51 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             (cx + 50, y_pos - 20, cx + 280, y_pos + 20),
             (cx + 40, y_pos - 35, cx + 320, y_pos + 15),
             (cx + 15, y_pos - 30, cx + 250, y_pos + 10),
+            (cx + 60, y_pos - 15, cx + 350, y_pos + 25),  # wider right
         ]
         for tb in tooltip_boxes:
             try:
                 tbimg = _safe_grab(tb)
                 if tbimg:
+                    # Scale up 3x for better OCR (Tesseract needs 300+ DPI)
+                    w, h = tbimg.size
+                    scale = 3
+                    tbimg_scaled = tbimg.resize((w * scale, h * scale), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
+                    
                     # Try multiple image preprocessing methods
                     preprocessed = []
                     
-                    # Method 1: RGB autocontrast
+                    # Method 1: Invert first (dark bg -> light bg), then autocontrast
+                    # Tesseract 4+ works best with dark text on light background
+                    gray = tbimg_scaled.convert('L')
                     if ImageOps:
-                        preprocessed.append(ImageOps.autocontrast(tbimg.convert('RGB')))
+                        inverted = ImageOps.invert(gray)
+                        # Add white border (10px) for better recognition
+                        from PIL import ImageOps as IOps
+                        bordered = IOps.expand(inverted, border=10, fill=255)
+                        preprocessed.append(bordered)
+                        
+                        # Also try autocontrast on inverted
+                        ac_inv = ImageOps.autocontrast(inverted, cutoff=5)
+                        bordered_ac = IOps.expand(ac_inv, border=10, fill=255)
+                        preprocessed.append(bordered_ac)
                     
-                    # Method 2: Grayscale with invert (for dark backgrounds)
-                    gray = tbimg.convert('L')
+                    # Method 2: Grayscale autocontrast with border
                     if ImageOps:
-                        preprocessed.append(ImageOps.invert(gray))
-                        preprocessed.append(ImageOps.autocontrast(gray))
+                        ac_gray = ImageOps.autocontrast(gray, cutoff=2)
+                        bordered_gray = ImageOps.expand(ac_gray, border=10, fill=255)
+                        preprocessed.append(bordered_gray)
                     
-                    # Method 3: Original
-                    preprocessed.append(tbimg)
+                    # OCR config: single line, LSTM engine
+                    ocr_config = '--psm 7 --oem 3'
                     
                     for pimg in preprocessed:
-                        txt = pytesseract.image_to_string(pimg, config='--psm 7').strip()
+                        txt = pytesseract.image_to_string(pimg, config=ocr_config).strip()
+                        # Clean common artifacts
+                        if txt:
+                            # Remove leading/trailing punctuation artifacts
+                            txt = txt.strip('|_-.,;:\'"°®©™><[]{}()')
+                            txt = txt.strip()
                         if txt and len(txt) > 1:
                             return txt
             except Exception:
@@ -1509,20 +1531,53 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             is_duplicate = False
             if name and len(name.strip()) > 2:
                 name_key = name.strip().lower()
+                # Remove common OCR noise for comparison
+                name_clean = ''.join(c for c in name_key if c.isalnum() or c == ' ').strip()
+                
                 if name_key in seen_names:
                     is_duplicate = True
                     overlap_count += 1
                     print(f'  Skipping duplicate at index {i}: {repr(name)}')
                     continue
-                # Also check for partial matches (OCR may vary slightly)
+                
+                # Check for fuzzy matches using cleaned versions
                 for seen in seen_names:
-                    if len(seen) > 3 and len(name_key) > 3:
-                        # Check if one is substring of other (fuzzy match)
-                        if seen in name_key or name_key in seen:
+                    seen_clean = ''.join(c for c in seen if c.isalnum() or c == ' ').strip()
+                    
+                    if len(seen_clean) > 3 and len(name_clean) > 3:
+                        # Method 1: Substring match
+                        if seen_clean in name_clean or name_clean in seen_clean:
                             is_duplicate = True
                             overlap_count += 1
                             print(f'  Skipping fuzzy duplicate at index {i}: {repr(name)} ~ {repr(seen)}')
                             break
+                        
+                        # Method 2: Common word overlap (>60% shared words = duplicate)
+                        seen_words = set(seen_clean.split())
+                        name_words = set(name_clean.split())
+                        if seen_words and name_words:
+                            common = seen_words & name_words
+                            # If more than half of the smaller set's words match
+                            min_words = min(len(seen_words), len(name_words))
+                            if min_words > 0 and len(common) >= max(1, min_words * 0.6):
+                                is_duplicate = True
+                                overlap_count += 1
+                                print(f'  Skipping word-match duplicate at index {i}: {repr(name)} ~ {repr(seen)}')
+                                break
+                        
+                        # Method 3: Character similarity (Jaccard on chars)
+                        seen_chars = set(seen_clean.replace(' ', ''))
+                        name_chars = set(name_clean.replace(' ', ''))
+                        if seen_chars and name_chars:
+                            intersection = len(seen_chars & name_chars)
+                            union = len(seen_chars | name_chars)
+                            similarity = intersection / union if union > 0 else 0
+                            if similarity > 0.7:  # 70% char similarity
+                                is_duplicate = True
+                                overlap_count += 1
+                                print(f'  Skipping similar duplicate at index {i}: {repr(name)} ~ {repr(seen)} (sim={similarity:.2f})')
+                                break
+                
                 if is_duplicate:
                     continue
             

@@ -108,3 +108,51 @@ Notes for maintainers:
 - Do not attempt to circumvent server anti-spam rules; the tool is intended to be respectful and compliant.
 - When testing on macOS, ensure `System Settings -> Privacy & Security -> Screen Recording` grants access to the terminal/Python process.
 
+Server Navigation: Name-Based Identification (Design)
+------------------------------------------------------
+**Problem**: Discord adds new servers at TOP (below DM icon), causing all indices to shift.
+Index-based navigation is unreliable - "server at index 5" changes when a new server is added.
+
+**Solution**: Use server NAME as primary identifier, not index.
+
+Storage format (`servers.json`):
+```json
+{
+  "servers": [
+    {"name": "Innovation Inc", "last_seen_page": 0, "last_seen_y": 300},
+    {"name": "GrogCloud", "last_seen_page": 7, "last_seen_y": 300}
+  ],
+  "known_names": ["Innovation Inc", "GrogCloud", ...],
+  "last_scan_timestamp": "2025-11-25T12:00:00Z"
+}
+```
+
+Key changes:
+- `index` field removed - meaningless across sessions
+- `last_seen_page` / `last_seen_y` are hints only, may be stale
+- `known_names` set used for quick new-server detection
+
+Navigation workflow:
+1. To navigate to server "GrogCloud":
+   - Scroll to top of server list
+   - Iterate icons top→bottom, hover each, read tooltip
+   - Stop when tooltip matches "GrogCloud"
+   - Click to enter server
+2. Position hints (`last_seen_page`, `last_seen_y`) can optimize search by starting near expected location, but must fall back to full scan if not found.
+
+New server detection:
+1. Run full scan, collect all names
+2. Compare against `known_names`
+3. Names in scan but not in known = new servers
+4. Names in known but not in scan = servers we left or were removed
+
+Benefits:
+- Robust to Discord reordering (new servers at top)
+- Robust to joining/leaving servers between sessions
+- Name is stable identifier (unless server renames, which is rare)
+
+Caveats:
+- OCR must be reliable enough to match names
+- Fuzzy matching needed for OCR variations
+- Navigation is slower (must scan to find) vs instant index jump
+
