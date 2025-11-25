@@ -509,7 +509,7 @@
       "friendly_name": "",
       "promo_channels": [],
       "game_tags": [],
-      "enabled": true,
+      "enabled": false,
       "notes": ""
     },
     "ragflow": {

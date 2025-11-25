@@ -1,22 +1,92 @@
-# Discord Stream Promotion Helper
+# Discord Promo Helper
 
-## Overview
+Respectful self-promotion automation for Discord streamers.
 
-A simple helper to post a message and your stream link to self-promotion/promotional channels in Discord servers you are a member of. This automation helper operates without needing API access, utilizing a straightforward approach for ease of use and setup.
+## What It Does
+
+- **Scans** all your Discord servers (106+ supported)
+- **Detects** promo/self-promo channels automatically
+- **Posts** your stream link with rate limiting (3h default)
+- **Filters** by game tag (Fortnite servers, AoE2 servers, etc.)
+
+## Quick Start
+
+```bash
+# 1. Clone and setup
+git clone https://github.com/phoebusg/DiscordPromoHelper.git
+cd DiscordPromoHelper
+./scripts/setup.sh
+source .venv/bin/activate
+
+# 2. Launch the GUI
+python -m src.main
+```
+
+## Usage
+
+### GUI Mode (Recommended)
+```bash
+python -m src.main
+```
+- Configure friendly names for servers (OCR names are often garbled)
+- Set promo channels per server
+- Tag servers by game for filtering
+- Enable/disable servers
+
+### CLI Mode
+```bash
+# Scan Discord for servers
+python -m src.main --scan
+
+# Post to all enabled servers
+python -m src.main --post "Check out my stream!" "https://twitch.tv/you"
+
+# Post only to Fortnite servers
+python -m src.main --post "Playing Fortnite!" "https://twitch.tv/you" --game fortnite
+
+# Preview without posting
+python -m src.main --post "Test" "https://twitch.tv/you" --dry-run
+```
 
 ## Features
 
-- **Auto Posting**: Automatically post your stream link and a message to designated channels.
-- **Queue System**: Incorporates a queueing system to respect server rules and avoid spamming.
+| Feature | Description |
+|---------|-------------|
+| Server Scanning | OCR-based detection of all your Discord servers |
+| Friendly Names | Replace garbled OCR names with readable labels |
+| Game Tagging | Filter servers by game (fortnite, aoe2, valorant, etc.) |
+| Rate Limiting | 3-hour default cooldown per channel |
+| Promo Detection | Auto-detect channels named "promo", "self-promo", etc. |
 
-## Disclaimer
+## Requirements
 
-This tool is designed to assist with the promotion of your streams in a responsible manner. It includes a built-in queue and anti-spam functionality to prevent abuse. **Modifying the code to circumvent these safeguards may result in your account being banned from servers or Discord itself.** Use this tool responsibly and always adhere to the rules of the servers you're posting in.
+- **macOS** (primary) or Windows
+- **Python 3.11+**
+- **Tesseract OCR**: `brew install tesseract`
+- **Permissions**: Screen Recording + Accessibility (macOS)
 
-## Setup
+See [SETUP.md](SETUP.md) for detailed setup instructions.
 
-1. Clone this repository to your local machine.
-2. Ensure Python and pip are installed.
-3. Setup a virtual environment:
-   ```sh
-   python -m venv discord_automation_env
+## Project Structure
+
+```
+├── src/
+│   ├── main.py           # Entry point (--ui, --scan, --post)
+│   ├── ui.py             # Tkinter GUI
+│   ├── discord_nav.py    # Server scanning
+│   ├── server_config.py  # Settings management
+│   └── utils.py          # OCR, window helpers
+├── servers.json          # Scanned server list
+├── server_config.json    # Your settings
+└── scripts/setup.sh      # Setup script
+```
+
+## ⚠️ Disclaimer
+
+This tool is for **respectful** self-promotion only. Built-in safeguards:
+
+- Rate limiting prevents spam
+- Per-server enable/disable
+- Channel whitelist/blacklist
+
+**Circumventing these safeguards may get your account banned.** Always follow server rules.

@@ -1,37 +1,46 @@
-discord_automation_env/
-
-# Python virtual environments
+# Virtual environments
 .venv/
 venv/
 env/
+discord_automation_env/
 
-# macOS and editors
+# macOS
 .DS_Store
+
+# Editors
 .idea/
 .vscode/
+*.swp
+*.swo
 
-# Python caches and bytecode
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+dist/
+build/
 
-# Logs and temp
+# Logs
 *.log
+
+# Runtime data
+data/
+servers.json
+server_config.json
+
+# Debug/test artifacts
 tmp/
 temp/
+screenshots/
+*.png
 
-# Generated/discovered server assets (icons/screenshots)
-data/servers/images/
-data/servers/*.png
-# Local runtime data (don't commit server icons or state)
-data/
-
-# Test artifacts and coverage
+# Test coverage
 .pytest_cache/
 coverage/
 htmlcov/
+.coverage
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
+# Generated files (keep requirements.txt)
+clean_requirements.txt
+installed.txt
