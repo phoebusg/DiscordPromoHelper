@@ -5,6 +5,7 @@ Features:
 - Per-server promo channel configuration
 - Game tag filtering
 - Global settings (rate limit, etc.)
+- Stream info fetching from Twitch/Kick/YouTube
 """
 from __future__ import annotations
 import tkinter as tk
@@ -12,6 +13,7 @@ from tkinter import ttk, messagebox, simpledialog
 from typing import Optional, List, Dict, Any
 import json
 from pathlib import Path
+import threading
 
 # Import our modules
 try:
@@ -20,12 +22,14 @@ try:
         get_display_name, import_from_servers_json, get_rate_limit_hours,
         set_rate_limit_hours, get_enabled_servers, get_servers_by_game
     )
+    from .stream_info import get_stream_info, detect_platform, StreamInfo
 except ImportError:
     from server_config import (
         load_config, save_config, get_server_config, set_server_config,
         get_display_name, import_from_servers_json, get_rate_limit_hours,
         set_rate_limit_hours, get_enabled_servers, get_servers_by_game
     )
+    from stream_info import get_stream_info, detect_platform, StreamInfo
 
 
 class ServerSettingsDialog(tk.Toplevel):
@@ -189,6 +193,191 @@ class GameFilterDialog(tk.Toplevel):
             self.tree.insert("", tk.END, values=(tag, count))
 
 
+class StreamInfoDialog(tk.Toplevel):
+    """Dialog for fetching stream information from Twitch/Kick/YouTube."""
+    
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Fetch Stream Info")
+        self.geometry("550x450")
+        self.resizable(True, True)
+        
+        self.result: Optional[StreamInfo] = None
+        self._create_widgets()
+        
+        self.transient(parent)
+        self.grab_set()
+    
+    def _create_widgets(self):
+        main = ttk.Frame(self, padding="15")
+        main.pack(fill=tk.BOTH, expand=True)
+        
+        # Header
+        ttk.Label(main, text="Fetch Stream Info", font=("", 14, "bold")).pack(anchor=tk.W)
+        ttk.Label(main, text="Enter a stream URL or platform/username to auto-detect title and game.",
+                 wraplength=500).pack(anchor=tk.W, pady=(0, 15))
+        
+        # URL/Username input
+        input_frame = ttk.LabelFrame(main, text="Stream Input", padding="10")
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(input_frame, text="URL or Username:").pack(anchor=tk.W)
+        self.url_var = tk.StringVar()
+        url_entry = ttk.Entry(input_frame, textvariable=self.url_var, width=60)
+        url_entry.pack(fill=tk.X, pady=(0, 5))
+        url_entry.focus_set()
+        
+        # Platform selection (optional override)
+        platform_frame = ttk.Frame(input_frame)
+        platform_frame.pack(fill=tk.X)
+        
+        ttk.Label(platform_frame, text="Platform:").pack(side=tk.LEFT)
+        self.platform_var = tk.StringVar(value="auto")
+        for text, val in [("Auto-detect", "auto"), ("Twitch", "twitch"), 
+                          ("Kick", "kick"), ("YouTube", "youtube")]:
+            ttk.Radiobutton(platform_frame, text=text, variable=self.platform_var, 
+                           value=val).pack(side=tk.LEFT, padx=5)
+        
+        # Examples
+        ttk.Label(input_frame, text="Examples: twitch.tv/ninja, kick.com/xqc, @MrBeast, username",
+                 foreground="gray").pack(anchor=tk.W, pady=(5, 0))
+        
+        # Fetch button
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        self.fetch_btn = ttk.Button(btn_frame, text="🔍 Fetch Stream Info", command=self._fetch)
+        self.fetch_btn.pack(side=tk.LEFT)
+        
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(btn_frame, textvariable=self.status_var, foreground="blue").pack(side=tk.LEFT, padx=10)
+        
+        # Results frame
+        results_frame = ttk.LabelFrame(main, text="Stream Info", padding="10")
+        results_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Result fields
+        ttk.Label(results_frame, text="Status:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.live_var = tk.StringVar(value="—")
+        ttk.Label(results_frame, textvariable=self.live_var, font=("", 10, "bold")).grid(row=0, column=1, sticky=tk.W, pady=2)
+        
+        ttk.Label(results_frame, text="Title:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.title_var = tk.StringVar(value="")
+        ttk.Entry(results_frame, textvariable=self.title_var, width=50, state="readonly").grid(row=1, column=1, sticky=tk.W+tk.E, pady=2)
+        
+        ttk.Label(results_frame, text="Game:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.game_var = tk.StringVar(value="")
+        ttk.Entry(results_frame, textvariable=self.game_var, width=50, state="readonly").grid(row=2, column=1, sticky=tk.W+tk.E, pady=2)
+        
+        ttk.Label(results_frame, text="Viewers:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.viewers_var = tk.StringVar(value="—")
+        ttk.Label(results_frame, textvariable=self.viewers_var).grid(row=3, column=1, sticky=tk.W, pady=2)
+        
+        ttk.Label(results_frame, text="URL:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.stream_url_var = tk.StringVar(value="")
+        ttk.Entry(results_frame, textvariable=self.stream_url_var, width=50, state="readonly").grid(row=4, column=1, sticky=tk.W+tk.E, pady=2)
+        
+        results_frame.columnconfigure(1, weight=1)
+        
+        # Error display
+        self.error_var = tk.StringVar(value="")
+        self.error_label = ttk.Label(results_frame, textvariable=self.error_var, foreground="red", wraplength=400)
+        self.error_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        
+        # Bottom buttons
+        bottom_frame = ttk.Frame(main)
+        bottom_frame.pack(fill=tk.X)
+        
+        ttk.Button(bottom_frame, text="Use This Info", command=self._use_result).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        
+        # Copy button
+        ttk.Button(bottom_frame, text="📋 Copy Title", command=self._copy_title).pack(side=tk.LEFT)
+    
+    def _fetch(self):
+        """Fetch stream info in background thread."""
+        url = self.url_var.get().strip()
+        if not url:
+            self.error_var.set("Please enter a URL or username")
+            return
+        
+        # Clear previous results
+        self.status_var.set("Fetching...")
+        self.error_var.set("")
+        self.live_var.set("—")
+        self.title_var.set("")
+        self.game_var.set("")
+        self.viewers_var.set("—")
+        self.stream_url_var.set("")
+        self.fetch_btn.configure(state="disabled")
+        
+        # Run in background thread
+        def fetch_thread():
+            try:
+                platform = self.platform_var.get()
+                
+                if platform == "auto":
+                    platform, username = detect_platform(url)
+                else:
+                    # If explicit platform, use URL as username
+                    _, username = detect_platform(url)
+                    if username == url:  # No URL detected, use raw input
+                        username = url
+                
+                info = get_stream_info(platform, username)
+                
+                # Update UI in main thread
+                self.after(0, lambda: self._update_results(info))
+            except Exception as e:
+                self.after(0, lambda: self._show_error(str(e)))
+        
+        thread = threading.Thread(target=fetch_thread, daemon=True)
+        thread.start()
+    
+    def _update_results(self, info: StreamInfo):
+        """Update UI with fetched results."""
+        self.status_var.set("Done!")
+        self.fetch_btn.configure(state="normal")
+        self.result = info
+        
+        if info.is_live:
+            self.live_var.set("🟢 LIVE")
+        else:
+            self.live_var.set("⚫ Offline")
+        
+        self.title_var.set(info.title)
+        self.game_var.set(info.game)
+        self.viewers_var.set(str(info.viewers) if info.viewers else "—")
+        self.stream_url_var.set(info.stream_url)
+        
+        if info.error:
+            self.error_var.set(f"⚠️ {info.error}")
+        
+        self.after(2000, lambda: self.status_var.set(""))
+    
+    def _show_error(self, error: str):
+        """Show error message."""
+        self.status_var.set("")
+        self.fetch_btn.configure(state="normal")
+        self.error_var.set(f"❌ {error}")
+    
+    def _copy_title(self):
+        """Copy title to clipboard."""
+        title = self.title_var.get()
+        if title:
+            self.clipboard_clear()
+            self.clipboard_append(title)
+            self.status_var.set("Copied!")
+            self.after(1500, lambda: self.status_var.set(""))
+    
+    def _use_result(self):
+        """Close dialog and return result."""
+        if self.result and (self.result.title or self.result.game):
+            self.destroy()
+        else:
+            self.error_var.set("No stream info to use. Fetch first!")
+
+
 class DiscordPromoApp(tk.Tk):
     """Main application window."""
     
@@ -226,6 +415,11 @@ class DiscordPromoApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
+        
+        # Tools menu
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Fetch Stream Info...", command=self._fetch_stream_info)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
         
         # Settings menu
         settings_menu = tk.Menu(menubar, tearoff=0)
@@ -307,6 +501,21 @@ class DiscordPromoApp(tk.Tk):
         ttk.Button(actions, text="Edit Selected", command=self._edit_selected).pack(fill=tk.X, pady=2)
         ttk.Button(actions, text="Quick Enable/Disable", command=self._toggle_enabled).pack(fill=tk.X, pady=2)
         ttk.Button(actions, text="Set Friendly Name...", command=self._quick_set_name).pack(fill=tk.X, pady=2)
+        
+        # Stream Info section
+        stream_frame = ttk.LabelFrame(right_frame, text="Stream Info", padding="10")
+        stream_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(stream_frame, text="🎬 Fetch Stream Info...", 
+                   command=self._fetch_stream_info).pack(fill=tk.X, pady=2)
+        
+        # Display current stream info
+        self.stream_title_var = tk.StringVar(value="Title: (none)")
+        self.stream_game_var = tk.StringVar(value="Game: (none)")
+        ttk.Label(stream_frame, textvariable=self.stream_title_var, 
+                 wraplength=180, foreground="gray").pack(anchor=tk.W)
+        ttk.Label(stream_frame, textvariable=self.stream_game_var,
+                 foreground="gray").pack(anchor=tk.W)
         
         # Status/info panel
         info_frame = ttk.LabelFrame(right_frame, text="Quick Info", padding="10")
@@ -516,6 +725,33 @@ class DiscordPromoApp(tk.Tk):
         
         messagebox.showinfo("Import Complete", f"Imported {imported} new servers.")
     
+    def _fetch_stream_info(self):
+        """Open stream info dialog and fetch from platform."""
+        dialog = StreamInfoDialog(self)
+        self.wait_window(dialog)
+        
+        if dialog.result:
+            info = dialog.result
+            # Store for later use in promotions
+            self._current_stream_info = info
+            
+            # Update UI display
+            title_display = info.title[:40] + "..." if len(info.title) > 40 else info.title
+            self.stream_title_var.set(f"Title: {title_display or '(none)'}")
+            self.stream_game_var.set(f"Game: {info.game or '(none)'}")
+            
+            # Show summary
+            status = "🟢 LIVE" if info.is_live else "⚫ Offline"
+            messagebox.showinfo(
+                "Stream Info Loaded",
+                f"Platform: {info.platform.title()}\n"
+                f"Status: {status}\n"
+                f"Title: {info.title or '(none)'}\n"
+                f"Game: {info.game or '(none)'}\n"
+                f"URL: {info.stream_url}\n\n"
+                "This info is now available for promotions."
+            )
+    
     def _show_about(self):
         """Show about dialog."""
         messagebox.showinfo(
@@ -526,6 +762,7 @@ class DiscordPromoApp(tk.Tk):
             "• Server management with friendly names\n"
             "• Per-server promo channel configuration\n"
             "• Game-based filtering\n"
+            "• Stream info fetching (Twitch/Kick/YouTube)\n"
             "• Rate limiting (default: 3h per channel)\n\n"
             "Always follow server rules!"
         )

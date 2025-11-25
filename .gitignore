@@ -4,6 +4,9 @@ venv/
 env/
 discord_automation_env/
 
+# Environment variables (secrets!)
+.env
+
 # macOS
 .DS_Store
 
