@@ -1263,7 +1263,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
     return (cx, int(final_y))
 
 
-def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_servers: int = 50):
+def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_servers: int = 200):
     """Iterate through ALL servers and return their names and positions.
     
     Returns list of dicts: [{'index': int, 'y': int, 'name': str or None}, ...]
@@ -1314,7 +1314,8 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     
     # Keywords to detect end/DM
     DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends', 'messages')
-    END_KEYWORDS = ('add a server', 'add server', 'create', 'explore')
+    # End markers - "Add a Server" and "Explore Public Servers" / "Discover"
+    END_KEYWORDS = ('add a server', 'add server', 'create', 'explore', 'discover', 'public servers')
     
     # Scroll to ABSOLUTE TOP - use direct scrolling since _seek_extreme may have reversed sign
     print('Scrolling to top...')
@@ -1448,9 +1449,11 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     seen_names = set()  # Track seen server names for deduplication
     last_page_names = []  # Names from last page for overlap detection
     page = 0
-    max_pages = 20  # Safety limit
+    max_pages = 50  # Safety limit
     reached_end = False
     total_servers_counted = 0  # Track total position in the list
+    stale_pages = 0  # Count consecutive pages with no new servers
+    max_stale = 3  # Stop after 3 consecutive stale pages
     
     while page < max_pages and not reached_end:
         print(f'\n=== Page {page} ===')
@@ -1495,31 +1498,38 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             start_idx = 0
             print(f'Page {page}: scanning from start, will deduplicate by name')
         
-        # Calculate safe iteration range
-        # Skip last 2 icons to avoid "NEW" notification occlusion at bottom
+        # Calculate iteration range
+        # We scan ALL icons (including last ones) to detect "Add a Server" end marker
+        # But we're more cautious about adding servers from the last 2 positions
         iter_start = start_idx
-        iter_end = len(centers_abs) - 2
-        iter_end = max(iter_start + 1, iter_end)
+        iter_end = len(centers_abs)  # Scan all icons, including last ones
         
         print(f'Iterating from index {iter_start} to {iter_end - 1}')
         
         new_servers_this_page = 0
         this_page_names = []  # Track names found on this page
         overlap_count = 0  # Count how many overlapping servers we see
+        is_near_bottom = False  # Track if we're in the last 2 icon positions
         
         for i in range(iter_start, iter_end):
             cy = centers_abs[i]
             y_hover = _clamp_y(cy)
+            is_near_bottom = (i >= len(centers_abs) - 2)
             
             # Read tooltip - but DON'T skip position if OCR fails
             name = _read_tooltip(y_hover)
             lname = (name or '').lower()
             
-            # Check for end marker
+            # Check for end marker FIRST - this is critical for "Add a Server"
             if name and any(k in lname for k in END_KEYWORDS):
                 print(f'  Detected end marker "{name}" at index {i}')
                 reached_end = True
                 break
+            
+            # Skip adding servers from last 2 positions (occlusion risk) unless end detected
+            if is_near_bottom:
+                print(f'  Skipping near-bottom icon at index {i} (occlusion risk): {repr(name)}')
+                continue
             
             # Skip DM (shouldn't happen after page 0, but safety check)
             if name and any(k in lname for k in DM_KEYWORDS):
@@ -1572,7 +1582,7 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                             intersection = len(seen_chars & name_chars)
                             union = len(seen_chars | name_chars)
                             similarity = intersection / union if union > 0 else 0
-                            if similarity > 0.7:  # 70% char similarity
+                            if similarity > 0.85:  # 85% char similarity - be more strict
                                 is_duplicate = True
                                 overlap_count += 1
                                 print(f'  Skipping similar duplicate at index {i}: {repr(name)} ~ {repr(seen)} (sim={similarity:.2f})')
@@ -1622,11 +1632,29 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         
         # Check if we found any new servers
         if new_servers_this_page == 0:
+            stale_pages += 1
             if overlap_count > 0:
-                print(f'Only found {overlap_count} duplicates, no new servers - might need more scroll')
+                print(f'Only found {overlap_count} duplicates, no new servers (stale: {stale_pages}/{max_stale}) - scrolling more...')
+                if stale_pages >= max_stale:
+                    print(f'Reached {max_stale} consecutive stale pages, assuming end of list')
+                    reached_end = True
+                    break
+                # Try scrolling more aggressively to get past overlap zone
+                if pyautogui:
+                    try:
+                        for _ in range(15):  # Scroll ~5 icons worth
+                            pyautogui.scroll(-1)
+                            time.sleep(0.02)
+                    except Exception:
+                        pass
+                time.sleep(0.35)
+                page += 1
+                continue  # Try another page
             else:
                 print('No new servers found on this page, stopping')
-            break
+                break
+        else:
+            stale_pages = 0  # Reset stale counter when we find new servers
         
         # Update last page names for next iteration
         last_page_names = this_page_names[-5:] if this_page_names else []  # Keep last 5 names
@@ -1676,7 +1704,7 @@ if __name__ == '__main__':
         servers = iterate_all_servers(
             hover_delay=args.hover_delay,
             debug_save=args.debug_save,
-            max_servers=args.max_centers if args.max_centers > 0 else 50
+            max_servers=args.max_centers if args.max_centers > 0 else 200
         )
         print(f'\\nFound {len(servers)} servers:')
         for s in servers:

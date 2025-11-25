@@ -113,46 +113,44 @@ Server Navigation: Name-Based Identification (Design)
 **Problem**: Discord adds new servers at TOP (below DM icon), causing all indices to shift.
 Index-based navigation is unreliable - "server at index 5" changes when a new server is added.
 
-**Solution**: Use server NAME as primary identifier, not index.
+**Solution**: Hybrid approach - use POSITION for iteration, NAME as backup identifier.
+
+Key insight: OCR is unreliable, so we cannot solely depend on name matching.
 
 Storage format (`servers.json`):
 ```json
 {
+  "total_servers": 96,
   "servers": [
-    {"name": "Innovation Inc", "last_seen_page": 0, "last_seen_y": 300},
-    {"name": "GrogCloud", "last_seen_page": 7, "last_seen_y": 300}
-  ],
-  "known_names": ["Innovation Inc", "GrogCloud", ...],
-  "last_scan_timestamp": "2025-11-25T12:00:00Z"
+    {"index": 0, "name": "Innovation Inc", "page": 0, "y_position": 300},
+    {"index": 1, "name": "GrogCloud", "page": 7, "y_position": 300}
+  ]
 }
 ```
 
-Key changes:
-- `index` field removed - meaningless across sessions
-- `last_seen_page` / `last_seen_y` are hints only, may be stale
-- `known_names` set used for quick new-server detection
+Scan termination detection:
+1. **End marker**: Look for "Add a Server" or "Explore/Discover" tooltips
+2. **Stale page fallback**: After 3 consecutive pages with no new servers, assume end reached
+3. **Max pages safety**: Hard limit (50 pages) prevents infinite loops
 
-Navigation workflow:
-1. To navigate to server "GrogCloud":
-   - Scroll to top of server list
-   - Iterate icons top→bottom, hover each, read tooltip
-   - Stop when tooltip matches "GrogCloud"
-   - Click to enter server
-2. Position hints (`last_seen_page`, `last_seen_y`) can optimize search by starting near expected location, but must fall back to full scan if not found.
+Navigation strategy (not yet implemented):
+1. **Full rescan on each session**: Position is ephemeral, rescan to get current layout
+2. **Count-based verification**: If we had N servers before, we should find ~N servers now
+3. **New server detection**: Compare counts - if current > previous, new servers added at top
+4. **Name as secondary ID**: Use fuzzy name matching only when position-based nav fails
 
-New server detection:
-1. Run full scan, collect all names
-2. Compare against `known_names`
-3. Names in scan but not in known = new servers
-4. Names in known but not in scan = servers we left or were removed
+Why not pure name-based:
+- OCR produces garbled text ("Add a Server" → "eae a. box")
+- Fuzzy matching has false positives
+- Server renames break name-based tracking
 
-Benefits:
-- Robust to Discord reordering (new servers at top)
-- Robust to joining/leaving servers between sessions
-- Name is stable identifier (unless server renames, which is rare)
+Why position works:
+- Servers have stable relative order (new ones at top, rest shifts down)
+- We can iterate reliably with scroll + icon detection
+- Count-based verification catches missed/extra servers
 
 Caveats:
-- OCR must be reliable enough to match names
-- Fuzzy matching needed for OCR variations
-- Navigation is slower (must scan to find) vs instant index jump
+- Must rescan before each operation (positions change)
+- OCR names are hints only, not authoritative
+- Need to handle case where user left a server between scans
 
