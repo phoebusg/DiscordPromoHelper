@@ -92,6 +92,7 @@ def _vertical_projection_centers(img, w, h, merge_gap=8):
     GAP_THRESH = max(100, p25 + (p75 - p25) * 0.15)
     MIN_GAP_SIZE = 4  # Minimum consecutive gap rows
     MIN_ICON_SIZE = 15  # Minimum icon height in pixels
+    TYPICAL_ICON_SPACING = 48  # Typical spacing between icon centers
     
     # Find gap regions (runs of low variance)
     gaps = []
@@ -144,6 +145,43 @@ def _vertical_projection_centers(img, w, h, merge_gap=8):
         if icon_size >= MIN_ICON_SIZE:
             center = (icon_start + icon_end) // 2
             icons.append({'start': icon_start, 'end': icon_end, 'center': center, 'size': icon_size})
+    
+    # POST-PROCESSING: Check for missing dark icons by looking at spacing
+    # If spacing between consecutive icons is ~2x normal, there's likely a dark icon missed
+    if len(icons) >= 2:
+        # Calculate median spacing
+        spacings = [icons[i+1]['center'] - icons[i]['center'] for i in range(len(icons)-1)]
+        spacings_sorted = sorted(spacings)
+        median_spacing = spacings_sorted[len(spacings_sorted) // 2]
+        
+        # Look for large gaps (>1.6x median) that suggest a missing dark icon
+        fixed_icons = []
+        for i, icon in enumerate(icons):
+            fixed_icons.append(icon)
+            
+            if i < len(icons) - 1:
+                next_icon = icons[i + 1]
+                spacing = next_icon['center'] - icon['center']
+                
+                # If spacing is ~2x normal, insert a synthetic icon in the middle
+                if spacing > median_spacing * 1.6:
+                    # Calculate how many icons might be missing
+                    num_missing = round(spacing / median_spacing) - 1
+                    if num_missing >= 1:
+                        # Insert synthetic icon(s) at evenly spaced positions
+                        for j in range(1, num_missing + 1):
+                            synthetic_center = icon['center'] + int(j * spacing / (num_missing + 1))
+                            synthetic_icon = {
+                                'start': synthetic_center - 20,
+                                'end': synthetic_center + 20,
+                                'center': synthetic_center,
+                                'size': 40,
+                                'synthetic': True  # Mark as synthetic for debugging
+                            }
+                            fixed_icons.append(synthetic_icon)
+        
+        # Sort by center position to maintain order after synthetic insertions
+        icons = sorted(fixed_icons, key=lambda x: x['center'])
     
     # Split overly large icons (likely merged due to small separators)
     # Typical icon is ~40-60px tall; anything > 70px likely contains multiple icons
@@ -1323,11 +1361,26 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             try:
                 tbimg = _safe_grab(tb)
                 if tbimg:
+                    # Try multiple image preprocessing methods
+                    preprocessed = []
+                    
+                    # Method 1: RGB autocontrast
                     if ImageOps:
-                        tbimg = ImageOps.autocontrast(tbimg.convert('RGB'))
-                    txt = pytesseract.image_to_string(tbimg, config='--psm 7').strip()
-                    if txt and len(txt) > 1:
-                        return txt
+                        preprocessed.append(ImageOps.autocontrast(tbimg.convert('RGB')))
+                    
+                    # Method 2: Grayscale with invert (for dark backgrounds)
+                    gray = tbimg.convert('L')
+                    if ImageOps:
+                        preprocessed.append(ImageOps.invert(gray))
+                        preprocessed.append(ImageOps.autocontrast(gray))
+                    
+                    # Method 3: Original
+                    preprocessed.append(tbimg)
+                    
+                    for pimg in preprocessed:
+                        txt = pytesseract.image_to_string(pimg, config='--psm 7').strip()
+                        if txt and len(txt) > 1:
+                            return txt
             except Exception:
                 pass
         return None
@@ -1370,6 +1423,8 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     
     # Main iteration
     all_servers = []
+    seen_names = set()  # Track seen server names for deduplication
+    last_page_names = []  # Names from last page for overlap detection
     page = 0
     max_pages = 20  # Safety limit
     reached_end = False
@@ -1413,10 +1468,10 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 start_idx = dm_found_idx + 1
                 print(f'DM confirmed at index {dm_found_idx}, starting at index {start_idx}')
         else:
-            # SUBSEQUENT PAGES: We scrolled so that 3 icons overlap
-            # Skip those 3 overlap icons and start fresh
-            start_idx = 3
-            print(f'Page {page}: skipping first 3 icons (overlap from previous page)')
+            # SUBSEQUENT PAGES: Start from beginning, use name-based deduplication
+            # Don't skip by fixed index - OCR the first few and skip if seen before
+            start_idx = 0
+            print(f'Page {page}: scanning from start, will deduplicate by name')
         
         # Calculate safe iteration range
         # Skip last 2 icons to avoid "NEW" notification occlusion at bottom
@@ -1427,6 +1482,8 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         print(f'Iterating from index {iter_start} to {iter_end - 1}')
         
         new_servers_this_page = 0
+        this_page_names = []  # Track names found on this page
+        overlap_count = 0  # Count how many overlapping servers we see
         
         for i in range(iter_start, iter_end):
             cy = centers_abs[i]
@@ -1447,9 +1504,36 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 print(f'  Skipping DM at index {i}: {name}')
                 continue
             
-            # Valid server position - ALWAYS add (trust spacing, OCR may fail)
+            # Deduplication: skip if we've seen this name before (with OCR fuzzy matching)
+            # Only dedupe if name is not None and has content
+            is_duplicate = False
+            if name and len(name.strip()) > 2:
+                name_key = name.strip().lower()
+                if name_key in seen_names:
+                    is_duplicate = True
+                    overlap_count += 1
+                    print(f'  Skipping duplicate at index {i}: {repr(name)}')
+                    continue
+                # Also check for partial matches (OCR may vary slightly)
+                for seen in seen_names:
+                    if len(seen) > 3 and len(name_key) > 3:
+                        # Check if one is substring of other (fuzzy match)
+                        if seen in name_key or name_key in seen:
+                            is_duplicate = True
+                            overlap_count += 1
+                            print(f'  Skipping fuzzy duplicate at index {i}: {repr(name)} ~ {repr(seen)}')
+                            break
+                if is_duplicate:
+                    continue
+            
+            # Valid NEW server position - add it
             new_servers_this_page += 1
             total_servers_counted += 1
+            
+            # Track the name for deduplication
+            if name and len(name.strip()) > 2:
+                seen_names.add(name.strip().lower())
+                this_page_names.append(name.strip().lower())
             
             server_info = {
                 'index': len(all_servers),
@@ -1483,25 +1567,31 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         
         # Check if we found any new servers
         if new_servers_this_page == 0:
-            print('No new servers found on this page, stopping')
+            if overlap_count > 0:
+                print(f'Only found {overlap_count} duplicates, no new servers - might need more scroll')
+            else:
+                print('No new servers found on this page, stopping')
             break
         
-        # Scroll down for next page
-        # We want to keep 3 icons as overlap, so scroll by (processed - 3) icons
-        overlap_icons = 3
-        icons_to_scroll = max(1, new_servers_this_page - overlap_icons)
+        # Update last page names for next iteration
+        last_page_names = this_page_names[-5:] if this_page_names else []  # Keep last 5 names
         
-        # On macOS: ~4 scroll units per server icon (empirically determined)
-        scroll_per_icon = 4
+        # Scroll down for next page - use CONSERVATIVE scrolling
+        # Since we have name-based deduplication, we can scroll less aggressively
+        # Better to have overlap (duplicates get filtered) than to miss servers
+        
+        # Scroll by roughly 1/3 of new servers found, minimum 2 icons
+        icons_to_scroll = max(2, new_servers_this_page // 3)
+        scroll_per_icon = 3  # ~3 scroll units per icon on macOS Retina
         total_scroll = icons_to_scroll * scroll_per_icon
         
-        print(f'Scrolling down by {icons_to_scroll} icons ({total_scroll} scroll units)...')
+        print(f'Found {new_servers_this_page} new servers, scrolling by ~{icons_to_scroll} icons ({total_scroll} units)...')
         
         if pyautogui:
             try:
                 for _ in range(total_scroll):
                     pyautogui.scroll(-1)  # Small increments, negative = down
-                    time.sleep(0.03)
+                    time.sleep(0.02)
             except Exception:
                 pass
         
@@ -1524,6 +1614,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-icon-retries', type=int, default=3, help='Max jitter retries per icon for tooltip OCR')
     parser.add_argument('--start-index-offset', type=int, default=0, help='Adjust start index by N servers (negative means earlier)')
     parser.add_argument('--list-all', action='store_true', help='List all servers instead of just finding the first')
+    parser.add_argument('--output-json', type=str, default=None, help='Save server list to JSON file')
     args = parser.parse_args()
     
     if args.list_all:
@@ -1535,6 +1626,25 @@ if __name__ == '__main__':
         print(f'\\nFound {len(servers)} servers:')
         for s in servers:
             print(f'  [{s["index"]}] {s["name"] or "(no name detected)"}')
+        
+        # Save to JSON if requested
+        if args.output_json:
+            import json
+            output_data = {
+                'total_servers': len(servers),
+                'servers': [
+                    {
+                        'index': s['index'],
+                        'name': s['name'],
+                        'page': s['page'],
+                        'y_position': s['y']
+                    }
+                    for s in servers
+                ]
+            }
+            with open(args.output_json, 'w') as f:
+                json.dump(output_data, f, indent=2)
+            print(f'Saved to {args.output_json}')
     else:
         res = find_and_hover_first_server(
             start_from_top=args.wait_top,
