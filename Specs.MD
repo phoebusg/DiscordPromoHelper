@@ -154,3 +154,69 @@ Caveats:
 - OCR names are hints only, not authoritative
 - Need to handle case where user left a server between scans
 
+Channel Reading & Promo Detection (Design)
+------------------------------------------
+**Goal**: For each server, scan channels to find promotion/self-promo channels.
+
+**Phase 1: Keyword-based detection**
+Primary keywords (exact/fuzzy match in channel name):
+- `promo`, `self-promo`, `self promo`, `selfpromo`
+- `promote`, `promotion`, `self-promotion`
+- `advertise`, `advertising`, `ads`
+- `plug`, `self-plug`, `plugs`
+- `share`, `share-your`, `show-off`
+- `spotlight`, `showcase`
+
+**Phase 2: Content verification (for ambiguous channels)**
+Some servers customize promo channel names. If channel name is ambiguous:
+1. Enter channel, read recent messages
+2. Look for promotional content patterns:
+   - Links (twitch.tv, youtube.com, twitter.com, etc.)
+   - "Check out my...", "Follow me...", "Subscribe..."
+   - Multiple users posting similar self-promotional content
+3. Check channel topic/description if visible
+
+**Storage format** (`server_channels.json`):
+```json
+{
+  "servers": {
+    "Innovation Inc": {
+      "server_index": 0,
+      "channels": {
+        "promo": {"type": "promo", "confidence": "high", "method": "keyword"},
+        "share-your-stuff": {"type": "promo", "confidence": "medium", "method": "keyword"},
+        "general-chat": {"type": "general", "confidence": "high"}
+      },
+      "promo_channels": ["promo", "share-your-stuff"],
+      "last_scanned": "2025-11-25T12:00:00Z"
+    }
+  }
+}
+```
+
+**Channel scanning workflow**:
+1. Click server icon to enter server
+2. Wait for channel list to load (left sidebar)
+3. Scroll to top of channel list
+4. Iterate visible channels:
+   - OCR channel name
+   - Check against keyword list
+   - If match → mark as promo (high confidence)
+   - If partial match → mark for content verification
+5. Scroll down, repeat until end of channel list
+6. For ambiguous channels: enter and scan content
+7. Save results to `server_channels.json`
+
+**Channel detection challenges**:
+- Channel categories (folders) vs actual channels
+- Voice channels vs text channels (only text channels matter)
+- Private/locked channels (skip, can't post anyway)
+- Channel icons/emojis in names
+
+**Implementation priority**:
+1. [ ] `enter_server(index)` - click server icon by position
+2. [ ] `scan_channel_list()` - iterate and OCR channel names  
+3. [ ] `find_promo_channels(keywords)` - filter for promo keywords
+4. [ ] `verify_channel_content(channel)` - enter and read messages
+5. [ ] `save_server_channels()` - persist to JSON
+

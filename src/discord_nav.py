@@ -1500,7 +1500,7 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         
         # Calculate iteration range
         # We scan ALL icons (including last ones) to detect "Add a Server" end marker
-        # But we're more cautious about adding servers from the last 2 positions
+        # Only skip the very last icon (Discover/Explore) - the second-to-last might be a server
         iter_start = start_idx
         iter_end = len(centers_abs)  # Scan all icons, including last ones
         
@@ -1509,12 +1509,11 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         new_servers_this_page = 0
         this_page_names = []  # Track names found on this page
         overlap_count = 0  # Count how many overlapping servers we see
-        is_near_bottom = False  # Track if we're in the last 2 icon positions
         
         for i in range(iter_start, iter_end):
             cy = centers_abs[i]
             y_hover = _clamp_y(cy)
-            is_near_bottom = (i >= len(centers_abs) - 2)
+            is_very_last = (i == len(centers_abs) - 1)  # Only skip the absolute last icon
             
             # Read tooltip - but DON'T skip position if OCR fails
             name = _read_tooltip(y_hover)
@@ -1526,9 +1525,9 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 reached_end = True
                 break
             
-            # Skip adding servers from last 2 positions (occlusion risk) unless end detected
-            if is_near_bottom:
-                print(f'  Skipping near-bottom icon at index {i} (occlusion risk): {repr(name)}')
+            # Only skip the very last icon (likely Discover/Explore which has tooltip issues)
+            if is_very_last:
+                print(f'  Skipping last icon at index {i}: {repr(name)}')
                 continue
             
             # Skip DM (shouldn't happen after page 0, but safety check)
