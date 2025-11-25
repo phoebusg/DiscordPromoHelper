@@ -61,57 +61,130 @@ def _safe_grab(bbox=None, timeout_sec: float = 1.0):
 def _vertical_projection_centers(img, w, h, merge_gap=8):
     """Return list of center Y positions (relative to the image top).
 
-    Input `img` should be a grayscale PIL image of the left server column
-    crop area.
+    Uses row-wise variance to detect icons against uniform background.
+    Icons have high variance (colorful pixels), gaps have low variance (solid color).
+    
+    Input `img` should be a grayscale PIL image of the left server column.
     """
     arr = list(img.getdata())
-    proj = [0] * h
+    
+    # Compute row variance (icons have texture, gaps are uniform)
+    variances = []
     for y in range(h):
-        row_sum = 0
-        offset = y * w
-        for x in range(w):
-            row_sum += 255 - arr[offset + x]
-        proj[y] = row_sum
-    maxp = max(proj) if proj else 0
-    thresh = max(8, int(maxp * 0.12))
-
-    regions = []
-    in_region = False
-    start = 0
-    for y, v in enumerate(proj):
-        if v >= thresh and not in_region:
-            in_region = True
-            start = y
-        elif v < thresh and in_region:
-            end = y
-            regions.append((start, end))
-            in_region = False
-    if in_region:
-        regions.append((start, h))
-
-    if not regions:
-        win_h = 48
-        step = max(24, int(win_h * 0.6))
-        regions = [(y0, y0 + win_h) for y0 in range(0, max(1, h - win_h + 1), step)]
-
-    merged = []
-    for r in regions:
-        if not merged:
-            merged.append(r)
+        row = [arr[y * w + x] for x in range(w)]
+        if not row:
+            variances.append(0)
             continue
-        prev = merged[-1]
-        if r[0] - prev[1] <= merge_gap:
-            merged[-1] = (prev[0], r[1])
+        mean = sum(row) / len(row)
+        variance = sum((v - mean) ** 2 for v in row) / len(row)
+        variances.append(variance)
+    
+    # Use adaptive threshold based on variance distribution
+    # Gaps are typically in the bottom 20-30% of variance values
+    sorted_vars = sorted(variances)
+    p25_idx = len(sorted_vars) // 4
+    p75_idx = (3 * len(sorted_vars)) // 4
+    p25 = sorted_vars[p25_idx] if sorted_vars else 0
+    p75 = sorted_vars[p75_idx] if sorted_vars else 1000
+    
+    # Gap threshold: values below the 25th percentile plus a margin
+    # This adapts to different themes and display scales
+    GAP_THRESH = max(100, p25 + (p75 - p25) * 0.15)
+    MIN_GAP_SIZE = 4  # Minimum consecutive gap rows
+    MIN_ICON_SIZE = 15  # Minimum icon height in pixels
+    
+    # Find gap regions (runs of low variance)
+    gaps = []
+    in_gap = False
+    gap_start = 0
+    
+    for y in range(h):
+        if variances[y] < GAP_THRESH and not in_gap:
+            in_gap = True
+            gap_start = y
+        elif variances[y] >= GAP_THRESH and in_gap:
+            in_gap = False
+            gap_size = y - gap_start
+            if gap_size >= MIN_GAP_SIZE:
+                gaps.append({'start': gap_start, 'end': y, 'size': gap_size})
+    
+    # Handle gap at end of image
+    if in_gap and (h - gap_start) >= MIN_GAP_SIZE:
+        gaps.append({'start': gap_start, 'end': h, 'size': h - gap_start})
+    
+    # If too few gaps found, use tighter threshold
+    if len(gaps) < 3:
+        tighter_thresh = max(50, p25 + (p75 - p25) * 0.05)
+        gaps = []
+        in_gap = False
+        gap_start = 0
+        for y in range(h):
+            if variances[y] < tighter_thresh and not in_gap:
+                in_gap = True
+                gap_start = y
+            elif variances[y] >= tighter_thresh and in_gap:
+                in_gap = False
+                if y - gap_start >= MIN_GAP_SIZE:
+                    gaps.append({'start': gap_start, 'end': y, 'size': y - gap_start})
+        if in_gap and (h - gap_start) >= MIN_GAP_SIZE:
+            gaps.append({'start': gap_start, 'end': h, 'size': h - gap_start})
+    
+    # If still no gaps found, fall back to fixed-step detection
+    if len(gaps) < 2:
+        step = 48
+        centers = list(range(24, h - 24, step))
+        return centers if centers else [h // 2]
+    
+    # Icons are the regions between consecutive gaps
+    icons = []
+    for i in range(len(gaps) - 1):
+        icon_start = gaps[i]['end']
+        icon_end = gaps[i + 1]['start']
+        icon_size = icon_end - icon_start
+        if icon_size >= MIN_ICON_SIZE:
+            center = (icon_start + icon_end) // 2
+            icons.append({'start': icon_start, 'end': icon_end, 'center': center, 'size': icon_size})
+    
+    # Split overly large icons (likely merged due to small separators)
+    # Typical icon is ~40-60px tall; anything > 70px likely contains multiple icons
+    MAX_SINGLE_ICON = 70
+    split_icons = []
+    for icon in icons:
+        if icon['size'] <= MAX_SINGLE_ICON:
+            split_icons.append(icon)
         else:
-            merged.append(r)
-
-    centers = []
-    for s, e in merged:
-        pad_v = min(28, int((e - s) * 0.35) + 8)
-        crop_top = max(0, s - pad_v)
-        crop_bot = min(h, e + pad_v)
-        center_y_local = crop_top + ((crop_bot - crop_top) // 2)
-        centers.append(center_y_local)
+            # Try to split by finding local variance minima within this region
+            region_start = icon['start']
+            region_end = icon['end']
+            region_vars = variances[region_start:region_end]
+            
+            # Find local minima that could be separators
+            minima = []
+            for j in range(5, len(region_vars) - 5):
+                local_val = region_vars[j]
+                # Check if this is a local minimum
+                window_before = region_vars[max(0, j-3):j]
+                window_after = region_vars[j+1:min(len(region_vars), j+4)]
+                if window_before and window_after:
+                    if local_val < min(window_before) * 0.6 and local_val < min(window_after) * 0.6:
+                        minima.append(region_start + j)
+            
+            if minima:
+                # Create sub-icons based on minima
+                sub_starts = [region_start] + minima
+                sub_ends = minima + [region_end]
+                for s, e in zip(sub_starts, sub_ends):
+                    size = e - s
+                    if size >= MIN_ICON_SIZE:
+                        split_icons.append({
+                            'start': s, 'end': e, 
+                            'center': (s + e) // 2, 'size': size
+                        })
+            else:
+                # Can't split, keep as is
+                split_icons.append(icon)
+    
+    centers = [icon['center'] for icon in split_icons]
     return centers
 
 
@@ -290,7 +363,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
 
     # local UI blacklist and DM keywords (keep in sync with utils)
     UI_BLACKLIST = {'friends', 'nitro', 'direct messages', 'direct message', 'home', 'add a server', 'create', 'download', 'explore public servers', 'threads', 'stage', 'settings', 'friends list'}
-    DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends')
+    DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends', 'messages', 'rectmessage', 'irectmessage')
 
     # safety margins (avoid titlebar/toolbar)
     top_skip_px = 48
@@ -393,7 +466,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
         except Exception:
             pass
 
-    # Take a snapshot and compute centers
+    # Take a snapshot and compute centers using variance-based detection
     col_img = _safe_grab(col_box)
     if col_img is None:
         print('Error: could not capture server column')
@@ -401,63 +474,22 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
     gray = col_img.convert('L')
     w, h = gray.size
     centers = _vertical_projection_centers(gray, w, h)
-    # If still too few centers, try a local-maximum peak detection to split a merged region
-    if len(centers) < 2:
-        try:
-            proj = [0] * h
-            arr = list(gray.getdata())
-            for y in range(h):
-                offset = y * w
-                s = 0
-                for x in range(w):
-                    s += 255 - arr[offset + x]
-                proj[y] = s
-            maxp = max(proj) if proj else 0
-            # Require peak to be at least 15% of max projection to filter noise
-            thresh = max(10, int(maxp * 0.15))
-            # smooth with 5-row window for better stability
-            smooth = [0] * h
-            for i in range(h):
-                total = 0
-                cnt = 0
-                for j in range(max(0, i - 2), min(h, i + 3)):
-                    total += proj[j]
-                    cnt += 1
-                smooth[i] = total // max(1, cnt)
-            peaks = []
-            for i in range(1, h - 1):
-                # require local maximum AND above threshold
-                if smooth[i] > smooth[i - 1] and smooth[i] >= smooth[i + 1] and smooth[i] >= thresh:
-                    peaks.append(i)
-            if peaks:
-                # Merge peaks closer than 40px (icon spacing is typically 48-56px)
-                merged = []
-                for p in peaks:
-                    if not merged:
-                        merged.append(p)
-                        continue
-                    if p - merged[-1] <= 40:
-                        # average nearby peaks
-                        merged[-1] = (merged[-1] + p) // 2
-                    else:
-                        merged.append(p)
-                centers = merged
-                print('Peak-based centers found:', len(centers), 'positions:', centers[:12])
-        except Exception:
-            pass
     print('Detected centers count:', len(centers), 'first few centers:', centers[:8])
-    # translate to absolute centers
+    
+    # Translate to absolute screen coordinates
     centers_abs = [top + c for c in centers]
-    # debug: diffs/median/large_gap for spacing detection
+    
+    # Debug: show diffs and spacing info
     diffs = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)] if len(centers) > 1 else []
     print('Centers diffs:', diffs[:10])
     median = None
     if diffs:
-        diffs_sorted = sorted([d for d in diffs if d > 4])
+        diffs_sorted = sorted([d for d in diffs if d > 10])
         median = diffs_sorted[len(diffs_sorted) // 2] if diffs_sorted else None
         large_gap = max(10, int(median * 1.4)) if median else None
-        print('Median step:', median, 'large_gap:', large_gap)
-    # If only a single center detected, try wider column capture (helps for rare layouts/themes)
+        print('Median step:', median, 'large_gap threshold:', large_gap)
+    
+    # If only a single center detected, try wider column capture
     if len(centers) < 2:
         try:
             wider_w = min(width, int(width * 0.12))
@@ -608,49 +640,87 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
 
     # Local spacing-based heuristic (moved above detection helper so nested helper can use it)
     def _detect_first_server_index_local(centers_list, top_y=top, header_skip=48):
+        """Detect the first server index based on spacing patterns.
+        
+        Discord server list structure (scrolled to top):
+        - Icon 0: DM/Home button at top
+        - (LARGE GAP ~1.5-2x normal): Separator between DM and servers  
+        - Icon 1+: Actual server icons with consistent spacing
+        - (possible folder separators have ~1.3x normal spacing)
+        - (LARGE GAP at bottom): "Add Server" button is separated
+        
+        The key insight is that the DM-to-first-server gap is significantly
+        larger than server-to-server spacing.
+        """
         if not centers_list:
             return 0
-        if len(centers_list) < 3:
+        if len(centers_list) < 2:
+            # Single center - check if it's past the header
             for i, c in enumerate(centers_list):
                 if c - top_y > header_skip + 6:
                     return i
             return 0
+        
+        # Calculate spacing between consecutive icons
         diffs = [centers_list[i + 1] - centers_list[i] for i in range(len(centers_list) - 1)]
-        diffs_filtered = [d for d in diffs if d > 4]
+        diffs_filtered = [d for d in diffs if d > 10]  # Filter tiny/noise diffs
+        
         if not diffs_filtered:
             return 0
-        # compute typical step using a mode-like histogram to avoid large outliers
+        
+        # Find the typical (median) server-to-server spacing
         diffs_sorted = sorted(diffs_filtered)
-        def _typical_step(dlist):
-            if not dlist:
-                return 56
-            # bucket diffs by 2px bins and find most frequent
-            from collections import Counter
-            buckets = [int(round(d / 2.0) * 2) for d in dlist]
-            c = Counter(buckets)
-            most_common = c.most_common(1)[0][0]
-            return int(most_common)
-        median = _typical_step(diffs_sorted)
-        tol = max(3, int(median * 0.20))
-        large_gap = max(10, int(median * 1.4))
-        # If the topmost gap (between centers[0] and centers[1]) is large, treat the first server as index 1
-        if diffs and diffs[0] > large_gap:
+        median_idx = len(diffs_sorted) // 2
+        median = diffs_sorted[median_idx]
+        
+        print(f'  Spacing analysis: {len(diffs)} diffs, median={median}px, diffs={diffs[:8]}')
+        
+        # Large gap threshold: 1.4x median indicates DM separator or folder gap
+        large_gap_thresh = int(median * 1.4)
+        
+        # Very large gap threshold: 1.8x median likely DM-to-server separator
+        very_large_gap_thresh = int(median * 1.8)
+        
+        # Check if first gap (centers[0] to centers[1]) is large
+        # This is the most common case - DM at index 0, first server at index 1
+        if diffs and diffs[0] >= large_gap_thresh:
+            print(f'  First gap {diffs[0]}px >= {large_gap_thresh}px threshold -> first server at index 1')
             return 1
-        for i in range(len(diffs)):
-            if diffs[i] > large_gap:
-                ok_follow = True
-                for j in range(i + 1, min(i + 3, len(diffs))):
-                    if abs(diffs[j] - median) > tol:
-                        ok_follow = False
-                        break
-                if ok_follow:
+        
+        # Look for first large gap anywhere (in case scroll position is off)
+        for i, d in enumerate(diffs):
+            if d >= very_large_gap_thresh:
+                # Verify next few spacings are normal (consistent server spacing)
+                next_diffs = diffs[i+1:i+4]
+                if next_diffs:
+                    avg_next = sum(next_diffs) / len(next_diffs)
+                    if abs(avg_next - median) < median * 0.3:  # Next spacings are consistent
+                        print(f'  Very large gap at index {i} ({d}px) -> first server at index {i+1}')
+                        return i + 1
+        
+        # Look for first large gap with consistent following spacing
+        for i, d in enumerate(diffs):
+            if d >= large_gap_thresh:
+                # Check if subsequent spacing is normal
+                next_diffs = diffs[i+1:i+4]
+                consistent_count = sum(1 for nd in next_diffs if abs(nd - median) < median * 0.25)
+                if consistent_count >= min(2, len(next_diffs)):
+                    print(f'  Large gap at index {i} ({d}px) with consistent following -> first server at index {i+1}')
                     return i + 1
+        
+        # Fallback: find first run of 3+ consistent spacings
         for i in range(len(diffs) - 2):
-            if abs(diffs[i] - median) <= tol and abs(diffs[i + 1] - median) <= tol and abs(diffs[i + 2] - median) <= tol:
+            if (abs(diffs[i] - median) < median * 0.25 and 
+                abs(diffs[i + 1] - median) < median * 0.25 and
+                abs(diffs[i + 2] - median) < median * 0.25):
+                print(f'  Found consistent run starting at index {i}')
                 return i
+        
+        # Last resort: first icon past header
         for i, c in enumerate(centers_list):
             if c - top_y > header_skip + 6:
                 return i
+        
         return 0
 
     # Detection helper: run one pass of hover-based detection, returning a candidate or None
@@ -662,15 +732,36 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
         candidate_idx = None
         hover_found = None
         centers_iter_local = centers_abs[:max_centers] if (max_centers and max_centers > 0) else centers_abs
+        
+        # First, use spacing to determine first server index - this is the PRIMARY method
+        # Don't rely on OCR to skip/validate positions since OCR is unreliable
+        spacing_idx = _detect_first_server_index_local(centers_iter_local, top_y=top)
+        print(f'Spacing detection says first server at index {spacing_idx}')
+        
+        # If spacing found a valid index, trust it and start from there
+        if spacing_idx > 0 and spacing_idx < len(centers_iter_local):
+            cy = centers_iter_local[spacing_idx]
+            y_for_hover = _clamp_hover_y(cy)
+            candidate = (cx, int(y_for_hover))
+            candidate_idx = spacing_idx
+            candidate_source = 'spacing-primary'
+            print(f'Using spacing-based first server at index {spacing_idx}, y={cy}')
+            return candidate, candidate_source, candidate_idx
+        
+        # Fallback: scan all icons if spacing detection failed
         FIRST_SERVER_SCAN_MAX = 3
         early_nonempty_found = False
         for i, cy in enumerate(centers_iter_local):
             # skip near header
             if cy - top <= 48:
                 continue
-            # ensure icon area present
-            if not _is_icon_by_variance(gray, cx - left, cy - top, size=40, var_threshold=9.0):
-                continue
+            # Check if icon area has content (variance check) but DON'T skip on failure
+            # Dark icons may have low variance but are still valid servers
+            has_icon = True
+            try:
+                has_icon = _is_icon_by_variance(gray, cx - left, cy - top, size=40, var_threshold=6.0)
+            except Exception:
+                has_icon = True  # Assume icon present if check fails
             # hover
             y_for_hover = _clamp_hover_y(cy)
             if pyautogui:
@@ -782,11 +873,8 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
             candidate_idx = i
             candidate_source = 'hover'
             break
-        # If first non-empty OCR is suspiciously late beyond FIRST_SERVER_SCAN_MAX, do not accept and retry
-        if candidate and candidate_idx is not None:
-            if candidate_idx > FIRST_SERVER_SCAN_MAX and not early_nonempty_found:
-                print('Suspiciously late first non-empty OCR at index', candidate_idx, 'with no earlier non-empty; asking retry')
-                return None, None, None
+        # Trust spacing-based detection - don't reject based on OCR timing
+        # The spacing math is reliable; OCR is not
 
         # spacing fallback if no hover candidate
         if not candidate and centers_abs:
@@ -850,23 +938,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                                     break
             except Exception:
                 pass
-        # If candidate chosen by spacing is not at top and earlier centers exist, probe them to find the first server
-        try:
-            if candidate and candidate_source and candidate_source.startswith('spacing') and candidate_idx is not None and candidate_idx > 1:
-                for earlier_i in range(0, candidate_idx):
-                    try:
-                        y_earlier = _clamp_hover_y(centers_abs[earlier_i])
-                        txt_ear = _hover_and_read_local(cx, y_earlier, hover_delay=hover_delay) or ''
-                    except Exception:
-                        txt_ear = ''
-                    if txt_ear and not any(k in txt_ear.lower() for k in DM_KEYWORDS) and not any(k in txt_ear.lower() for k in UI_BLACKLIST):
-                        print('Earlier hover probe found server at index', earlier_i, 'prefer it over spacing-based candidate')
-                        candidate = (cx, int(y_earlier))
-                        candidate_idx = earlier_i
-                        candidate_source = 'spacing-earlier-probe-final'
-                        break
-        except Exception:
-            pass
+        # Trust spacing-based detection - don't override with earlier probes that may misidentify DM/UI elements
         return candidate, candidate_source, candidate_idx
     # End helper _run_detection_once
 
@@ -1153,6 +1225,293 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
     return (cx, int(final_y))
 
 
+def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_servers: int = 50):
+    """Iterate through ALL servers and return their names and positions.
+    
+    Returns list of dicts: [{'index': int, 'y': int, 'name': str or None}, ...]
+    
+    This function:
+    1. Scrolls to top first
+    2. Detects servers using spacing-based detection
+    3. Iterates through visible servers, collecting names via OCR
+    4. Scrolls down using the last server as anchor for overlap
+    5. Continues until "Add a Server" is detected or no new servers found
+    """
+    import time
+    
+    # Get Discord window
+    bbox = None
+    if utils:
+        try:
+            bbox = utils.find_and_focus_discord()
+        except Exception:
+            bbox = None
+    
+    if not bbox:
+        print('Discord window not found')
+        return []
+    
+    left, top, width, height = bbox
+    col_w = max(48, int(width * 0.08))
+    col_box = (max(0, left - 2), top, min(left + col_w + 4, left + width), top + height)
+    cx = left + (col_w // 2)
+    
+    # Debug save dir
+    debug_dir = None
+    if debug_save:
+        try:
+            debug_dir = os.path.join('data', 'debug')
+            os.makedirs(debug_dir, exist_ok=True)
+        except Exception:
+            debug_dir = None
+    
+    # Safety margins
+    top_skip_px = 48
+    bottom_skip_px = 64
+    
+    def _clamp_y(y):
+        miny = top + top_skip_px + 6
+        maxy = top + height - bottom_skip_px - 6
+        return int(max(miny, min(y, maxy)))
+    
+    # Keywords to detect end/DM
+    DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends', 'messages')
+    END_KEYWORDS = ('add a server', 'add server', 'create', 'explore')
+    
+    # Scroll to ABSOLUTE TOP - use direct scrolling since _seek_extreme may have reversed sign
+    print('Scrolling to top...')
+    if pyautogui:
+        # Move mouse to server column first
+        try:
+            safe_y = top + height // 2
+            pyautogui.moveTo(cx, safe_y, duration=0.1)
+            time.sleep(0.1)
+        except Exception:
+            pass
+        
+        # Aggressive scroll up - positive = scroll up on macOS
+        for i in range(40):
+            try:
+                pyautogui.scroll(15)
+                time.sleep(0.03)
+            except Exception:
+                pass
+            # Brief pause every 10 scrolls
+            if (i + 1) % 10 == 0:
+                time.sleep(0.15)
+        time.sleep(0.4)
+    
+    # Helper to read tooltip at position
+    def _read_tooltip(y_pos):
+        name = None
+        if not pytesseract:
+            return None
+        # Move and wait for tooltip
+        if pyautogui:
+            try:
+                pyautogui.moveTo(cx, y_pos, duration=0.08)
+                time.sleep(hover_delay)
+            except Exception:
+                pass
+        # Try multiple tooltip positions
+        tooltip_boxes = [
+            (cx + 50, y_pos - 20, cx + 280, y_pos + 20),
+            (cx + 40, y_pos - 35, cx + 320, y_pos + 15),
+            (cx + 15, y_pos - 30, cx + 250, y_pos + 10),
+        ]
+        for tb in tooltip_boxes:
+            try:
+                tbimg = _safe_grab(tb)
+                if tbimg:
+                    if ImageOps:
+                        tbimg = ImageOps.autocontrast(tbimg.convert('RGB'))
+                    txt = pytesseract.image_to_string(tbimg, config='--psm 7').strip()
+                    if txt and len(txt) > 1:
+                        return txt
+            except Exception:
+                pass
+        return None
+    
+    # Helper to detect and analyze current viewport
+    def _analyze_viewport(is_first_page=True):
+        col_img = _safe_grab(col_box)
+        if col_img is None:
+            return [], None, None
+        
+        gray = col_img.convert('L')
+        w, h = gray.size
+        centers = _vertical_projection_centers(gray, w, h)
+        centers_abs = [top + c for c in centers]
+        
+        if len(centers) < 2:
+            return centers_abs, None, 48
+        
+        # Calculate spacing
+        diffs = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+        diffs_sorted = sorted([d for d in diffs if d > 10])
+        median = diffs_sorted[len(diffs_sorted) // 2] if diffs_sorted else 48
+        
+        # Only look for DM gap on first page
+        dm_idx = None
+        if is_first_page:
+            large_gap_thresh = int(median * 1.6)  # Require bigger gap for DM detection
+            very_large_thresh = int(median * 1.8)
+            
+            for i, d in enumerate(diffs):
+                if d >= very_large_thresh:
+                    dm_idx = i  # DM is at index i, first server at i+1
+                    break
+                elif d >= large_gap_thresh and i < 4:
+                    # Only consider large gap as DM if it's near the top
+                    dm_idx = i
+                    break
+        
+        return centers_abs, dm_idx, median
+    
+    # Main iteration
+    all_servers = []
+    page = 0
+    max_pages = 20  # Safety limit
+    reached_end = False
+    total_servers_counted = 0  # Track total position in the list
+    
+    while page < max_pages and not reached_end:
+        print(f'\n=== Page {page} ===')
+        
+        # Analyze current viewport
+        centers_abs, dm_idx, median = _analyze_viewport(is_first_page=(page == 0))
+        print(f'Detected {len(centers_abs)} icons, dm_idx={dm_idx}, median={median}')
+        
+        if not centers_abs:
+            print('No icons detected, stopping')
+            break
+        
+        # Determine start index for this page
+        if page == 0:
+            # FIRST PAGE: Must find DM anchor via OCR to ensure we're at the top
+            dm_found_idx = None
+            print('Scanning for DM anchor via OCR...')
+            
+            for i, cy in enumerate(centers_abs[:6]):  # Check first 6 icons max
+                y_hover = _clamp_y(cy)
+                txt = _read_tooltip(y_hover)
+                ltxt = (txt or '').lower()
+                print(f'  Icon {i} at y={cy}: "{txt}"')
+                
+                if any(k in ltxt for k in DM_KEYWORDS):
+                    dm_found_idx = i
+                    print(f'  -> DM found at index {i}')
+                    break
+            
+            if dm_found_idx is None:
+                print('WARNING: Could not confirm DM anchor!')
+                if dm_idx is not None:
+                    start_idx = dm_idx + 1
+                else:
+                    start_idx = 0
+            else:
+                start_idx = dm_found_idx + 1
+                print(f'DM confirmed at index {dm_found_idx}, starting at index {start_idx}')
+        else:
+            # SUBSEQUENT PAGES: We scrolled so that 3 icons overlap
+            # Skip those 3 overlap icons and start fresh
+            start_idx = 3
+            print(f'Page {page}: skipping first 3 icons (overlap from previous page)')
+        
+        # Calculate safe iteration range
+        # Skip last 2 icons to avoid "NEW" notification occlusion at bottom
+        iter_start = start_idx
+        iter_end = len(centers_abs) - 2
+        iter_end = max(iter_start + 1, iter_end)
+        
+        print(f'Iterating from index {iter_start} to {iter_end - 1}')
+        
+        new_servers_this_page = 0
+        
+        for i in range(iter_start, iter_end):
+            cy = centers_abs[i]
+            y_hover = _clamp_y(cy)
+            
+            # Read tooltip - but DON'T skip position if OCR fails
+            name = _read_tooltip(y_hover)
+            lname = (name or '').lower()
+            
+            # Check for end marker
+            if name and any(k in lname for k in END_KEYWORDS):
+                print(f'  Detected end marker "{name}" at index {i}')
+                reached_end = True
+                break
+            
+            # Skip DM (shouldn't happen after page 0, but safety check)
+            if name and any(k in lname for k in DM_KEYWORDS):
+                print(f'  Skipping DM at index {i}: {name}')
+                continue
+            
+            # Valid server position - ALWAYS add (trust spacing, OCR may fail)
+            new_servers_this_page += 1
+            total_servers_counted += 1
+            
+            server_info = {
+                'index': len(all_servers),
+                'raw_index': i,
+                'page': page,
+                'y': y_hover,
+                'name': name  # May be None - that's OK
+            }
+            all_servers.append(server_info)
+            print(f'  Server {server_info["index"]}: y={y_hover}, name={repr(name)}')
+            
+            # Save debug image
+            if debug_dir:
+                try:
+                    hf = os.path.join(debug_dir, f'server_{len(all_servers)}_{int(time.time()*1000)}.png')
+                    rr = (cx - 50, int(cy) - 40, cx + 300, int(cy) + 40)
+                    img = _safe_grab(rr)
+                    if img:
+                        img.save(hf)
+                except Exception:
+                    pass
+            
+            # Safety limit
+            if len(all_servers) >= max_servers:
+                print(f'Reached max_servers limit ({max_servers})')
+                reached_end = True
+                break
+        
+        if reached_end:
+            break
+        
+        # Check if we found any new servers
+        if new_servers_this_page == 0:
+            print('No new servers found on this page, stopping')
+            break
+        
+        # Scroll down for next page
+        # We want to keep 3 icons as overlap, so scroll by (processed - 3) icons
+        overlap_icons = 3
+        icons_to_scroll = max(1, new_servers_this_page - overlap_icons)
+        
+        # On macOS: ~4 scroll units per server icon (empirically determined)
+        scroll_per_icon = 4
+        total_scroll = icons_to_scroll * scroll_per_icon
+        
+        print(f'Scrolling down by {icons_to_scroll} icons ({total_scroll} scroll units)...')
+        
+        if pyautogui:
+            try:
+                for _ in range(total_scroll):
+                    pyautogui.scroll(-1)  # Small increments, negative = down
+                    time.sleep(0.03)
+            except Exception:
+                pass
+        
+        time.sleep(0.35)
+        page += 1
+    
+    print(f'\n=== Finished: found {len(all_servers)} servers across {page + 1} pages ===')
+    return all_servers
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Find and hover the first Discord server')
@@ -1164,15 +1523,27 @@ if __name__ == '__main__':
     parser.add_argument('--hover-delay', type=float, default=0.6, help='Hover delay used for reading tooltip')
     parser.add_argument('--max-icon-retries', type=int, default=3, help='Max jitter retries per icon for tooltip OCR')
     parser.add_argument('--start-index-offset', type=int, default=0, help='Adjust start index by N servers (negative means earlier)')
+    parser.add_argument('--list-all', action='store_true', help='List all servers instead of just finding the first')
     args = parser.parse_args()
-    res = find_and_hover_first_server(
-        start_from_top=args.wait_top,
-        hover_delay=args.hover_delay,
-        test_target=args.test_target,
-        force_run=args.force_run,
-        debug_save=args.debug_save,
-        max_centers=(args.max_centers if args.max_centers > 0 else None),
-        max_icon_retries=args.max_icon_retries,
-        start_index_offset=args.start_index_offset,
-    )
-    print('Hovered at:', res)
+    
+    if args.list_all:
+        servers = iterate_all_servers(
+            hover_delay=args.hover_delay,
+            debug_save=args.debug_save,
+            max_servers=args.max_centers if args.max_centers > 0 else 50
+        )
+        print(f'\\nFound {len(servers)} servers:')
+        for s in servers:
+            print(f'  [{s["index"]}] {s["name"] or "(no name detected)"}')
+    else:
+        res = find_and_hover_first_server(
+            start_from_top=args.wait_top,
+            hover_delay=args.hover_delay,
+            test_target=args.test_target,
+            force_run=args.force_run,
+            debug_save=args.debug_save,
+            max_centers=(args.max_centers if args.max_centers > 0 else None),
+            max_icon_retries=args.max_icon_retries,
+            start_index_offset=args.start_index_offset,
+        )
+        print('Hovered at:', res)
