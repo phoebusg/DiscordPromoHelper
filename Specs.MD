@@ -6,99 +6,124 @@ Purpose:
 - Automate respectful self-promotion in Discord servers by detecting promotion channels and posting a preset message with a stream link.
 - Respect anti-spam by queueing posts and enforcing per-channel/posting delays.
 
-Core modules and responsibilities:
+Architecture Overview
+=====================
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Discord Promo Helper                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  UI Layer (src/ui.py)                                               │
+│  ├── Server list with friendly names                                │
+│  ├── Per-server channel configuration                               │
+│  ├── Game tag filtering                                             │
+│  └── Settings (rate limit, etc.)                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  Business Logic                                                      │
+│  ├── src/main.py          Entry point (--ui, --cli, --scan)        │
+│  ├── src/promotion_helper.py  Posting queue & rate limiting        │
+│  ├── src/server_config.py     Server settings (friendly names)     │
+│  └── src/storage.py           Timestamp persistence                │
+├─────────────────────────────────────────────────────────────────────┤
+│  Discord Automation                                                  │
+│  ├── src/discord_nav.py   Server scanning & navigation             │
+│  └── src/utils.py         OCR, window management, helpers          │
+├─────────────────────────────────────────────────────────────────────┤
+│  Data Files                                                          │
+│  ├── servers.json              Scanned servers (OCR names)         │
+│  ├── server_config.json        User config (friendly names, tags)  │
+│  └── data/last_post_timestamps.json  Rate limit tracking           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Core Modules
+============
 
 - `src/config.py`
-  - `CHANNEL_KEYWORDS`: list of keywords used to detect promo channels.
+  - `CHANNEL_KEYWORDS`: list of keywords used to detect promo channels
+  - `RATE_LIMIT_HOURS`: default 3 hours between posts to same channel
+  - `COMMON_GAME_TAGS`: predefined game tags for filtering
+
+- `src/main.py` (Entry Point)
+  - `--ui`: Launch Tkinter GUI (default)
+  - `--cli`: Run in legacy CLI mode
+  - `--scan`: Run server scan only
+  - `--post TITLE LINK`: Post promotion with given message
+  - `--game TAG`: Filter servers by game tag
+  - `--dry-run`: Show what would happen without posting
+
+- `src/ui.py` (Tkinter GUI)
+  - Server list with filtering
+  - Per-server settings dialog (friendly name, channels, game tags)
+  - Game filter management
+  - Rate limit configuration
+
+- `src/server_config.py`
+  - Load/save server configuration from `server_config.json`
+  - Friendly name management (OCR names are often garbled)
+  - Game tag assignment for filtering
+  - Promo channel list per server
+  - Enable/disable servers
+
+- `src/discord_nav.py`
+  - Server column scanning with OCR
+  - Tooltip hover and reading
+  - Scroll management for full server enumeration
+  - Outputs to `servers.json`
 
 - `src/utils.py`
-  - `is_tesseract_installed()` / install helpers: detect and install Tesseract OCR on Windows/macOS/Linux.
-  - `check_tesseract_path()` / `update_tesseract_cmd()`: ensure `pytesseract` points to a valid binary.
-  - `is_discord_running()` / `run_discord()`: detect and launch Discord.
-  - `find_and_focus_discord()`: find Discord window and bring it to foreground. (Updated to have cross-platform fallback using `pygetwindow`.)
-  - `read_screen_with_tesseract()`: capture screen and OCR to find UI elements.
+  - Tesseract OCR setup and helpers
+  - Discord window detection and focus
+  - Channel position finding via OCR
 
 - `src/promotion_helper.py`
-  - `find_channel_position()`: (implemented in `utils`), locate the promo channel in Discord's UI.
-  - `post_update()`: type/post message to a given channel position.
-  - `queue_updates()`: manages repeated posting with delays to avoid spam.
+  - `post_update()`: type/post message to a channel
+  - `queue_updates()`: manages repeated posting with delays
 
-Immediate issues and tasks (short-term):
-1. Window-finding reliability (macOS):
-   - Ensure `find_and_focus_discord()` correctly enumerates windows on macOS (uses `pygetwindow` fallback now).
-   - Verify macOS accessibility/screen-recording permissions for `Pillow`/`ImageGrab` and `PyAutoGUI`.
+- `src/storage.py`
+  - Per-channel timestamp tracking
+  - Cooldown enforcement
+  - Whitelist/blacklist checking
 
-2. OCR reliability and paths:
-   - Confirm `pytesseract.pytesseract.tesseract_cmd` resolves to actual binary on macOS (Homebrew path: `/opt/homebrew/bin/tesseract` or `/usr/local/bin/tesseract`).
-   - Add clear notes for users to install Tesseract and grant screen permissions.
+Rate Limiting
+=============
 
-3. Missing behavior to implement to match Windows behavior:
-   - Robust window activation when Discord is minimized or hidden (macOS may require `osascript` to bring app to front).
-   - Channel detection heuristics: detect the left-sidebar area and locate promo channels via OCR + anchor image matching.
+**Default: 3 hours per promo channel**
 
-4. Respectful posting policy (requirements):
-   - Per-server rate limiting (default: max 1 message per channel per hour).
-   - Queue persistence across restarts (optional): store timestamps in a local file/db.
-   - Blacklist/whitelist of servers/channels in `config.py`.
+Rationale: Many Discord servers have anti-spam rules limiting self-promotion 
+to once every few hours. A 3-hour default is respectful and unlikely to 
+trigger moderator action.
 
-Planned next steps:
-- [ ] Add macOS-specific activation via `osascript` when `pygetwindow`/`pyautogui` cannot activate the window.
-- [ ] Add user-facing `SETUP.md` with required permissions and Tesseract install steps for macOS.
-- [ ] Add a lightweight storage (JSON) to track last-post times per channel to avoid over-posting.
-- [ ] Manual test on macOS and iterate on timing/screenshot regions for reliable channel detection.
+Implementation:
+- Timestamps stored in `data/last_post_timestamps.json`
+- Key format: `"{server_name}:{channel_name}"`
+- Before posting, check if enough time has passed
+- Update timestamp after successful post
+- Configurable via UI or `server_config.json`
 
-Server list scanning: deterministic nested scan (Plan)
---------------------------------------------------
-Goal: reliable, deterministic scan of Discord's left server column that:
-- Starts explicitly at the first server icon after the DM/home icon.
-- Visits every visible server icon top→bottom.
-- Hovers each icon and OCRs its tooltip. Do not proceed to the next icon until a non-empty normalized name is read (or an explicit stop).
-- After scanning all visible icons, scroll so that the previous last visible icon becomes the new top.
-- Repeat until the viewport stabilizes at the bottom.
+Game-Based Filtering
+====================
 
-Design decisions and rationale:
-- Determinism: Avoid heuristics that rely on start position or fragile anchors. Instead, use a precise top→bottom order centered on computed icon centers.
-- Blocking OCR per-icon: Enforce strict correctness; the scanner must not skip unread icons. A bounded retry cap can be used to avoid indefinite stalls.
-- UI label blacklist: Recognize and ignore non-server UI labels (DMs, Nitro, Explore Public Servers, etc.). These entries should be recognized and not treated as servers.
-- Thumbnail deduplication: Save icon thumbnails and avoid re-adding duplicate icons across runs.
+**Purpose**: When streaming a specific game, only post to relevant servers.
 
-Implementation steps:
-1. Replace the current scanning loop with a deterministic algorithm in `capture_discord_servers`:
-   - Seek to the top of the server column via repeated small upward scrolls until viewport fingerprint stabilizes.
-   - Build the list of center Y positions for the current viewport (use vertical projection as currently implemented).
-   - Detect which center corresponds to the DM/Home icon by hovering the centers and OCRing. Set the first server index to be the center immediately following the DM/Home center.
-   - For each center from first server → last visible:
-     - Ensure an icon is present via `_is_icon_at` check before hovering.
-     - Hover, wait, and OCR until a valid name is returned or a bounded retry count is reached.
-     - If the OCR indicates a UI label or matches blacklist keywords, do NOT add a server record; mark the center as processed.
-     - Otherwise, save icon PNG, update thumbnail dedupe data, save metadata immediately to `servers.json`, and mark center processed.
-   - After all visible centers are processed, perform a scroll that moves the last processed icon to the viewport top (make minimal scroll to avoid skipping icons).
-   - Continue until fingerprint repeats for 3-4 iterations with no new servers found.
+Example use case:
+- User is streaming Fortnite
+- Only servers tagged with "fortnite" receive promotions
+- AoE2 servers are skipped for this session
 
-2. Safety and robustness:
-   - Add a bounded retry for the per-icon OCR: by default 120 attempts (approx 10–20s), but this can be set via `max_icon_retries` in call signature.
-   - Add `should_stop_scan()` sentinel checks frequently to allow graceful aborts.
-   - Make the scroll calculation relative to the viewport rather than absolute amounts — avoid hard-coded `scroll_amount` values when possible.
-   - Add small jitter while hovering to provoke tooltips (left→right jitter and micro-scroll if necessary).
+Configuration:
+- Game tags assigned per server in `server_config.json`
+- Filter applied via `--game TAG` CLI flag or UI selection
+- Multiple tags per server supported (e.g., "fortnite", "battle royale")
 
-3. Tests & validation:
-   - Create a test harness (`scripts/test_full_scan.py`) to run the scan and store output in `data/test_scan/`.
-   - Validate scanning behavior using a visible Discord window: confirm `servers.json` contains non-empty names for all visible servers.
-   - Generate `viewport_history.json` showing per-viewport OCR sets; verify monotonic coverage from top→bottom and no missing icons.
-   - Integration acceptance: run multiple times with different initial scrollbar positions and confirm the output is identical.
-
-4. Cleanup & risk control:
-   - Remove leftover debug screenshot flows and non-essential heuristics that conflict with the deterministic nested-for approach.
-   - Retain low-level helpers (`_get_viewport_centers`, `find_and_focus_discord`, `_is_icon_at`, `_hover_and_read`) to keep code modular.
-   - Provide a bounded retry cap and fail-safe to avoid indefinite hangs if a tooltip never appears.
-
-Acceptance criteria:
-- Determinism: Starting anywhere in the server list, the scan produces the same `servers.json` result for the same Discord server order.
-- Completeness: All visible server icons get a non-empty `name` or a recorded icon with blank name marked for later repair.
-- Stability: The scan terminates when viewport fingerprint repeats 3–4 times without new servers.
-- Usability: `scripts/test_full_scan.py` runs end-to-end on macOS with appropriate permissions.
-
-Next short-term tasks:
+Predefined tags (in config.py):
+- FPS: fortnite, valorant, apex, warzone, cs2, overwatch
+- MOBA: league, dota
+- MMO: wow, ffxiv
+- Strategy: aoe2, aoe4
+- Sandbox: minecraft, roblox, gta
+- Classic: ultima, uo
+- General: variety, just chatting, irl
 - [ ] Add `max_icon_retries` argument to `capture_discord_servers` and expose it via `scripts/test_full_scan.py`.
 - [ ] Add a preflight check for macOS Screen Recording permission and `tesseract` availability.
 - [ ] Run an instrumented scan in a visible Discord session, capture `viewport_history.json`, and verify coverage.
@@ -219,4 +244,165 @@ Some servers customize promo channel names. If channel name is ambiguous:
 3. [ ] `find_promo_channels(keywords)` - filter for promo keywords
 4. [ ] `verify_channel_content(channel)` - enter and read messages
 5. [ ] `save_server_channels()` - persist to JSON
+
+Future Features (Planned)
+=========================
+
+## Mid-Stream Game Change Re-Posting
+
+**Scenario**: Streamer starts with Fortnite, switches to Minecraft mid-stream.
+
+**Behavior**:
+1. Detect game category change (via Twitch/YouTube API or manual trigger)
+2. Identify servers tagged with the NEW game (Minecraft servers)
+3. Check rate limit for those servers' promo channels
+4. If allowed (3hr since last post), post update to new game's servers
+5. Do NOT re-post to servers already posted this session
+
+**Technical requirements**:
+- Track "posted this session" separately from cooldown timestamps
+- Streaming platform API integration (Twitch, YouTube)
+- Game change detection callback/webhook
+- Session state management
+
+**Configuration**:
+- `enable_game_change_repost`: true/false (default: false)
+- `game_change_cooldown_minutes`: minimum time after game change before repost (default: 15)
+- `max_reposts_per_session`: prevent spam on frequent game changes (default: 2)
+
+**NOT in scope**:
+- Automatic game detection from Discord activity status
+- Multi-platform simultaneous streaming
+
+## Stream Status Integration
+
+**Purpose**: Auto-detect stream info and update promotions accordingly.
+
+**Twitch Integration**:
+- OAuth connection to Twitch API
+- Detect stream title, game category, viewer count
+- Auto-select servers based on detected game
+- Include viewer count in promo message (optional)
+
+**YouTube Integration**:
+- Similar OAuth flow
+- Detect live stream status and title
+- Game category detection (if available)
+
+**Configuration**:
+- Platform API keys (stored securely)
+- Message templates with placeholders: `{title}`, `{game}`, `{viewers}`, `{url}`
+- Auto-post on stream start (optional, with rate limit)
+
+## Scheduled Promotions
+
+**Purpose**: Queue promotions for specific times.
+
+**Use case**:
+- Schedule promotion 15 minutes after stream start
+- Periodic re-promotion every 2 hours during long streams
+- Pre-scheduled promotion for announced stream times
+
+## Multi-Message Templates
+
+**Purpose**: Avoid repetitive identical messages.
+
+**Implementation**:
+- Define multiple message templates per server/channel
+- Rotate through templates on each post
+- Track last-used template to ensure variety
+
+## Analytics & Reporting
+
+**Purpose**: Track promotion effectiveness.
+
+**Metrics to track**:
+- Posts sent per server/channel
+- Time since last post
+- Failed posts (errors, rate limits hit)
+- Server/channel coverage percentage
+
+**Reports**:
+- Weekly summary of promotion activity
+- Servers not promoted to in X days
+- Channels with frequent rate limit hits
+
+Data Files Reference
+====================
+
+| File | Purpose | Created By |
+|------|---------|------------|
+| `servers.json` | Scanned server list (OCR names, positions) | `discord_nav.py` |
+| `server_config.json` | User settings (friendly names, tags, channels) | `ui.py` / `server_config.py` |
+| `data/last_post_timestamps.json` | Rate limit tracking | `storage.py` |
+| `server_channels.json` | (Future) Per-server channel scan results | (not yet implemented) |
+
+Server Config JSON Format
+-------------------------
+
+```json
+{
+  "servers": {
+    "normalized ocr name key": {
+      "ocr_name": "T900fficial Discord",
+      "friendly_name": "T90 Official Discord",
+      "promo_channels": ["self-promo", "share-your-work"],
+      "game_tags": ["aoe2", "age of empires", "strategy"],
+      "enabled": true,
+      "notes": "Age of Empires 2 community"
+    }
+  },
+  "game_filters": {
+    "fortnite": ["Fortnite Official", "FN Streams"],
+    "aoe2": ["T90 Official Discord", "AoE2 Community"]
+  },
+  "settings": {
+    "rate_limit_hours": 3,
+    "default_enabled": true
+  }
+}
+```
+
+Development Notes
+=================
+
+## macOS Requirements
+
+1. **Screen Recording Permission**: Required for screenshots
+   - System Settings → Privacy & Security → Screen Recording
+   - Grant access to Terminal / VS Code / Python
+
+2. **Accessibility Permission**: Required for mouse/keyboard control
+   - System Settings → Privacy & Security → Accessibility
+
+3. **Tesseract OCR**: Required for text recognition
+   ```bash
+   brew install tesseract
+   ```
+
+## Running the App
+
+```bash
+# Activate virtual environment
+source .venv/bin/activate
+
+# Launch GUI
+python -m src.main
+
+# Or run specific modes
+python -m src.main --scan      # Scan servers only
+python -m src.main --cli       # CLI mode
+python -m src.main --help      # Show help
+```
+
+## Testing
+
+```bash
+# Run server scan test
+python scripts/test_full_scan.py
+
+# Test imports
+python -c "from src.server_config import load_config; print(load_config())"
+```
+
 

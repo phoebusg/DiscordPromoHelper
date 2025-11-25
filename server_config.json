@@ -1,0 +1,857 @@
+{
+  "servers": {
+    "innovation inc. 2/28 boo": {
+      "ocr_name": "Innovation Inc. 2/28 Boo",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "a k": {
+      "ocr_name": "a k",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ea a": {
+      "ocr_name": "ea A",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "the kiara show": {
+      "ocr_name": "The Kiara Show",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "the 90s roleplay": {
+      "ocr_name": "The 90s Roleplay",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\u201cdevelopers": {
+      "ocr_name": "\u201cDevelopers",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "t900fficial discord": {
+      "ocr_name": "T900fficial Discord",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "on slugs m discord": {
+      "ocr_name": "on slugs m Discord",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "lpexeees": {
+      "ocr_name": "lpexeees",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "lreanation": {
+      "ocr_name": "LREANATION",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "caked up .ncements": {
+      "ocr_name": "Caked Up .ncements",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "irk age: redemption": {
+      "ocr_name": "irk Age: Redemption",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "aavate": {
+      "ocr_name": "aavate",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\\productions": {
+      "ocr_name": "\\Productions",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "@ 7 els": {
+      "ocr_name": "@ 7 els",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "o_o": {
+      "ocr_name": "o_o",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "mmnitien": {
+      "ocr_name": "mmnitien",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "showrunner alpha": {
+      "ocr_name": "Showrunner ALPHA",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "wee lotus l": {
+      "ocr_name": "wee Lotus L",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "os \u201cj avirwvy": {
+      "ocr_name": "os \u201cJ avirwvy",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "white lotus anels": {
+      "ocr_name": "White Lotus anels",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "lumi land": {
+      "ocr_name": "Lumi land",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\u2018 marimo :lopment": {
+      "ocr_name": "\u2018 marimo :lopment",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "peubveiatess -": {
+      "ocr_name": "peubveiatess -",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\u2014\u2014": {
+      "ocr_name": "\u2014\u2014",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ysuppyzisters ae": {
+      "ocr_name": "ysuppyzisters ae",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "dino nuggies": {
+      "ocr_name": "Dino Nuggies",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "alls fallen angels &": {
+      "ocr_name": "alls Fallen Angels &",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "erent": {
+      "ocr_name": "erent",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "eiberator's house": {
+      "ocr_name": "EiberAtor's House",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "eklipse.gg m=": {
+      "ocr_name": "Eklipse.gg m=",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "malek's night owls": {
+      "ocr_name": "Malek's Night Owls",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "liberator's house 2/28 boo": {
+      "ocr_name": "Liberator's House 2/28 Boo",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "eklipse.gg pannels": {
+      "ocr_name": "Eklipse.gg pannels",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "chacsmachinegr": {
+      "ocr_name": "ChacsMachineGR",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\u201cyou.com -uncements": {
+      "ocr_name": "\u201cYou.com -uncements",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "elata biosciences": {
+      "ocr_name": "Elata Biosciences",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ashesctigrestion\u2019": {
+      "ocr_name": "AshesctiGrestion\u2019",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "co's party pack": {
+      "ocr_name": "CO'S PARTY PACK",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "snake queen's den": {
+      "ocr_name": "Snake Queen's Den",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "you.com \"discord": {
+      "ocr_name": "You.com \"Discord",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ashes of creation": {
+      "ocr_name": "Ashes of Creation",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "zeruss pit": {
+      "ocr_name": "zeruss Pit",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\u2018 grogcloud \u00bbment": {
+      "ocr_name": "\u2018 GrogCloud \u00bbment",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "jgebusd'apolcis rays": {
+      "ocr_name": "jgebusd'Apolcis Rays",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "y server": {
+      "ocr_name": "y server",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ou pit 1 discord": {
+      "ocr_name": "ou Pit 1 Discord",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ioebusg apollo's rays": {
+      "ocr_name": "ioebusG Apollo's Rays",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "udio come": {
+      "ocr_name": "udio come",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "dspy ciment": {
+      "ocr_name": "DSPY ciment",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "aphitt levelopment": {
+      "ocr_name": "aphitt levelopment",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "phe time": {
+      "ocr_name": "phe TIME",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "cago stories": {
+      "ocr_name": "cago Stories",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "dspy liem discord": {
+      "ocr_name": "DSPy liem Discord",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "apne il 2/28 boo": {
+      "ocr_name": "apne il 2/28 Boo",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "lrwoustea time": {
+      "ocr_name": "LRWOUSTEA TIME",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "eae stories": {
+      "ocr_name": "eae Stories",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "dinocakes": {
+      "ocr_name": "Dinocakes",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "i kingsguard _\u2014": {
+      "ocr_name": "i Kingsguard _\u2014",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "brave alice games": {
+      "ocr_name": "Brave Alice Games",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "as et": {
+      "ocr_name": "as et",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ms * zone cements": {
+      "ocr_name": "Ms * Zone cements",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "< aaa": {
+      "ocr_name": "< aaa",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    ": aina mn": {
+      "ocr_name": ": aina mn",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ragflow": {
+      "ocr_name": "RAGFlow",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "actual pirates i": {
+      "ocr_name": "Actual Pirates i",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "linknet": {
+      "ocr_name": "LinkNet",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "a software": {
+      "ocr_name": "a Software",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "nts klubhouse nents": {
+      "ocr_name": "nts Klubhouse nents",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "the village | ee": {
+      "ocr_name": "The Village | ee",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "peat: patch nts": {
+      "ocr_name": "peat: Patch nts",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "be club": {
+      "ocr_name": "be Club",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "cantaloupe patch": {
+      "ocr_name": "Cantaloupe Patch",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "jp aatee club 2/28 boo": {
+      "ocr_name": "jp aatee Club 2/28 Boo",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "rieie e channels": {
+      "ocr_name": "RIEIE e Channels",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "grace\u2019s dungeon": {
+      "ocr_name": "grace\u2019s dungeon",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "e real ones": {
+      "ocr_name": "e Real Ones",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "cajuris pasture a": {
+      "ocr_name": "Cajuris Pasture A",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "winnie's house }t": {
+      "ocr_name": "Winnie's House }t",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "weee ( -": {
+      "ocr_name": "WEEE ( -",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "kretin kommunity": {
+      "ocr_name": "Kretin Kommunity",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "i hepaves \u2014\u2014": {
+      "ocr_name": "i Hepaves \u2014\u2014",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "mistral al": {
+      "ocr_name": "Mistral Al",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "nicelm se viiainicw": {
+      "ocr_name": "nicElm Se VIIAINICW",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "saints sn": {
+      "ocr_name": "Saints SN",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "paceeusion": {
+      "ocr_name": "paceEusion",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "e ac) den perits": {
+      "ocr_name": "e AC) Den perits",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ctory verelct vou": {
+      "ocr_name": "ctory verelct vou",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "webchatgpt \u2018ements": {
+      "ocr_name": "WebChatGPT \u2018ements",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "lsod0pe's dopa": {
+      "ocr_name": "lsoD0pe's Dopa",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "webchatgpt \u00b00\u00b0d": {
+      "ocr_name": "WebChatGpT \u00b00\u00b0d",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "fiends dopa- a": {
+      "ocr_name": "fiends Dopa- a",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "streamlabs ae": {
+      "ocr_name": "Streamlabs ae",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "comfy gang": {
+      "ocr_name": "comfy gang",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "the sadverse": {
+      "ocr_name": "The Sadverse",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "shortyple squad": {
+      "ocr_name": "Shortyple Squad",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "ward >r>yur": {
+      "ocr_name": "Ward >r>yur",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "pixel network sei": {
+      "ocr_name": "Pixel Network Sei",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "highlife bh": {
+      "ocr_name": "HighLife bh",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "autogpt *hannels": {
+      "ocr_name": "AutoGPT *hannels",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "subconscious": {
+      "ocr_name": "Subconscious",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "sct tie": {
+      "ocr_name": "Sct tie",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "\\vanancodes ments": {
+      "ocr_name": "\\VAnancodes ments",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "hera discord ont": {
+      "ocr_name": "Hera Discord ont",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "j sxere | |. ents": {
+      "ocr_name": "J sxere | |. ents",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    },
+    "pi - s -_ opia": {
+      "ocr_name": "pi - s -_ opia",
+      "friendly_name": "",
+      "promo_channels": [],
+      "game_tags": [],
+      "enabled": true,
+      "notes": ""
+    }
+  },
+  "game_filters": {},
+  "settings": {
+    "rate_limit_hours": 3,
+    "default_enabled": true
+  }
+}
