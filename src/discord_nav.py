@@ -7,6 +7,16 @@ import sys
 import subprocess
 import os
 
+# OS-aware scroll multiplier: Windows uses "clicks" (~3 lines each), macOS uses pixels
+# On Windows, scroll(1) moves ~3 lines; on macOS Retina, scroll(1) moves ~1 pixel
+# We need much larger values on Windows to scroll meaningful amounts
+if sys.platform.startswith('win32'):
+    SCROLL_MULTIPLIER = 120  # Windows: each unit is ~1/120th of a wheel rotation
+    SCROLL_PER_ICON = 60     # Windows: ~60 units scrolls one server icon
+else:
+    SCROLL_MULTIPLIER = 1    # macOS: already in reasonable units
+    SCROLL_PER_ICON = 3      # macOS Retina: ~3 units per icon
+
 try:
     from src import utils
 except Exception:
@@ -578,7 +588,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                 utils._seek_extreme('up', max_iters=4, repeat_goal=2, step_clicks=18)
             except Exception:
                 try:
-                    pyautogui.scroll(600)
+                    pyautogui.scroll(10 * SCROLL_PER_ICON)  # Scroll up ~10 icons
                 except Exception:
                     pass
             time.sleep(0.14)
@@ -1312,33 +1322,60 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         maxy = top + height - bottom_skip_px - 6
         return int(max(miny, min(y, maxy)))
     
-    # Keywords to detect end/DM
-    DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends', 'messages')
-    # End markers - "Add a Server" and "Explore Public Servers" / "Discover"
-    END_KEYWORDS = ('add a server', 'add server', 'create', 'explore', 'discover', 'public servers')
-    
-    # Scroll to ABSOLUTE TOP - use direct scrolling since _seek_extreme may have reversed sign
-    print('Scrolling to top...')
-    if pyautogui:
-        # Move mouse to server column first
+    def _focus_and_scroll(scroll_amount):
+        """Move cursor to Discord server column and scroll.
+        
+        This handles cases where other windows (like VS Code notifications) may have
+        appeared - we move the cursor back to Discord before scrolling.
+        Does NOT click to avoid disrupting Discord's UI state.
+        """
+        nonlocal bbox, left, top, width, height, cx, col_box
+        
+        # Re-acquire Discord window position (it may have moved or been resized)
+        if utils:
+            try:
+                new_bbox = utils.find_and_focus_discord()
+                if new_bbox:
+                    bbox = new_bbox
+                    left, top, width, height = bbox
+                    col_w = max(48, int(width * 0.08))
+                    col_box = (max(0, left - 2), top, min(left + col_w + 4, left + width), top + height)
+                    cx = left + (col_w // 2)
+            except Exception:
+                pass
+        
+        # Move cursor to safe position in server column (no click!)
+        safe_y = top + height // 2
+        safe_y = max(safe_y, top + 80)  # Avoid header
+        safe_y = min(safe_y, top + height - 80)  # Avoid bottom UI
+        
         try:
-            safe_y = top + height // 2
-            pyautogui.moveTo(cx, safe_y, duration=0.1)
+            pyautogui.moveTo(cx, safe_y, duration=0.15)
             time.sleep(0.1)
         except Exception:
             pass
         
-        # Aggressive scroll up - positive = scroll up on macOS
-        for i in range(40):
-            try:
-                pyautogui.scroll(15)
-                time.sleep(0.03)
-            except Exception:
-                pass
-            # Brief pause every 10 scrolls
-            if (i + 1) % 10 == 0:
-                time.sleep(0.15)
-        time.sleep(0.4)
+        # Now scroll
+        try:
+            pyautogui.scroll(scroll_amount)
+            time.sleep(0.1)
+        except Exception:
+            pass
+    
+    # Keywords to detect end/DM
+    DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends', 'messages')
+    # End markers - "Add a Server" and "Explore Public Servers" / "Discover"
+    # These appear at the bottom of the server list
+    END_KEYWORDS = ('add a server', 'add server', 'explore public', 'discover', 'public servers', 'scover')  # 'scover' catches OCR errors on 'Discover'
+    
+    # Scroll to ABSOLUTE TOP - use direct scrolling since _seek_extreme may have reversed sign
+    print('Scrolling to top...')
+    if pyautogui:
+        # Aggressive scroll up - positive = scroll up
+        # Use larger scroll amounts on Windows
+        scroll_up_amount = 10 * SCROLL_PER_ICON  # Scroll ~10 icons worth
+        _focus_and_scroll(scroll_up_amount)
+        time.sleep(0.3)
     
     # Helper to read tooltip at position
     def _read_tooltip(y_pos):
@@ -1519,13 +1556,26 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             name = _read_tooltip(y_hover)
             lname = (name or '').lower()
             
-            # Check for end marker FIRST - this is critical for "Add a Server"
+            # Check for end marker FIRST - this is critical for "Add a Server" / "Discover"
+            # Also check the last icon specifically for end markers
             if name and any(k in lname for k in END_KEYWORDS):
                 print(f'  Detected end marker "{name}" at index {i}')
                 reached_end = True
                 break
             
-            # Only skip the very last icon (likely Discover/Explore which has tooltip issues)
+            # Check if this looks like "Add a Server" or "Discover" button based on common OCR errors
+            # These buttons have very short/garbled OCR results at the bottom
+            if is_very_last or i >= len(centers_abs) - 2:
+                # Check the last 2 icons more carefully for end markers
+                if name:
+                    # Common OCR results for "Add a Server": "Id a Server", "Add Server", "a Server"
+                    # Common OCR results for "Discover": "scover", "iscover", "Discover"
+                    if any(x in lname for x in ('server', 'scover', 'iscover', 'xplore')):
+                        print(f'  Detected likely end marker "{name}" at index {i}')
+                        reached_end = True
+                        break
+            
+            # Skip the very last icon if not already detected as end
             if is_very_last:
                 print(f'  Skipping last icon at index {i}: {repr(name)}')
                 continue
@@ -1633,51 +1683,45 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         if new_servers_this_page == 0:
             stale_pages += 1
             if overlap_count > 0:
-                print(f'Only found {overlap_count} duplicates, no new servers (stale: {stale_pages}/{max_stale}) - scrolling more...')
+                print(f'Only found {overlap_count} duplicates, no new servers (stale: {stale_pages}/{max_stale})')
                 if stale_pages >= max_stale:
                     print(f'Reached {max_stale} consecutive stale pages, assuming end of list')
                     reached_end = True
                     break
                 # Try scrolling more aggressively to get past overlap zone
-                if pyautogui:
-                    try:
-                        for _ in range(15):  # Scroll ~5 icons worth
-                            pyautogui.scroll(-1)
-                            time.sleep(0.02)
-                    except Exception:
-                        pass
-                time.sleep(0.35)
+                scroll_amount = -5 * SCROLL_PER_ICON  # Negative = scroll down
+                _focus_and_scroll(scroll_amount)
+                time.sleep(0.25)
                 page += 1
                 continue  # Try another page
             else:
                 print('No new servers found on this page, stopping')
                 break
+        elif new_servers_this_page <= 2:
+            # Only found 1-2 new servers - likely near end, increment stale counter
+            stale_pages += 1
+            if stale_pages >= max_stale:
+                print(f'Only finding {new_servers_this_page} new servers per page for {stale_pages} pages, assuming end of list')
+                reached_end = True
+                break
         else:
-            stale_pages = 0  # Reset stale counter when we find new servers
+            stale_pages = 0  # Reset stale counter when we find several new servers
         
         # Update last page names for next iteration
         last_page_names = this_page_names[-5:] if this_page_names else []  # Keep last 5 names
         
-        # Scroll down for next page - use CONSERVATIVE scrolling
-        # Since we have name-based deduplication, we can scroll less aggressively
-        # Better to have overlap (duplicates get filtered) than to miss servers
-        
-        # Scroll by roughly 1/3 of new servers found, minimum 2 icons
-        icons_to_scroll = max(2, new_servers_this_page // 3)
-        scroll_per_icon = 3  # ~3 scroll units per icon on macOS Retina
-        total_scroll = icons_to_scroll * scroll_per_icon
+        # Scroll down for next page
+        # Scroll by (new_servers - 2) to leave ~2 icons overlap for deduplication
+        # This ensures we don't miss any servers while minimizing redundant scanning
+        icons_to_scroll = max(3, new_servers_this_page - 2)
+        total_scroll = icons_to_scroll * SCROLL_PER_ICON
         
         print(f'Found {new_servers_this_page} new servers, scrolling by ~{icons_to_scroll} icons ({total_scroll} units)...')
         
-        if pyautogui:
-            try:
-                for _ in range(total_scroll):
-                    pyautogui.scroll(-1)  # Small increments, negative = down
-                    time.sleep(0.02)
-            except Exception:
-                pass
+        # Use _focus_and_scroll to ensure Discord has focus before scrolling
+        _focus_and_scroll(-total_scroll)  # Negative = scroll down
         
-        time.sleep(0.35)
+        time.sleep(0.25)
         page += 1
     
     print(f'\n=== Finished: found {len(all_servers)} servers across {page + 1} pages ===')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test harness to run a full scan using capture_discord_servers and verify servers.json."""
+"""Test harness to run a full scan using iterate_all_servers and verify servers.json."""
 import argparse
 import json
 from pathlib import Path
@@ -9,7 +9,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.utils import capture_discord_servers, check_tesseract_path
+from src.utils import check_tesseract_path
+from src.discord_nav import iterate_all_servers
 from PIL import ImageGrab
 
 
@@ -61,12 +62,16 @@ def main():
         print(f"Error: {e}")
         sys.exit(4)
 
-    server_list = capture_discord_servers(str(save_dir), max_scrolls=args.max_scrolls,
-                                          start_from_top=args.start_from_top,
-                                          max_icon_retries=args.max_icon_retries,
-                                          debug_save_hover=args.debug_save_hover)
-
+    server_list = iterate_all_servers(
+        hover_delay=0.4,
+        debug_save=args.debug_save_hover,
+        max_servers=args.max_scrolls * 10  # rough estimate: 10 servers per scroll
+    )
+    
+    # Write results to servers.json
     meta_path = save_dir / 'servers.json'
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(server_list, f, indent=2)
 
     summary = summarize_servers(meta_path)
     print('Scan finished; summary:')

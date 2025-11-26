@@ -385,7 +385,10 @@ def find_and_focus_discord():
     # If the foreground window is Discord, return its bbox immediately
     try:
         app_name, title, bbox = get_foreground_window_info()
-        if (app_name and 'discord' in (app_name or '').lower()) or (title and 'discord' in (title or '').lower()):
+        # Check for "- Discord" suffix to identify actual Discord window (not VS Code with Discord files)
+        is_discord = (app_name and 'discord' in (app_name or '').lower()) or \
+                     (title and title.lower().endswith('- discord'))
+        if is_discord:
             # Return bbox if we have it, else attempt to find via pygetwindow
             if bbox:
                 try:
@@ -396,27 +399,39 @@ def find_and_focus_discord():
     except Exception:
         pass
 
-    # Try pygetwindow first
+    # Try pygetwindow - works cross-platform but API differs
     if gw is not None:
         try:
+            # Find Discord windows - look for title ending with "- Discord"
             titles = gw.getAllTitles()
             for t in titles:
                 if not t:
                     continue
-                if 'discord' in t.lower():
+                # Match windows with "- Discord" at the end (actual Discord app)
+                if t.lower().endswith('- discord') or t.lower() == 'discord':
                     try:
-                        geom = gw.getWindowGeometry(t)
-                        # Try to activate the window (pygetwindow provides `activate` convenience)
+                        # On Windows, use getWindowsWithTitle which returns window objects
+                        wins = gw.getWindowsWithTitle(t)
+                        for w in wins:
+                            if hasattr(w, 'left') and hasattr(w, 'width'):
+                                # Windows pygetwindow uses object properties directly
+                                left, top, width, height = w.left, w.top, w.width, w.height
+                                # Try to activate/focus the window
+                                try:
+                                    if hasattr(w, 'activate'):
+                                        w.activate()
+                                except Exception:
+                                    pass
+                                return (int(left), int(top), int(width), int(height))
+                    except Exception:
+                        # Fallback: try getWindowGeometry for macOS compatibility  
                         try:
-                            w = gw.Window(t)
-                            w.activate()
+                            geom = gw.getWindowGeometry(t)
+                            if geom:
+                                left, top, width, height = (int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
+                                return (left, top, width, height)
                         except Exception:
                             pass
-                        # Return left, top, width, height
-                        if geom:
-                            left, top, width, height = (int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
-                            return (left, top, width, height)
-                    except Exception:
                         continue
         except Exception:
             pass
@@ -453,18 +468,28 @@ def find_and_focus_discord():
                     if gw is not None:
                         titles = gw.getAllTitles()
                         for t in titles:
-                            if t and 'discord' in t.lower():
+                            # Match actual Discord window
+                            if t and (t.lower().endswith('- discord') or t.lower() == 'discord'):
                                 try:
-                                    geom = gw.getWindowGeometry(t)
-                                    if geom:
-                                        left, top, width, height = (int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
-                                        try:
-                                            w = gw.Window(t)
-                                            w.activate()
-                                        except Exception:
-                                            pass
-                                        return (left, top, width, height)
+                                    # Windows: use getWindowsWithTitle
+                                    wins = gw.getWindowsWithTitle(t)
+                                    for w in wins:
+                                        if hasattr(w, 'left') and hasattr(w, 'width'):
+                                            try:
+                                                if hasattr(w, 'activate'):
+                                                    w.activate()
+                                            except Exception:
+                                                pass
+                                            return (int(w.left), int(w.top), int(w.width), int(w.height))
                                 except Exception:
+                                    # macOS fallback
+                                    try:
+                                        geom = gw.getWindowGeometry(t)
+                                        if geom:
+                                            left, top, width, height = (int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
+                                            return (left, top, width, height)
+                                    except Exception:
+                                        pass
                                     continue
                 except Exception:
                     pass
@@ -582,107 +607,13 @@ def is_discord_foreground() -> bool:
         app, title, bbox = get_foreground_window_info()
         if app and 'discord' in (app or '').lower():
             return True
-        if title and 'discord' in (title or '').lower():
+        # Check for "- Discord" suffix to avoid matching VS Code with Discord files open
+        if title and title.lower().endswith('- discord'):
             return True
     except Exception:
         pass
     return False
 
-    # On macOS, try to activate Discord via AppleScript first (more reliable than open)
-    if sys.platform.startswith('darwin'):
-        try:
-            subprocess.run(["osascript", "-e", 'tell application "Discord" to activate'], check=False)
-            time.sleep(0.4)
-        except Exception:
-            pass
-
-    # If the foreground window is Discord, return its bbox immediately
-    try:
-        app_name, title, bbox = get_foreground_window_info()
-        if (app_name and 'discord' in (app_name or '').lower()) or (title and 'discord' in (title or '').lower()):
-            # Return bbox if we have it, else attempt to find via pygetwindow
-            if bbox:
-                try:
-                    l, t, r, b = bbox
-                    return (l, t, r - l, b - t)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # Try pygetwindow first
-    if gw is not None:
-        try:
-            titles = gw.getAllTitles()
-            for t in titles:
-                if not t:
-                    continue
-                if 'discord' in t.lower():
-                    try:
-                        geom = gw.getWindowGeometry(t)
-                        # Try to activate the window (pygetwindow provides `activate` convenience)
-                        try:
-                            w = gw.Window(t)
-                            w.activate()
-                        except Exception:
-                            pass
-                        # Return left, top, width, height
-                        if geom:
-                            left, top, width, height = (int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
-                            return (left, top, width, height)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    # Fallback: try to find a Discord process and bring it to front using platform-specific commands
-    try:
-        for proc in psutil.process_iter(['name', 'exe', 'cmdline']):
-            name = (proc.info.get('name') or '').lower()
-            if 'discord' in name:
-                # best-effort activation: on macOS use `open -a Discord`, on Windows rely on run_discord
-                try:
-                    if sys.platform.startswith('darwin'):
-                        subprocess.Popen(['open', '-a', 'Discord'])
-                        # try to obtain window bounds via AppleScript (System Events) for macOS
-                        try:
-                            script = 'tell application "System Events"\n    if exists (process "Discord") then\n        tell process "Discord"\n            if (count of windows) > 0 then\n                set b to bounds of window 1\n                return b\n            end if\n        end tell\n    end if\nend tell\n'
-                            proc_as = subprocess.run(["osascript", "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                            out = proc_as.stdout.strip()
-                            if out:
-                                parts = [int(x.strip()) for x in out.split(',') if x.strip().isdigit()]
-                                if len(parts) == 4:
-                                    return (parts[0], parts[1], parts[2]-parts[0], parts[3]-parts[1])
-                        except Exception:
-                            pass
-                    elif sys.platform.startswith('win32'):
-                        subprocess.Popen(['start', 'Discord'], shell=True)
-                    else:
-                        subprocess.Popen(['discord'])
-                except Exception:
-                    pass
-                time.sleep(0.6)
-                # retry pygetwindow activation after attempting to start/activate
-                try:
-                    if gw is not None:
-                        wins = gw.getWindowsWithTitle('Discord') or gw.getWindowsWithTitle('discord')
-                        for w in wins:
-                            try:
-                                if not w.isMinimized:
-                                    try:
-                                        w.activate()
-                                    except Exception:
-                                        pass
-                                    return (w.left, w.top, w.width, w.height)
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-                break
-    except Exception:
-        pass
-
-    return None
 
 def find_discord():
     """
