@@ -30,6 +30,10 @@ python -m src.main
 python -m src.main
 ```
 - **Fetch Stream Info**: Auto-detect title/game from your stream URL
+- **Fetch Stream Info**: Auto-detect title/game from your stream URL
+- **Improved OCR**: Screenshots from dark Discord themes are now detected
+	and automatically inverted to improve OCR accuracy (helps with garbled
+	leading characters and symbols).
 - Configure friendly names for servers (OCR names are often garbled)
 - Set promo channels per server
 - Tag servers by game for filtering

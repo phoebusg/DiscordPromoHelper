@@ -68,6 +68,28 @@ def _safe_grab(bbox=None, timeout_sec: float = 1.0):
         return None
 
 
+def ocr_from_image(img):
+        """OCR helper for discord_nav that defers to src.utils.ocr_image_to_text when available.
+
+        This function is intended for non-interactive OCR testing of tooltip/crop images.
+        """
+        # Prefer utils helper when available
+        try:
+            if utils and hasattr(utils, 'ocr_image_to_text'):
+                return utils.ocr_image_to_text(img)
+        except Exception:
+            pass
+
+        # Fallback to pytesseract
+        try:
+            if pytesseract:
+                cfg = '--psm 7 --oem 3'
+                return pytesseract.image_to_string(img, config=cfg).strip()
+        except Exception:
+            pass
+        return ''
+
+
 def _vertical_projection_centers(img, w, h, merge_gap=8):
     """Return list of center Y positions (relative to the image top).
 
@@ -455,7 +477,11 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                     # Enhance contrast before OCR
                     if ImageOps:
                         tbimg = ImageOps.autocontrast(tbimg.convert('RGB'))
-                    t = pytesseract.image_to_string(tbimg, config='--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ')
+                    # Use the module-level helper where available (better preprocessing)
+                    try:
+                        t = ocr_from_image(tbimg)
+                    except Exception:
+                        t = pytesseract.image_to_string(tbimg, config='--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ')
                 except Exception:
                     t = ''
                 if t and t.strip() and len(t.strip()) > 1:
@@ -859,7 +885,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
                                 tip_img = None
                             if tip_img is not None:
                                 try:
-                                    txtcand = pytesseract.image_to_string(tip_img, config='--psm 7')
+                                    txtcand = ocr_from_image(tip_img) if 'ocr_from_image' in globals() else pytesseract.image_to_string(tip_img, config='--psm 7')
                                 except Exception:
                                     txtcand = ''
                             if txtcand and txtcand.strip():
@@ -1433,7 +1459,10 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                     ocr_config = '--psm 7 --oem 3'
                     
                     for pimg in preprocessed:
-                        txt = pytesseract.image_to_string(pimg, config=ocr_config).strip()
+                        try:
+                            txt = ocr_from_image(pimg) if 'ocr_from_image' in globals() else pytesseract.image_to_string(pimg, config=ocr_config).strip()
+                        except Exception:
+                            txt = ''
                         # Clean common artifacts
                         if txt:
                             # Remove leading/trailing punctuation artifacts

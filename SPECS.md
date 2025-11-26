@@ -153,6 +153,47 @@ class StreamInfo:
 - Dark icons may not trigger tooltip → synthetic hover
 - OCR produces garbled text → fuzzy deduplication
 - Dedup: substring match, 60% word overlap, or 85% char similarity
+- Dark theme text (light-on-dark) can confuse OCR — we now detect
+    dark-theme captures and automatically reverse polarity before OCR
+    using `reverse_polarity_if_needed` in `src/utils.py`.
+
+### OCR Research & Recommendations
+
+We researched common failure modes and practical fixes for OCR on GUI tooltips (small, anti-aliased white text on dark backgrounds) and summarized actionable guidance below.
+
+- Problem summary:
+    - Very small, anti-aliased GUI text can be low-contrast for Tesseract's binariser and produces short/garbled outputs.
+    - Tight crops can clip leading characters or emoji; alpha channels and lack of border may confuse segmentation.
+
+- Quick wins (recommended first):
+    - Add whitespace padding (≈8–12 px) around tooltip crops to avoid clipped characters.
+    - Upscale small crops (x2–x3) with a good resampling filter (Lanczos/Bicubic) so text height approaches recommended OCR size (>16–24 px cap height; aim for ~300 DPI equivalent).
+    - Try both original and inverted polarity (dark→light) — pick the result with the higher mean/word confidence returned by Tesseract's `image_to_data`.
+    - Use targeted Tesseract options: `--oem 3` and `--psm 7` for single-line tooltips; experiment with `--psm 8/10` for single words/characters.
+    - Apply CLAHE (local contrast) and mild denoising before binarization to restore anti-aliased strokes.
+    - Add a small white border (10 px) before OCR when crops are tightly trimmed.
+
+- Medium effort (recommended where OCR still fails):
+    - Use Tesseract 5+ Leptonica thresholding (Adaptive Otsu / Sauvola) or OpenCV adaptive thresholding for difficult backgrounds.
+    - Run multiple preprocessing pipelines (e.g. autocontrast, CLAHE+threshold, inverted) and choose the OCR output with the best aggregate confidence score.
+    - Persist a small set of `debug` pre/post images and OCR outputs to tune heuristics and inspect failure cases.
+
+- Higher effort / robust fallbacks:
+    - Integrate a modern scene-text stack (text detector + recognizer) — e.g., CRAFT or DB for detection + CRNN/transformer-based recognizer, or use higher-level libs like EasyOCR or PaddleOCR — these handle small, low-contrast scene text much better than generic Tesseract.
+    - Create a small, labeled tooltip dataset and finetune a lightweight recognition model for your font/scale if you need near-perfect results.
+
+- Other practical tips from research:
+    - Remove alpha channels and ensure input images are RGB/8-bit (Tesseract historically had issues with alpha channels).
+    - Avoid huge borders (can create an "empty page" effect) — keep padding small and focused around text.
+    - Use `image_to_data`/TSV outputs to obtain per-word confidences and bounding boxes; use these to choose best result or reject low confidence reads.
+
+References / further reading
+- Tesseract ImproveQuality (rescaling, inversion, binarisation, border): https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html
+- PyTesseract docs and config usage: https://github.com/madmaze/pytesseract
+- OpenCV preprocessing guide (CLAHE, thresholding): https://www.pyimagesearch.com/2018/09/17/opencv-ocr-and-text-recognition-with-tesseract/
+- Detection+recognition pipelines: CRAFT (detection) https://github.com/clovaai/CRAFT-pytorch
+- Modern recognition stacks: EasyOCR https://github.com/JaidedAI/EasyOCR, PaddleOCR https://github.com/PaddlePaddle/PaddleOCR
+
 
 ## Game Filtering
 

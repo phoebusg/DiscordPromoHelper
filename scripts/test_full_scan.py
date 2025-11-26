@@ -19,11 +19,16 @@ def summarize_servers(meta_path: Path):
         return {}
     with open(meta_path, 'r', encoding='utf-8') as fh:
         data = json.load(fh)
-    total = len(data)
-    with_name = len([s for s in data if s.get('name')])
+    # Handle both list format and dict with 'servers' key
+    if isinstance(data, dict):
+        servers = data.get('servers', [])
+    else:
+        servers = data
+    total = len(servers)
+    with_name = len([s for s in servers if s.get('name')])
     unnamed = total - with_name
-    unique_names = len(set(s.get('name') for s in data if s.get('name')))
-    unique_icons = len(set(s.get('icon') for s in data if s.get('icon')))
+    unique_names = len(set(s.get('name') for s in servers if s.get('name')))
+    unique_icons = len(set(s.get('icon') for s in servers if s.get('icon')))
     return {
         'total': total,
         'with_name': with_name,
@@ -62,16 +67,20 @@ def main():
         print(f"Error: {e}")
         sys.exit(4)
 
-    server_list = iterate_all_servers(
-        hover_delay=0.4,
-        debug_save=args.debug_save_hover,
-        max_servers=args.max_scrolls * 10  # rough estimate: 10 servers per scroll
-    )
-    
-    # Write results to servers.json
+    # Run the iterator and save results to servers.json in save_dir
+    try:
+        server_list = iterate_all_servers(
+            hover_delay=0.4,
+            debug_save=args.debug_save_hover,
+            max_servers=args.max_scrolls * 10 if args.max_scrolls else 200
+        )
+    except Exception as e:
+        print('Error running iterate_all_servers:', e)
+        server_list = []
+
     meta_path = save_dir / 'servers.json'
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump(server_list, f, indent=2)
+    with open(meta_path, 'w', encoding='utf-8') as fh:
+        json.dump({'total_servers': len(server_list), 'servers': server_list}, fh, ensure_ascii=False, indent=2)
 
     summary = summarize_servers(meta_path)
     print('Scan finished; summary:')

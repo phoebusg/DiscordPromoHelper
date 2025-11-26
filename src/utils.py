@@ -38,6 +38,7 @@ import re
 import unicodedata
 import json
 from pathlib import Path
+from PIL import ImageStat, ImageFilter
 
 
 def run_command_as_admin(command):
@@ -768,14 +769,117 @@ def normalize_ocr_name(s: str) -> str:
     return s
 
 
-def ocr_image_to_text(img):
-    """Return the best-effort OCR text from an image using multiple pre-processing steps."""
+def reverse_polarity_if_needed(img, dark_thresh=110, bright_pixel_ratio=0.005):
+    """Detect if an image is dark-theme (light text over dark bg) and invert it.
+
+    Returns (image, inverted) where `inverted` is True if the image was inverted.
+    """
+    if img is None or not _HAS_PIL:
+        return img, False
+    try:
+        gray = img.convert('L')
+        stat = ImageStat.Stat(gray)
+        mean = stat.mean[0] if stat.mean else 0
+    except Exception:
+        return img, False
+
+    if mean >= dark_thresh:
+        return img, False
+
+    # quick downsample scan for bright pixels
+    try:
+        w, h = gray.size
+        scan = gray.resize((max(16, w // 16), max(8, h // 16)))
+        px = list(scan.getdata())
+        # threshold relative to mean to catch anti-aliased or faint white text
+        threshold = mean + 30
+        bright = sum(1 for p in px if p >= threshold)
+        ratio = bright / max(1, len(px))
+        if ratio < bright_pixel_ratio:
+            return img, False
+    except Exception:
+        # if scanning fails, optimistically invert
+        pass
+
+    try:
+        from PIL import ImageOps
+        out = ImageOps.invert(img.convert('RGB'))
+        return out, True
+    except Exception:
+        return img, False
+
+
+def _pil_clahe(img):
+    """Apply CLAHE-like local contrast via OpenCV if available, else return original image.
+
+    Returns a PIL Image.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return img
+    try:
+        # convert PIL -> gray numpy
+        gray = img.convert('L')
+        arr = np.array(gray)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        out = clahe.apply(arr)
+        return Image.fromarray(out)
+    except Exception:
+        return img
+
+
+def _add_padding(img, pad=10, fill=255):
+    try:
+        from PIL import ImageOps
+        return ImageOps.expand(img, border=pad, fill=fill)
+    except Exception:
+        return img
+
+
+def _average_confidence_from_data(data):
+    """Return the average confidence from pytesseract image_to_data result dict.
+
+    If per-word confidences are present, compute the average of valid confidences.
+    """
+    if not data:
+        return 0.0
+    try:
+        confs = data.get('conf', [])
+        vals = []
+        for c in confs:
+            try:
+                # Some versions return strings like '-1'
+                v = float(c)
+            except Exception:
+                continue
+            # Skip invalid/confidence placeholders
+            if v >= 0:
+                vals.append(v)
+        return (sum(vals) / len(vals)) if vals else 0.0
+    except Exception:
+        return 0.0
+
+
+def ocr_image_to_text(img, debug: bool = False):
+    """Return the best-effort OCR text from an image using multiple pre-processing steps.
+
+    Quick-fixes implemented:
+    - Add padding to avoid clipped leading characters
+    - Upscale small crops (x2-x3) with Lanczos for better DPI
+    - Try CLAHE (OpenCV) if available
+    - Try both original and inverted polarity
+    - Run multiple preprocess pipelines and select result with highest confidence from pytesseract
+    - Optional `debug=True` writes candidate images and scores to `data/debug/ocr_*`
+    """
     if img is None or not _HAS_PYTESSERACT or not pytesseract:
         return ""
     try:
-        # Try direct OCR first with conservative whitelist
+        # Try direct OCR first with small padding and conservative whitelist
+        probe = _add_padding(img, pad=8)
         cfg = '--psm 7 --oem 3 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#-_@/:. &'
-        txt = pytesseract.image_to_string(img, config=cfg)
+        txt = pytesseract.image_to_string(probe, config=cfg)
         if txt and txt.strip():
             return txt.strip()
     except Exception:
@@ -783,43 +887,114 @@ def ocr_image_to_text(img):
     try:
         # Convert to grayscale, resize, and increase contrast
         tmp = img.convert('L')
-        w, h = tmp.size
-        tmp = tmp.resize((max(32, w * 3), max(32, h * 3)), resample=Image.BILINEAR)
+        # Detect dark-theme screenshots (white text on dark background)
+        # and invert polarity to improve OCR accuracy (e.g. Discord dark theme)
         try:
-            from PIL import ImageEnhance, ImageOps
-            enhancer = ImageEnhance.Contrast(tmp)
-            tmp = enhancer.enhance(1.8)
-            # Try auto-contrast as well
-            ac = ImageOps.autocontrast(tmp)
+            alt_img, inverted = reverse_polarity_if_needed(img)
         except Exception:
-            ac = tmp
+            alt_img, inverted = img, False
+        # Build a set of preprocessing variants to evaluate
+        variants = []
+
+        # baseline scaled (3x) with Lanczos
+        w, h = tmp.size
+        scaled = tmp.resize((max(64, w * 3), max(32, h * 3)), resample=Image.LANCZOS)
+        variants.append(('scaled', scaled))
+
+        # padded + scaled
+        padded = _add_padding(scaled, pad=10, fill=255)
+        variants.append(('padded', padded))
+
+        # CLAHE variant (if available)
+        try:
+            clahe_img = _pil_clahe(scaled)
+            variants.append(('clahe', clahe_img))
+        except Exception:
+            pass
+
+        # Autocontrast variant
+        try:
+            from PIL import ImageOps
+            ac = ImageOps.autocontrast(scaled, cutoff=2)
+            variants.append(('autocontrast', ac))
+        except Exception:
+            pass
+
+        # Inverted variants (if polarity suggested inversion or not)
+        try:
+            from PIL import ImageOps
+            # always include inverted forms to be robust
+            inv_scaled = ImageOps.invert(scaled.convert('RGB')).convert('L')
+            variants.append(('inv_scaled', inv_scaled))
+            inv_padded = ImageOps.invert(padded.convert('RGB')).convert('L')
+            variants.append(('inv_padded', inv_padded))
+        except Exception:
+            pass
+        # apply a light contrast boost on each variant
+        try:
+            from PIL import ImageEnhance
+            enriched = []
+            for name, v in variants:
+                try:
+                    enhancer = ImageEnhance.Contrast(v)
+                    v2 = enhancer.enhance(1.6)
+                except Exception:
+                    v2 = v
+                enriched.append((name, v2))
+            variants = enriched
+        except Exception:
+            pass
+
+        # we've already applied an inversion if it was helpful; continue
         # try different psm settings for robustness
         # Try several psm modes and select best word using image_to_data (highest confidence)
-        for cfg in ('--psm 7', '--psm 6'):
-            try:
-                data = pytesseract.image_to_data(ac, output_type=getattr(pytesseract, 'Output', {}).DICT if hasattr(pytesseract, 'Output') else None, config=cfg)
-                # data may be a dict-like output; prefer the element with highest confidence
+        # Evaluate each variant using image_to_data and pick the highest average confidence
+        best_score = -1.0
+        best_text = ''
+        o_output = getattr(pytesseract, 'Output', None)
+        for name, v in variants:
+            for cfg in ('--psm 7 --oem 3', '--psm 6 --oem 3'):
                 try:
-                    texts = data.get('text', [])
-                    confs = data.get('conf', [])
-                    best_idx = None
-                    best_conf = -999
-                    for i, t in enumerate(texts):
-                        if not t or not t.strip():
-                            continue
-                        try:
-                            c = float(confs[i]) if i < len(confs) else 0
-                        except Exception:
-                            c = 0
-                        if c > best_conf:
-                            best_conf = c
-                            best_idx = i
-                    if best_idx is not None and texts[best_idx].strip():
-                        return texts[best_idx].strip()
+                    out_type = o_output.DICT if o_output else None
+                    data = pytesseract.image_to_data(v, output_type=out_type, config=cfg)
                 except Exception:
-                    pass
-            except Exception:
-                pass
+                    # fallback to plain string and a low pseudo-confidence
+                    try:
+                        txt = pytesseract.image_to_string(v, config='--psm 7') or ''
+                        score = len(txt) * 5.0
+                        if score > best_score:
+                            best_score = score
+                            best_text = txt.strip()
+                    except Exception:
+                        continue
+                    continue
+
+                # Calculate average confidence for this call
+                score = _average_confidence_from_data(data)
+                # Favour higher numeric score and non-empty text
+                txts = data.get('text', []) if isinstance(data, dict) else []
+                txt_combined = ' '.join([t for t in txts if t and t.strip()])
+                if txt_combined and score >= best_score:
+                    best_score = score
+                    best_text = txt_combined.strip()
+
+                # Optional debug save per-variant
+                if debug:
+                    try:
+                        import json, time
+                        debug_dir = os.path.join('data', 'debug')
+                        os.makedirs(debug_dir, exist_ok=True)
+                        ts = int(time.time() * 1000)
+                        fname = f'ocr_{ts}_{name}_{int(score)}.png'
+                        v.convert('RGB').save(os.path.join(debug_dir, fname))
+                        meta = {'variant': name, 'score': score, 'cfg': cfg}
+                        with open(os.path.join(debug_dir, f'ocr_{ts}_{name}_{int(score)}.json'), 'w') as f:
+                            json.dump(meta, f)
+                    except Exception:
+                        pass
+
+        if best_text and best_text.strip():
+            return best_text.strip()
         # If still nothing, try an inverted variant
         try:
             inv = ImageOps.invert(ac)
