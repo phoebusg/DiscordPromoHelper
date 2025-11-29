@@ -7,15 +7,19 @@ import sys
 import subprocess
 import os
 
-# OS-aware scroll multiplier: Windows uses "clicks" (~3 lines each), macOS uses pixels
-# On Windows, scroll(1) moves ~3 lines; on macOS Retina, scroll(1) moves ~1 pixel
-# We need much larger values on Windows to scroll meaningful amounts
+# OS-aware scroll constants: pyautogui.scroll() behavior differs by platform
+# On Windows: scroll(1) moves ~3 lines, need larger values
+# On macOS: scroll(1) is small, need moderate values; positive=up, negative=down
 if sys.platform.startswith('win32'):
     SCROLL_MULTIPLIER = 120  # Windows: each unit is ~1/120th of a wheel rotation
     SCROLL_PER_ICON = 60     # Windows: ~60 units scrolls one server icon
+    SCROLL_TO_TOP_PASSES = 3  # Number of scroll-up passes to reach top
 else:
-    SCROLL_MULTIPLIER = 1    # macOS: already in reasonable units
-    SCROLL_PER_ICON = 3      # macOS Retina: ~3 units per icon
+    # macOS: pyautogui scroll units are small but not tiny
+    # Testing shows ~10-15 units per icon on Retina displays
+    SCROLL_MULTIPLIER = 1
+    SCROLL_PER_ICON = 12     # macOS: ~12 units per server icon (increased from 3)
+    SCROLL_TO_TOP_PASSES = 5  # More passes on macOS to ensure we reach top
 
 try:
     from src import utils
@@ -1382,11 +1386,25 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             pass
         
         # Now scroll
+        # On macOS, pyautogui.scroll() may need multiple smaller calls
+        # to work reliably. Also, scroll direction: positive=up, negative=down
         try:
-            pyautogui.scroll(scroll_amount)
+            if sys.platform.startswith('darwin'):
+                # macOS: break into smaller scroll chunks for reliability
+                chunk_size = 20
+                remaining = abs(scroll_amount)
+                direction = 1 if scroll_amount > 0 else -1
+                while remaining > 0:
+                    this_chunk = min(chunk_size, remaining)
+                    pyautogui.scroll(direction * this_chunk)
+                    remaining -= this_chunk
+                    time.sleep(0.02)
+            else:
+                # Windows: single scroll call works fine
+                pyautogui.scroll(scroll_amount)
             time.sleep(0.1)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'Scroll error: {e}')
     
     # Keywords to detect end/DM
     DM_KEYWORDS = ('direct messages', 'direct message', 'home', 'friends', 'messages')
@@ -1394,14 +1412,21 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     # These appear at the bottom of the server list
     END_KEYWORDS = ('add a server', 'add server', 'explore public', 'discover', 'public servers', 'scover')  # 'scover' catches OCR errors on 'Discover'
     
-    # Scroll to ABSOLUTE TOP - use direct scrolling since _seek_extreme may have reversed sign
+    # Scroll to ABSOLUTE TOP - multiple passes to ensure we reach the top
+    # regardless of starting position
     print('Scrolling to top...')
     if pyautogui:
-        # Aggressive scroll up - positive = scroll up
-        # Use larger scroll amounts on Windows
-        scroll_up_amount = 10 * SCROLL_PER_ICON  # Scroll ~10 icons worth
-        _focus_and_scroll(scroll_up_amount)
+        # Multiple aggressive scroll-up passes
+        # positive scroll = up on both Windows and macOS
+        scroll_up_amount = 20 * SCROLL_PER_ICON  # Scroll ~20 icons worth per pass
+        
+        for scroll_pass in range(SCROLL_TO_TOP_PASSES):
+            _focus_and_scroll(scroll_up_amount)
+            time.sleep(0.15)
+        
+        # Final pause to let UI settle
         time.sleep(0.3)
+        print(f'Completed {SCROLL_TO_TOP_PASSES} scroll-to-top passes ({scroll_up_amount} units each)')
     
     # Helper to read tooltip at position
     def _read_tooltip(y_pos):
@@ -1592,22 +1617,15 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 reached_end = True
                 break
             
-            # Check if this looks like "Add a Server" or "Discover" button based on common OCR errors
-            # These buttons have very short/garbled OCR results at the bottom
-            if is_very_last or i >= len(centers_abs) - 2:
-                # Check the last 2 icons more carefully for end markers
-                if name:
-                    # Common OCR results for "Add a Server": "Id a Server", "Add Server", "a Server"
-                    # Common OCR results for "Discover": "scover", "iscover", "Discover"
-                    if any(x in lname for x in ('server', 'scover', 'iscover', 'xplore')):
-                        print(f'  Detected likely end marker "{name}" at index {i}')
-                        reached_end = True
-                        break
-            
-            # Skip the very last icon if not already detected as end
-            if is_very_last:
-                print(f'  Skipping last icon at index {i}: {repr(name)}')
-                continue
+            # Check last 3 icons for "Add a Server" / "Discover" button patterns
+            # These may have garbled OCR due to their different visual style
+            if i >= len(centers_abs) - 3 and name:
+                add_server_patterns = ('server', 'dd a', 'add a', 'ddaserver')
+                discover_patterns = ('scover', 'iscover', 'xplore', 'iscov', 'ublic')
+                if any(p in lname for p in add_server_patterns + discover_patterns):
+                    print(f'  Detected likely end marker "{name}" at index {i}')
+                    reached_end = True
+                    break
             
             # Skip DM (shouldn't happen after page 0, but safety check)
             if name and any(k in lname for k in DM_KEYWORDS):
@@ -1707,6 +1725,80 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         
         if reached_end:
             break
+        
+        # BEFORE declaring stale: probe BELOW the last detected icon for end markers
+        # PROBE BEYOND DETECTED ICONS
+        # The icon detection algorithm may miss icons near the bottom of the window
+        # (e.g., near the account icon area which has a different background).
+        # When all detected icons are duplicates, probe further down to find:
+        # 1. Any remaining servers that weren't detected
+        # 2. The "Add a Server" / "Discover" end markers
+        if new_servers_this_page == 0 and overlap_count > 0 and centers_abs:
+            last_icon_y = centers_abs[-1]
+            spacing = median if median else 48
+            
+            print(f'  Probing below last detected icon (y={last_icon_y}) for more servers/end markers...')
+            
+            # Common OCR variations of "Add a Server" and "Discover" buttons
+            ADD_SERVER_PATTERNS = ('server', 'dd a', 'add a', 'ddaserver', 'addaserver')
+            DISCOVER_PATTERNS = ('scover', 'iscover', 'xplore', 'iscov', 'ublic', 'discover')
+            
+            for offset_mult in range(1, 8):  # Probe up to 7 icon spacings below
+                probe_y = int(last_icon_y + (spacing * offset_mult))
+                
+                probe_name = _read_tooltip(probe_y)
+                if probe_name:
+                    probe_lower = probe_name.lower()
+                    print(f'    Probe +{offset_mult} (y={probe_y}): {repr(probe_name)}')
+                    
+                    # Check for end markers (Add a Server / Discover buttons)
+                    if any(k in probe_lower for k in END_KEYWORDS):
+                        print(f'  -> End marker detected')
+                        reached_end = True
+                        break
+                    
+                    if any(p in probe_lower for p in ADD_SERVER_PATTERNS + DISCOVER_PATTERNS):
+                        print(f'  -> Likely end marker detected')
+                        reached_end = True
+                        break
+                    
+                    # Skip DM anchor if somehow encountered
+                    if any(k in probe_lower for k in DM_KEYWORDS):
+                        continue
+                    
+                    # Check if this is a NEW server (not already seen)
+                    probe_key = probe_name.strip().lower()
+                    is_new = probe_key not in seen_names
+                    
+                    # Fuzzy duplicate check
+                    if is_new:
+                        probe_clean = ''.join(c for c in probe_key if c.isalnum() or c == ' ').strip()
+                        for seen in seen_names:
+                            seen_clean = ''.join(c for c in seen if c.isalnum() or c == ' ').strip()
+                            if len(seen_clean) > 3 and len(probe_clean) > 3:
+                                if seen_clean in probe_clean or probe_clean in seen_clean:
+                                    is_new = False
+                                    break
+                    
+                    if is_new:
+                        seen_names.add(probe_key)
+                        server_info = {
+                            'index': len(all_servers),
+                            'raw_index': -1,  # Probed position, not from icon detection
+                            'page': page,
+                            'y': probe_y,
+                            'name': probe_name
+                        }
+                        all_servers.append(server_info)
+                        new_servers_this_page += 1
+                        print(f'  -> NEW server added: {repr(probe_name)}')
+                else:
+                    # No tooltip at this position - likely past the server list
+                    print(f'    Probe +{offset_mult} (y={probe_y}): no tooltip - stopping probe')
+                    break
+            
+            if reached_end:
+                break
         
         # Check if we found any new servers
         if new_servers_this_page == 0:
