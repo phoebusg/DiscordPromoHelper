@@ -98,6 +98,74 @@ def ocr_from_image(img):
         return ''
 
 
+def _find_image_in_image(needle, haystack, search_limit_y=None):
+    """Find the vertical position of needle image inside haystack image.
+    
+    Args:
+        needle: The image slice to find (e.g. bottom of previous page)
+        haystack: The image to search in (e.g. top of current page)
+        search_limit_y: Max Y coordinate in haystack to search (optimization)
+        
+    Returns:
+        y_pos: The Y coordinate in haystack where needle starts, or -1 if not found.
+    """
+    if not needle or not haystack:
+        return -1
+        
+    nw, nh = needle.size
+    hw, hh = haystack.size
+    
+    if nw != hw or nh > hh:
+        return -1
+        
+    # Convert to grayscale for comparison
+    n_gray = needle.convert('L')
+    h_gray = haystack.convert('L')
+    
+    n_pixels = list(n_gray.getdata())
+    h_pixels = list(h_gray.getdata())
+    
+    best_score = float('inf')
+    best_y = -1
+    
+    limit = search_limit_y if search_limit_y else (hh - nh)
+    limit = min(limit, hh - nh)
+    
+    # Search
+    for y in range(limit):
+        # Compare row by row
+        score = 0
+        # Optimization: check middle row first
+        mid_row = nh // 2
+        
+        # Compare full block
+        # This is slow in Python, but images are small (width ~72px)
+        # We can optimize by checking a few rows first
+        
+        diff = 0
+        for r in range(0, nh, 5): # Check every 5th row
+            idx_n = r * nw
+            idx_h = (y + r) * hw
+            for x in range(0, nw, 2): # Check every 2nd pixel
+                diff += abs(n_pixels[idx_n + x] - h_pixels[idx_h + x])
+            if diff > best_score: # Early exit
+                break
+        
+        if diff < best_score:
+            best_score = diff
+            best_y = y
+            
+    # Threshold for "good match"
+    # Average pixel diff per pixel checked
+    pixels_checked = (nh // 5) * (nw // 2)
+    if pixels_checked > 0:
+        avg_diff = best_score / pixels_checked
+        if avg_diff < 15: # Allow some noise
+            return best_y
+            
+    return -1
+
+
 def _vertical_projection_centers(img, w, h, merge_gap=8):
     """Return list of center Y positions (relative to the image top).
 
@@ -1444,12 +1512,13 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             except Exception:
                 pass
         # Tooltip capture - Discord tooltips appear to the right of the server icon
-        # Based on debug image analysis, tooltip text spans from about cx-20 to cx+175
-        # Use narrower boxes that focus on the tooltip area, avoiding channel list
+        # Icon center is cx. Icon width is 48px (radius 24).
+        # Tooltip starts to the right of the icon (approx cx + 30px).
+        # We MUST avoid capturing the icon itself as it confuses OCR.
         tooltip_boxes = [
-            (cx - 10, y_pos - 18, cx + 180, y_pos + 18),   # Primary: centered on tooltip
-            (cx - 20, y_pos - 22, cx + 200, y_pos + 22),   # Slightly wider
-            (cx + 0, y_pos - 15, cx + 170, y_pos + 15),    # Tight, slightly right
+            (cx + 30, y_pos - 18, cx + 230, y_pos + 18),   # Primary: starts after icon
+            (cx + 25, y_pos - 22, cx + 250, y_pos + 22),   # Wider: slightly more context
+            (cx + 35, y_pos - 15, cx + 210, y_pos + 15),   # Tight: focused on text
         ]
         for tb in tooltip_boxes:
             try:
@@ -1481,8 +1550,7 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         return None
     
     # Helper to detect and analyze current viewport
-    def _analyze_viewport(is_first_page=True):
-        col_img = _safe_grab(col_box)
+    def _analyze_viewport(col_img, is_first_page=True):
         if col_img is None:
             return [], None, None
         
@@ -1528,24 +1596,92 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     stale_pages = 0  # Count consecutive pages with no new servers
     max_stale = 2  # Stop after 2 consecutive stale pages (faster end detection)
     
+    # Track the start index for the scrollable list (skipping fixed icons like Home/DM)
+    # Default to 0 to be safe - we'd rather scan the Home icon as a duplicate than skip a real server
+    
+    # Visual overlap tracking
+    last_col_bottom = None
+    current_scroll_pixel_y = 0 # Absolute Y position of the top of the current view
+    
     while page < max_pages and not reached_end:
         print(f'\n=== Page {page} ===')
         
-        # Analyze current viewport
-        centers_abs, dm_idx, median = _analyze_viewport(is_first_page=(page == 0))
+        # Capture current viewport
+        col_img = _safe_grab(col_box)
+        if not col_img:
+            print('Failed to capture column, stopping')
+            break
+            
+        # VISUAL OVERLAP CHECK
+        # Determine which part of the new image is NEW content
+        # We use this ONLY to calculate scroll distance, NOT to skip icons blindly
+        visual_overlap_found = False
+        pixels_scrolled_this_step = 0
+        
+        if last_col_bottom:
+            # Search for the bottom of the previous page in the current page
+            # We search the ENTIRE column to be robust against small scrolls
+            search_box = (0, 0, col_img.width, col_img.height)
+            new_col_full = _safe_grab(col_box) # Need fresh full capture
+            
+            if new_col_full:
+                match_y = _find_image_in_image(last_col_bottom, new_col_full)
+                
+                if match_y >= 0:
+                    # Found match!
+                    # The bottom of the previous page (which was at relative Y = col_h)
+                    # is now at relative Y = match_y + last_col_bottom.height
+                    # Wait, last_col_bottom is the bottom 150px slice.
+                    # So the top of that slice was at (col_h - 150).
+                    # Now the top of that slice is at match_y.
+                    # So the content moved UP by (col_h - 150) - match_y.
+                    # This means we scrolled DOWN by that amount.
+                    
+                    col_h = col_box[3] - col_box[1]
+                    slice_h = last_col_bottom.height
+                    pixels_scrolled_this_step = (col_h - slice_h) - match_y
+                    
+                    visual_overlap_found = True
+                    print(f'  Visual Overlap: Found match at y={match_y}. Scrolled {pixels_scrolled_this_step}px.')
+                else:
+                    print('  Visual Overlap: No match found (scrolled too far or first page)')
+                    # Fallback: estimate based on scroll amount?
+                    # Better to assume we scrolled a full page minus overlap?
+                    # For now, let's just rely on dedup if visual fails.
+        
+        if page > 0 and visual_overlap_found:
+            current_scroll_pixel_y += pixels_scrolled_this_step
+        elif page > 0:
+             # Fallback if visual tracking lost: assume we scrolled what we intended
+             # This is risky but better than 0
+             # We intended to scroll 'total_scroll' units (approx 60px per unit)
+             # But we don't have access to 'total_scroll' from previous loop here easily without refactoring
+             # Let's just warn.
+             print('  WARNING: Visual tracking lost, absolute Y coordinates may be inaccurate.')
+
+        # Analyze viewport using the captured image
+        centers_abs, dm_idx, median = _analyze_viewport(col_img, is_first_page=(page == 0))
         print(f'Detected {len(centers_abs)} icons, dm_idx={dm_idx}, median={median}')
         
         if not centers_abs:
             print('No icons detected, stopping')
             break
         
-        # Determine start index for this page
+        # SCAN EVERYTHING: Do not filter by min_y_cutoff.
+        # We process ALL icons to ensure we don't miss anything and get second chances at OCR.
+        icons_to_process = list(range(len(centers_abs)))
+        
+        # On first page, we still need to handle DM detection
         if page == 0:
             # FIRST PAGE: Must find DM anchor via OCR to ensure we're at the top
             dm_found_idx = None
             print('Scanning for DM anchor via OCR...')
             
-            for i, cy in enumerate(centers_abs[:3]):  # Check first 3 icons only (DM is always first)
+            # Only check top 3 icons
+            check_indices = icons_to_process[:3]
+            
+            for i in check_indices:
+                cy = centers_abs[i]
                 y_hover = _clamp_y(cy)
                 txt = _read_tooltip(y_hover)
                 ltxt = (txt or '').lower()
@@ -1556,39 +1692,31 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                     print(f'  -> DM found at index {i}')
                     break
             
-            if dm_found_idx is None:
-                print('WARNING: Could not confirm DM anchor!')
-                if dm_idx is not None:
-                    start_idx = dm_idx + 1
-                else:
-                    start_idx = 0
-            else:
-                start_idx = dm_found_idx + 1
-                print(f'DM confirmed at index {dm_found_idx}, starting at index {start_idx}')
-        else:
-            # SUBSEQUENT PAGES: Start from beginning, use name-based deduplication
-            # Don't skip by fixed index - OCR the first few and skip if seen before
-            start_idx = 0
-            print(f'Page {page}: scanning from start, will deduplicate by name')
+            if dm_found_idx is not None:
+                # If DM found, we skip it and everything before it
+                # We need to adjust icons_to_process to exclude DM
+                new_icons_to_process = [idx for idx in icons_to_process if idx > dm_found_idx]
+                icons_to_process = new_icons_to_process
+                print(f'  Skipping DM and before, {len(icons_to_process)} icons remain')
         
-        # Calculate iteration range
-        # We scan ALL icons (including last ones) to detect "Add a Server" end marker
-        # Only skip the very last icon (Discover/Explore) - the second-to-last might be a server
-        iter_start = start_idx
-        iter_end = len(centers_abs)  # Scan all icons, including last ones
         
-        print(f'Iterating from index {iter_start} to {iter_end - 1}')
+        print(f'Processing {len(icons_to_process)} icons (scanning everything)')
         
         new_servers_this_page = 0
         this_page_names = []  # Track names found on this page
         overlap_count = 0  # Count how many overlapping servers we see
         this_page_hashes = []  # Track icon hashes on this page
         
-        # Process each icon - read tooltip for EVERY icon, capture hash too
-        # We need ALL the information to make robust dedup decisions
-        for i in range(iter_start, iter_end):
+        # Process each icon
+        for i in icons_to_process:
             cy = centers_abs[i]
             y_hover = _clamp_y(cy)
+            
+            # Calculate Absolute Y for this icon
+            # relative_y = cy - top
+            # absolute_y = current_scroll_pixel_y + relative_y
+            relative_y = cy - top
+            absolute_y = current_scroll_pixel_y + relative_y
             
             # CAPTURE: Get icon image and hash
             icon_img = None
@@ -1625,97 +1753,72 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 print(f'  Skipping DM at index {i}: {name}')
                 continue
             
-            # DEDUPLICATION: Use ALL signals together
-            # We compute confidence scores from multiple methods
+            # DEDUPLICATION: Check if we already have this server
+            # We use Absolute Y as a strong signal if visual tracking is working
             is_duplicate = False
             dup_reason = None
+            existing_server_idx = -1
             
-            # Signal 1: Exact hash match (very strong - same icon pixels)
-            hash_exact_match = False
-            hash_close_match = False
-            if icon_hash and utils:
-                for seen_hash in seen_hashes:
-                    dist = utils.icon_hash_distance(icon_hash, seen_hash)
-                    if dist == 0:
-                        hash_exact_match = True
+            # 1. Check Absolute Y (if tracking is good)
+            if visual_overlap_found or page == 0:
+                for idx, s in enumerate(all_servers):
+                    # Check if absolute Y matches within tolerance (e.g. 10px)
+                    if abs(s.get('abs_y', -999) - absolute_y) < 15:
+                        is_duplicate = True
+                        dup_reason = f'abs_y match ({s.get("abs_y")} vs {absolute_y})'
+                        existing_server_idx = idx
                         break
-                    elif dist <= 5:
-                        hash_close_match = True
             
-            # Signal 2: Exact name match (strong - OCR got same text)
-            name_exact_match = False
-            if name and len(name.strip()) > 2:
-                name_key = name.strip().lower()
-                if name_key in seen_names:
-                    name_exact_match = True
-            
-            # Signal 3: Fuzzy name match (medium - OCR variations)
-            name_fuzzy_match = False
-            fuzzy_match_name = None
-            if name and len(name.strip()) > 3:
-                name_clean = ''.join(c for c in name.strip().lower() if c.isalnum() or c == ' ').strip()
-                for seen in seen_names:
-                    seen_clean = ''.join(c for c in seen if c.isalnum() or c == ' ').strip()
-                    if len(seen_clean) > 3 and len(name_clean) > 3:
-                        # Substring match
-                        if seen_clean in name_clean or name_clean in seen_clean:
-                            name_fuzzy_match = True
-                            fuzzy_match_name = seen
+            # 2. Fallback to Hash/Name if Abs Y didn't match (or tracking lost)
+            if not is_duplicate:
+                # Signal 1: Exact hash match
+                if icon_hash and utils:
+                    for idx, s in enumerate(all_servers):
+                        s_hash = s.get('icon_hash')
+                        if s_hash:
+                            dist = utils.icon_hash_distance(icon_hash, s_hash)
+                            if dist == 0:
+                                is_duplicate = True
+                                dup_reason = f'hash_exact'
+                                existing_server_idx = idx
+                                break
+                
+                # Signal 2: Name match (if not found by hash)
+                if not is_duplicate and name and len(name.strip()) > 2:
+                    name_key = name.strip().lower()
+                    for idx, s in enumerate(all_servers):
+                        s_name = s.get('name')
+                        if s_name and s_name.strip().lower() == name_key:
+                            is_duplicate = True
+                            dup_reason = f'name_exact'
+                            existing_server_idx = idx
                             break
-                        # Word overlap (>50% shared words)
-                        seen_words = set(seen_clean.split())
-                        name_words = set(name_clean.split())
-                        if seen_words and name_words:
-                            common = seen_words & name_words
-                            min_words = min(len(seen_words), len(name_words))
-                            if min_words > 0 and len(common) >= max(1, min_words * 0.5):
-                                name_fuzzy_match = True
-                                fuzzy_match_name = seen
-                                break
-                        # Character similarity (Jaccard > 80%)
-                        seen_chars = set(seen_clean.replace(' ', ''))
-                        name_chars = set(name_clean.replace(' ', ''))
-                        if seen_chars and name_chars:
-                            intersection = len(seen_chars & name_chars)
-                            union = len(seen_chars | name_chars)
-                            if union > 0 and intersection / union > 0.8:
-                                name_fuzzy_match = True
-                                fuzzy_match_name = seen
-                                break
-            
-            # DECISION MATRIX: Combine signals
-            # - Hash exact + any name match = DEFINITE duplicate
-            # - Hash close + name exact = DEFINITE duplicate  
-            # - Hash exact alone = LIKELY duplicate (icon copied or holiday variant)
-            # - Name exact + no hash = LIKELY duplicate (icon changed but same server)
-            # - Hash close + name fuzzy = PROBABLE duplicate
-            # - Only fuzzy name = POSSIBLE duplicate (be conservative)
-            
-            if hash_exact_match and (name_exact_match or name_fuzzy_match):
-                is_duplicate = True
-                dup_reason = f'hash_exact + name_match'
-            elif hash_close_match and name_exact_match:
-                is_duplicate = True
-                dup_reason = f'hash_close + name_exact'
-            elif hash_exact_match:
-                # Icon pixels identical - very likely same server even if OCR failed
-                is_duplicate = True
-                dup_reason = f'hash_exact (OCR: {repr(name)})'
-            elif name_exact_match:
-                # Same name - likely same server even if icon changed
-                is_duplicate = True
-                dup_reason = f'name_exact (hash dist varies)'
-            elif hash_close_match and name_fuzzy_match:
-                is_duplicate = True
-                dup_reason = f'hash_close + name_fuzzy ({fuzzy_match_name})'
-            elif name_fuzzy_match and not icon_hash:
-                # Only fuzzy name, no hash - be conservative, call it duplicate
-                is_duplicate = True
-                dup_reason = f'name_fuzzy only ({fuzzy_match_name})'
-            
+
             if is_duplicate:
                 overlap_count += 1
-                print(f'  Skipping duplicate at index {i}: {dup_reason}')
+                # MERGE / IMPROVE: If we found a duplicate, check if we can improve the data
+                if existing_server_idx >= 0:
+                    existing = all_servers[existing_server_idx]
+                    old_name = existing.get('name')
+                    
+                    # If old name was empty/bad and new name is good -> UPDATE
+                    if (not old_name or len(old_name) < 2) and (name and len(name) > 2):
+                        print(f'  UPDATING server {existing["index"]} with better name: "{name}" (was "{old_name}")')
+                        existing['name'] = name
+                        # Update seen_names set too
+                        if name.strip().lower() not in seen_names:
+                            seen_names.add(name.strip().lower())
+                    
+                    # If we didn't have a hash before but do now -> UPDATE
+                    if not existing.get('icon_hash') and icon_hash:
+                        existing['icon_hash'] = icon_hash
+                        if icon_hash not in seen_hashes:
+                            seen_hashes.add(icon_hash)
+                            
+                    # Always update abs_y to the latest (might be more accurate?)
+                    # Actually, keep the first one, it's fine.
+                
+                print(f'  Duplicate at index {i}: {dup_reason} - Merged/Skipped')
                 continue
             
             # Valid NEW server - add it
@@ -1735,11 +1838,12 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 'raw_index': i,
                 'page': page,
                 'y': y_hover,
+                'abs_y': absolute_y, # Store absolute Y for tracking
                 'name': name,
                 'icon_hash': icon_hash
             }
             all_servers.append(server_info)
-            print(f'  Server {server_info["index"]}: y={y_hover}, name={repr(name)}, hash={icon_hash[:8] if icon_hash else "None"}...')
+            print(f'  Server {server_info["index"]}: y={y_hover}, abs_y={int(absolute_y)}, name={repr(name)}, hash={icon_hash[:8] if icon_hash else "None"}...')
             
             # Save icon image for UI display (canonical location: data/icons/{hash}.png)
             if icon_img and icon_hash:
@@ -1772,7 +1876,9 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         
         # Report overlap status
         if page > 0:
-            if overlap_count >= 2:
+            if visual_overlap_found:
+                print(f'  Good overlap: Visual match confirmed (skipped {overlap_count} duplicates)')
+            elif overlap_count >= 2:
                 print(f'  Good overlap: {overlap_count} duplicates detected')
             elif overlap_count == 1:
                 print(f'  WARNING: Only 1 overlap detected, scroll may be slightly off')
@@ -1867,7 +1973,7 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         
         # Validate overlap: on page > 0, we should see at least 1-2 duplicates
         # If we see 0 duplicates, scroll went too far - SCROLL BACK to recover!
-        if page > 0 and overlap_count == 0 and new_servers_this_page > 0:
+        if page > 0 and overlap_count == 0 and new_servers_this_page > 0 and not visual_overlap_found:
             print(f'  WARNING: No overlap on page {page}! Scrolling back to recover...')
             # Scroll back UP by ~2 icons worth to reveal overlap
             recovery_scroll = 2 * SCROLL_PER_ICON
@@ -1875,7 +1981,8 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             time.sleep(0.2)
             
             # Re-analyze viewport after scroll-back
-            centers_abs, dm_idx, median = _analyze_viewport(is_first_page=False)
+            col_img_rec = _safe_grab(col_box)
+            centers_abs, dm_idx, median = _analyze_viewport(col_img_rec, is_first_page=False)
             if centers_abs:
                 # Re-check for overlap with existing hashes
                 recovery_overlap = 0
@@ -1897,19 +2004,19 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         # EARLY END DETECTION: If overlap_count >= (total icons - 1), we're at the end
         # This means almost all visible icons are duplicates
         total_visible = len(centers_abs)
+        
         if overlap_count >= total_visible - 1 and new_servers_this_page <= 1:
             print(f'Nearly all {overlap_count}/{total_visible} icons are duplicates - at end of list')
             break
         
         # Scroll down for next page
-        # KEY INSIGHT: Scroll by (visible_icons - 3) to leave 3 icons as overlap (more conservative)
-        # The TOP 3 icons after scroll should be the BOTTOM 3 icons from before
-        # Using 3 instead of 2 for safety margin
-        icons_to_scroll = max(1, total_visible - 3)
+        # KEY INSIGHT: Scroll by (visible_icons - 1) to leave 1 icon as overlap
+        # We can be aggressive because we scan everything and merge duplicates
+        icons_to_scroll = max(1, total_visible - 1)
         total_scroll = icons_to_scroll * SCROLL_PER_ICON
         
         # ADAPTIVE: If no overlap was detected, reduce scroll even more for next page
-        if page > 0 and overlap_count == 0:
+        if page > 0 and overlap_count == 0 and not visual_overlap_found:
             total_scroll = max(1, total_scroll // 2)
             print(f'  Reducing scroll to {total_scroll} due to no overlap')
         
@@ -1918,8 +2025,20 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         # Track position before scroll to detect if we've hit bottom
         last_first_hash = this_page_hashes[0] if this_page_hashes else None
         
+        # Capture current column bottom for overlap detection
+        # We capture the bottom 150px of the column
+        last_col_bottom = None
+        try:
+            # col_box is (left, top, right, bottom)
+            # We want the bottom slice
+            slice_h = 150
+            slice_box = (col_box[0], col_box[3] - slice_h, col_box[2], col_box[3])
+            last_col_bottom = _safe_grab(slice_box)
+        except Exception:
+            pass
+        
         _focus_and_scroll(-total_scroll)  # Negative = scroll down
-        time.sleep(0.25)
+        time.sleep(0.6)  # Wait for scroll to settle
         
         page += 1
     

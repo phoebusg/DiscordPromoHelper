@@ -282,12 +282,14 @@ def clean_and_dedupe_servers(config_path: Optional[str] = None) -> Dict[str, int
     """Clean up server config by removing duplicates and invalid entries.
     
     Removes:
-    - Entries with no icon_hash (old cruft before hash-based tracking)
-    - Entries with no valid name AND no icon_hash
+    - Entries with BOTH no valid name AND no icon_hash (completely empty)
     - Near-duplicate entries (very similar icon_hash, distance <= 2)
-    - Entries with "Unknown" names that have duplicates with real names
+    - Garbage OCR entries (obviously invalid patterns)
     
-    Returns dict with counts: {'removed_invalid', 'removed_duplicates', 'removed_no_hash', 'total_remaining'}
+    Does NOT remove entries just because they lack icon_hash - those are valid
+    servers that just haven't been rescanned with hash capture yet.
+    
+    Returns dict with counts: {'removed_invalid', 'removed_duplicates', 'total_remaining'}
     """
     config = load_config(config_path)
     servers = config.get("servers", {})
@@ -304,7 +306,6 @@ def clean_and_dedupe_servers(config_path: Optional[str] = None) -> Dict[str, int
     stats = {
         'removed_invalid': 0,
         'removed_duplicates': 0,
-        'removed_no_hash': 0,
         'cleaned_names': 0,
         'total_before': len(servers),
         'total_remaining': 0
@@ -312,22 +313,24 @@ def clean_and_dedupe_servers(config_path: Optional[str] = None) -> Dict[str, int
     
     keys_to_remove = set()
     
-    # First pass: remove entries without icon_hash (old cruft)
+    # First pass: remove only truly invalid entries (no name AND no hash, or garbage)
     for key, server in servers.items():
         icon_hash = server.get("icon_hash", "") or ""
-        
-        if not icon_hash:
-            keys_to_remove.add(key)
-            stats['removed_no_hash'] += 1
-            continue
-        
-        # Check for obviously invalid entries
         ocr_name = server.get("ocr_name", "") or ""
         friendly_name = server.get("friendly_name", "") or ""
         
-        # Garbage patterns
-        garbage_patterns = ['|||', '___', '...', '???', 'null', 'none', 'error']
-        if any(p in ocr_name.lower() for p in garbage_patterns) and not friendly_name:
+        # Only remove if BOTH name and hash are missing/empty
+        has_valid_name = bool(ocr_name.strip()) or bool(friendly_name.strip())
+        has_hash = bool(icon_hash)
+        
+        if not has_valid_name and not has_hash:
+            keys_to_remove.add(key)
+            stats['removed_invalid'] += 1
+            continue
+        
+        # Garbage patterns - only remove if no friendly name set
+        garbage_patterns = ['|||', '___', '???', 'null', 'none', 'error']
+        if any(p in ocr_name.lower() for p in garbage_patterns) and not friendly_name and not has_hash:
             keys_to_remove.add(key)
             stats['removed_invalid'] += 1
     

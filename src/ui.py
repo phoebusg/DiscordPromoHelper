@@ -906,7 +906,7 @@ class DiscordPromoApp(tk.Tk):
         result = messagebox.askyesno(
             "Clean & Dedupe",
             "This will:\n"
-            "• Remove entries WITHOUT icon hash (old cruft)\n"
+            "• Remove entries with NO name AND no hash\n"
             "• Remove near-duplicate icons (hash distance ≤ 2)\n"
             "• Remove garbage OCR entries\n"
             "• Clean up whitespace in names\n\n"
@@ -928,7 +928,6 @@ class DiscordPromoApp(tk.Tk):
             "Clean & Dedupe Complete",
             f"Before: {stats['total_before']} servers\n"
             f"After: {stats['total_remaining']} servers\n\n"
-            f"Removed (no hash): {stats['removed_no_hash']}\n"
             f"Removed (invalid): {stats['removed_invalid']}\n"
             f"Removed (duplicates): {stats['removed_duplicates']}\n"
             f"Cleaned names: {stats['cleaned_names']}"

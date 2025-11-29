@@ -323,7 +323,8 @@ def capture_full_column(progress_callback=None):
     left, top, width, height = bbox
     col_w = max(48, int(width * 0.08))
     col_box = (max(0, left - 2), top + 50, min(left + col_w + 4, left + width), top + height - 60)
-    cx = left + (col_w // 2)
+    # Icon center is at fixed position: Discord icons are 48px, centered at ~36px from left edge
+    cx = left + 36
     cy_safe = top + height // 2
     
     log(f'Discord window: {bbox}')

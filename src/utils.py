@@ -878,6 +878,15 @@ def _clean_ocr_text(text: str) -> str:
     
     # Remove "Muted" anywhere in text (Discord tooltip artifact)
     text = re.sub(r'\s*\bMuted\b\s*', ' ', text, flags=re.IGNORECASE)
+    # Remove notification counts like "1 new message" or "9+ mentions"
+    text = re.sub(r'\b\d+\+?\s+(new\s+)?(message|notification|mention)s?\b', ' ', text, flags=re.IGNORECASE)
+    # Remove "Unread" or "Mentions" badges
+    text = re.sub(r'\b(Unread|Mentions)\b', ' ', text, flags=re.IGNORECASE)
+    
+    # Remove common channel list bleed (Announcements, Status, etc.)
+    # Handles full words and common OCR partials like "nents", "uncements"
+    bleed_pattern = r'\s+((An)?nounc?e?ments?|nents|uncements|Status|atus)\s*$'
+    text = re.sub(bleed_pattern, '', text, flags=re.IGNORECASE)
     
     # Common garbage sequences that appear when OCR misreads emoji/icons
     garbage_patterns = [
@@ -887,6 +896,7 @@ def _clean_ocr_text(text: str) -> str:
         r'[@#]\s*$',  # Trailing @ or #
         r'^[\'"]+\s*',  # Leading quotes
         r'\s*[\'"]+$',  # Trailing quotes
+        r'^\s*[.,;:]\s*$', # Just punctuation
     ]
     
     for pattern in garbage_patterns:
@@ -904,6 +914,10 @@ def _clean_ocr_text(text: str) -> str:
     
     # Remove leading/trailing punctuation
     text = text.strip('|_-.,;:\'"°®©™><[]{}()')
+    
+    # If the result is too short and not alphanumeric, it's likely noise
+    if len(text) < 2 and not any(c.isalnum() for c in text):
+        return ""
     
     return text
 
@@ -1017,18 +1031,23 @@ def _preprocess_discord_tooltip(img) -> list:
         # Aggressive autocontrast
         gray4 = ImageOps.autocontrast(gray4, cutoff=0)
         # Slight threshold to clean up while keeping anti-aliasing
-        gray4 = gray4.point(lambda x: 0 if x < 80 else (255 if x > 200 else x))
+        # Adjusted threshold: keep more gray levels for better anti-aliasing handling
+        gray4 = gray4.point(lambda x: 0 if x < 60 else (255 if x > 220 else x))
+        # Sharpen slightly to help with blurry text
+        gray4 = gray4.filter(ImageFilter.SHARPEN)
     else:
         gray4 = ImageOps.autocontrast(gray4, cutoff=2)
     
     # Add generous white padding (Tesseract needs margin)
-    discord_variant = ImageOps.expand(gray4, border=20, fill=255)
+    discord_variant = ImageOps.expand(gray4, border=30, fill=255)
     variants.append(('discord', discord_variant))
     
     # Variant 2: Simple scale 3x + autocontrast (good baseline)
     scaled = img.resize((w * 3, h * 3), Image.LANCZOS)
     gray = scaled.convert('L')
     v1 = ImageOps.autocontrast(gray, cutoff=2)
+    # Add padding here too
+    v1 = ImageOps.expand(v1, border=20, fill=255 if not is_dark else 0)
     variants.append(('simple', v1))
     
     # Variant 3: Invert (for dark theme) + autocontrast
