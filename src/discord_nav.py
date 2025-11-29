@@ -1520,10 +1520,19 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             (cx + 25, y_pos - 22, cx + 250, y_pos + 22),   # Wider: slightly more context
             (cx + 35, y_pos - 15, cx + 210, y_pos + 15),   # Tight: focused on text
         ]
-        for tb in tooltip_boxes:
+        for i, tb in enumerate(tooltip_boxes):
             try:
                 tbimg = _safe_grab(tb)
                 if tbimg:
+                    # SAVE DEBUG IMAGE
+                    if debug_save and debug_dir:
+                        try:
+                            ts = int(time.time() * 1000)
+                            fn = os.path.join(debug_dir, f'tooltip_{ts}_{y_pos}_{i}.png')
+                            tbimg.save(fn)
+                        except Exception:
+                            pass
+
                     # Pass original image - ocr_from_image handles all preprocessing
                     txt = ocr_from_image(tbimg) if 'ocr_from_image' in globals() else ''
                     if not txt:

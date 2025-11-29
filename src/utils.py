@@ -924,67 +924,83 @@ def _clean_ocr_text(text: str) -> str:
 
 def _detect_tooltip_region(img):
     """Detect the tooltip region within an image by analyzing brightness.
+    Crops both horizontally and vertically to the text content.
     
     Discord tooltips:
     - Appear as dark gray boxes (~RGB 35-55) on dark backgrounds
     - Text (white) appears on the tooltip
-    - Are typically 100-200px wide
-    
-    The channel list to the right is darker (~RGB 25-32).
-    
-    Returns a cropped image containing just the tooltip, or the original if detection fails.
     """
     try:
         w, h = img.size
-        if w < 100 or h < 20:
+        if w < 50 or h < 10:
             return img
             
-        # Convert to RGB
-        if img.mode != 'RGB':
-            img_rgb = img.convert('RGB')
-        else:
-            img_rgb = img
+        # Convert to grayscale for analysis
+        gray = img.convert('L')
+        px = list(gray.getdata())
         
-        pixels = list(img_rgb.getdata())
-        
-        def get_col_stats(x):
-            """Get brightness stats for column x."""
-            col_pixels = [pixels[y * w + x] for y in range(h)]
-            avg = sum((p[0] + p[1] + p[2]) // 3 for p in col_pixels) // len(col_pixels)
-            white = sum(1 for p in col_pixels if (p[0] + p[1] + p[2]) // 3 > 180)
-            return avg, white
-        
-        # Find where text (white pixels) starts - this is the tooltip content
-        text_start = 0
-        for x in range(w):
-            _, white = get_col_stats(x)
-            if white >= 2:  # At least 2 white pixels = text
-                text_start = max(0, x - 5)  # Small margin before text
-                break
-        
-        # Find where brightness drops (transition from tooltip to channel list)
-        # Scan from after text start
-        drop_x = w
-        for x in range(max(text_start + 50, 100), w - 10, 5):
-            avg, _ = get_col_stats(x)
-            if avg < 32:  # Channel list is darker
-                drop_x = x
-                break
-        
-        # Crop region
-        left = text_start
-        right = min(drop_x + 10, w)
-        
-        # Sanity check: must have reasonable width
-        if right - left < 80:
-            right = min(left + 200, w)
-        
-        # Don't crop if already small enough
-        if right - left >= w - 20:
+        # Threshold for text detection (Discord text is bright on dark)
+        # Use a relative threshold based on max brightness to handle dim text
+        max_val = max(px)
+        if max_val < 50: # Image is too dark, probably no text
             return img
+            
+        bright_thresh = max(80, max_val * 0.6)
         
-        cropped = img.crop((left, 0, right, h))
-        return cropped
+        # 1. Vertical Crop (Find top/bottom of text)
+        row_has_text = []
+        for y in range(h):
+            row = [px[y * w + x] for x in range(w)]
+            # Check for run of bright pixels
+            has_text = False
+            consecutive = 0
+            for p in row:
+                if p > bright_thresh:
+                    consecutive += 1
+                    if consecutive >= 2:
+                        has_text = True
+                        break
+                else:
+                    consecutive = 0
+            row_has_text.append(has_text)
+            
+        if not any(row_has_text):
+            return img
+            
+        first_row = next((i for i, has in enumerate(row_has_text) if has), 0)
+        last_row = next((h - 1 - i for i, has in enumerate(reversed(row_has_text)) if has), h - 1)
+        
+        # 2. Horizontal Crop (Find left/right of text)
+        col_has_text = []
+        for x in range(w):
+            col = [px[y * w + x] for y in range(h)]
+            # Only check within the vertical bounds we just found
+            col_segment = col[first_row:last_row+1]
+            has_text = any(p > bright_thresh for p in col_segment)
+            col_has_text.append(has_text)
+            
+        if not any(col_has_text):
+            return img
+            
+        first_col = next((i for i, has in enumerate(col_has_text) if has), 0)
+        last_col = next((w - 1 - i for i, has in enumerate(reversed(col_has_text)) if has), w - 1)
+        
+        # Add margin
+        margin_x = 6
+        margin_y = 4
+        
+        crop_box = (
+            max(0, first_col - margin_x),
+            max(0, first_row - margin_y),
+            min(w, last_col + margin_x + 1),
+            min(h, last_row + margin_y + 1)
+        )
+        
+        # Sanity check: don't crop if result is tiny
+        if crop_box[2] - crop_box[0] < 20 or crop_box[3] - crop_box[1] < 10:
+            return img
+            
+        return img.crop(crop_box)
         
     except Exception:
         return img
@@ -1020,7 +1036,7 @@ def _preprocess_discord_tooltip(img) -> list:
     stat = ImageStat.Stat(gray_check)
     is_dark = stat.mean[0] < 120
     
-    # Variant 1: Discord-optimized (best performing in tests)
+    # Variant 1: Discord-optimized (Tuned)
     # 4x scale + invert + autocontrast + partial threshold
     scaled4 = img.resize((w * 4, h * 4), Image.LANCZOS)
     gray4 = scaled4.convert('L')
@@ -1031,15 +1047,16 @@ def _preprocess_discord_tooltip(img) -> list:
         # Aggressive autocontrast
         gray4 = ImageOps.autocontrast(gray4, cutoff=0)
         # Slight threshold to clean up while keeping anti-aliasing
-        # Adjusted threshold: keep more gray levels for better anti-aliasing handling
-        gray4 = gray4.point(lambda x: 0 if x < 60 else (255 if x > 220 else x))
+        # Tuned threshold from v5_discord_optimized (80/200)
+        gray4 = gray4.point(lambda x: 0 if x < 80 else (255 if x > 200 else x))
         # Sharpen slightly to help with blurry text
         gray4 = gray4.filter(ImageFilter.SHARPEN)
     else:
         gray4 = ImageOps.autocontrast(gray4, cutoff=2)
     
     # Add generous white padding (Tesseract needs margin)
-    discord_variant = ImageOps.expand(gray4, border=30, fill=255)
+    # Tuned padding: 20px is sufficient
+    discord_variant = ImageOps.expand(gray4, border=20, fill=255)
     variants.append(('discord', discord_variant))
     
     # Variant 2: Simple scale 3x + autocontrast (good baseline)
