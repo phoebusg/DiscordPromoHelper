@@ -48,3 +48,4 @@ htmlcov/
 clean_requirements.txt
 installed.txt
 servers*.json
+*.png
