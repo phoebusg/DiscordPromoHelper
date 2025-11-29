@@ -100,14 +100,25 @@ See [SETUP.md](SETUP.md) for detailed setup instructions.
 │   ├── main.py           # Entry point (--ui, --scan, --post)
 │   ├── ui.py             # Tkinter GUI
 │   ├── stream_info.py    # Twitch/Kick/YouTube API integration
-│   ├── discord_nav.py    # Server scanning
+│   ├── discord_nav.py    # Server scanning & iteration
+│   ├── promotion_helper.py # Posting logic
 │   ├── server_config.py  # Settings management
+│   ├── storage.py        # Rate limiting & persistence
+│   ├── config.py         # App configuration
 │   └── utils.py          # OCR, window helpers
-├── servers.json          # Scanned server list
+├── scripts/
+│   ├── setup.sh          # Setup script
+│   ├── test_ocr_tuning.py # OCR preprocessing test harness
+│   ├── test_full_scan.py # Full scan test
+│   └── collect_tooltip_crops.py # Tooltip image collection
+├── tests/                # Unit tests
+├── data/                 # Runtime data (gitignored)
+│   └── debug/            # Debug screenshots
 ├── server_config.json    # Your settings
-├── .env.example          # API key template
-└── scripts/setup.sh      # Setup script
+└── .env.example          # API key template
 ```
+
+> **Note**: `servers.json` and `*.png` files are gitignored (contain private data). They are generated when you run the app.
 
 ## ⚠️ Disclaimer
 
