@@ -77,17 +77,17 @@ def ocr_from_image(img):
 
         This function is intended for non-interactive OCR testing of tooltip/crop images.
         """
-        # Prefer utils helper when available
+        # Prefer utils helper when available (uses optimized preprocessing)
         try:
             if utils and hasattr(utils, 'ocr_image_to_text'):
                 return utils.ocr_image_to_text(img)
         except Exception:
             pass
 
-        # Fallback to pytesseract
+        # Fallback to pytesseract with PSM 6 (block mode - best for Discord tooltips)
         try:
             if pytesseract:
-                cfg = '--psm 7 --oem 3'
+                cfg = '--psm 6 --oem 3'
                 return pytesseract.image_to_string(img, config=cfg).strip()
         except Exception:
             pass
