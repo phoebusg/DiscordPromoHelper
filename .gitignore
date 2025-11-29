@@ -47,3 +47,4 @@ htmlcov/
 # Generated files (keep requirements.txt)
 clean_requirements.txt
 installed.txt
+servers*.json
