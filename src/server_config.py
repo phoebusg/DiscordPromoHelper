@@ -182,6 +182,8 @@ def import_from_servers_json(servers_json_path: str = "servers.json", config_pat
     """Import servers from servers.json (scan output) into server_config.json.
     
     Returns the number of new servers imported.
+    Handles both list format (from scan) and dict format with "servers" key.
+    Now includes icon_hash for reliable server identification.
     """
     servers_path = Path(servers_json_path)
     if not servers_path.exists():
@@ -193,23 +195,53 @@ def import_from_servers_json(servers_json_path: str = "servers.json", config_pat
         return 0
     
     config = load_config(config_path)
-    servers_list = servers_data.get("servers", [])
+    
+    # Handle both list format and dict format
+    if isinstance(servers_data, list):
+        servers_list = servers_data
+    else:
+        servers_list = servers_data.get("servers", [])
     
     imported = 0
+    updated = 0
+    
     for server in servers_list:
         ocr_name = server.get("name", "")
-        if not ocr_name:
+        icon_hash = server.get("icon_hash", "")
+        
+        if not ocr_name and not icon_hash:
             continue
         
-        key = _normalize_key(ocr_name)
-        if key not in config.get("servers", {}):
+        # Use icon_hash as primary key if available, else fall back to name
+        if icon_hash:
+            key = f"icon_{icon_hash[:16]}"
+        else:
+            key = _normalize_key(ocr_name)
+        
+        existing = config.get("servers", {}).get(key)
+        
+        if existing is None:
             # New server - add with defaults
-            set_server_config(
-                ocr_name=ocr_name,
-                config=config,
-                save=False
-            )
+            config.setdefault("servers", {})[key] = {
+                "ocr_name": ocr_name or f"Unknown ({icon_hash[:8]})",
+                "friendly_name": "",
+                "promo_channels": [],
+                "game_tags": [],
+                "enabled": True,
+                "notes": "",
+                "icon_hash": icon_hash,
+                "scan_index": server.get("index", -1)
+            }
             imported += 1
+        else:
+            # Existing server - update icon_hash if not set
+            if icon_hash and not existing.get("icon_hash"):
+                existing["icon_hash"] = icon_hash
+                updated += 1
+            # Update OCR name if we got a better one
+            if ocr_name and (not existing.get("ocr_name") or existing.get("ocr_name", "").startswith("Unknown")):
+                existing["ocr_name"] = ocr_name
+                updated += 1
     
     save_config(config, config_path)
     return imported
@@ -244,3 +276,153 @@ def find_similar_servers(name: str, config: Optional[Dict] = None, threshold: fl
     # Sort by similarity descending
     similar.sort(key=lambda x: x["similarity"], reverse=True)
     return similar
+
+
+def clean_and_dedupe_servers(config_path: Optional[str] = None) -> Dict[str, int]:
+    """Clean up server config by removing duplicates and invalid entries.
+    
+    Removes:
+    - Entries with no icon_hash (old cruft before hash-based tracking)
+    - Entries with no valid name AND no icon_hash
+    - Near-duplicate entries (very similar icon_hash, distance <= 2)
+    - Entries with "Unknown" names that have duplicates with real names
+    
+    Returns dict with counts: {'removed_invalid', 'removed_duplicates', 'removed_no_hash', 'total_remaining'}
+    """
+    config = load_config(config_path)
+    servers = config.get("servers", {})
+    
+    # Try to import hash distance function
+    try:
+        from src.utils import icon_hash_distance
+    except ImportError:
+        try:
+            from utils import icon_hash_distance
+        except ImportError:
+            icon_hash_distance = None
+    
+    stats = {
+        'removed_invalid': 0,
+        'removed_duplicates': 0,
+        'removed_no_hash': 0,
+        'cleaned_names': 0,
+        'total_before': len(servers),
+        'total_remaining': 0
+    }
+    
+    keys_to_remove = set()
+    
+    # First pass: remove entries without icon_hash (old cruft)
+    for key, server in servers.items():
+        icon_hash = server.get("icon_hash", "") or ""
+        
+        if not icon_hash:
+            keys_to_remove.add(key)
+            stats['removed_no_hash'] += 1
+            continue
+        
+        # Check for obviously invalid entries
+        ocr_name = server.get("ocr_name", "") or ""
+        friendly_name = server.get("friendly_name", "") or ""
+        
+        # Garbage patterns
+        garbage_patterns = ['|||', '___', '...', '???', 'null', 'none', 'error']
+        if any(p in ocr_name.lower() for p in garbage_patterns) and not friendly_name:
+            keys_to_remove.add(key)
+            stats['removed_invalid'] += 1
+    
+    # Second pass: find near-duplicate hashes (distance <= 2)
+    remaining = {k: v for k, v in servers.items() if k not in keys_to_remove}
+    
+    # Build list of (key, hash) pairs
+    hash_entries = [(k, v.get('icon_hash', '')) for k, v in remaining.items() if v.get('icon_hash')]
+    
+    # Track which hashes we've decided to keep
+    kept_hashes = {}  # hash -> key
+    
+    for key, icon_hash in hash_entries:
+        if key in keys_to_remove:
+            continue
+            
+        # Check if this hash is near-duplicate of a kept hash
+        is_near_dup = False
+        dup_of_key = None
+        
+        if icon_hash_distance:
+            for kept_hash, kept_key in kept_hashes.items():
+                dist = icon_hash_distance(icon_hash, kept_hash)
+                if dist <= 2:  # Very strict - only near-identical icons
+                    is_near_dup = True
+                    dup_of_key = kept_key
+                    break
+        else:
+            # Fallback: exact match only
+            if icon_hash in kept_hashes:
+                is_near_dup = True
+                dup_of_key = kept_hashes[icon_hash]
+        
+        if is_near_dup:
+            # Decide which to keep: prefer one with friendly_name or better ocr_name
+            current = remaining[key]
+            existing = remaining.get(dup_of_key, {})
+            
+            current_has_friendly = bool(current.get("friendly_name"))
+            existing_has_friendly = bool(existing.get("friendly_name"))
+            current_is_unknown = (current.get("ocr_name") or "").lower().startswith("unknown")
+            existing_is_unknown = (existing.get("ocr_name") or "").lower().startswith("unknown")
+            
+            # Keep current if it's better
+            if (current_has_friendly and not existing_has_friendly) or \
+               (not current_is_unknown and existing_is_unknown):
+                # Remove the existing one, keep current
+                keys_to_remove.add(dup_of_key)
+                kept_hashes[icon_hash] = key
+                # Remove old hash entry
+                for h, k in list(kept_hashes.items()):
+                    if k == dup_of_key:
+                        del kept_hashes[h]
+                        break
+            else:
+                # Keep existing, remove current
+                keys_to_remove.add(key)
+            
+            stats['removed_duplicates'] += 1
+        else:
+            # No duplicate, keep this one
+            kept_hashes[icon_hash] = key
+    
+    # Build cleaned config
+    cleaned_servers = {}
+    for key, server in servers.items():
+        if key in keys_to_remove:
+            continue
+        
+        # Clean up the entry
+        cleaned = server.copy()
+        cleaned.setdefault("ocr_name", "")
+        cleaned.setdefault("friendly_name", "")
+        cleaned.setdefault("promo_channels", [])
+        cleaned.setdefault("game_tags", [])
+        cleaned.setdefault("enabled", True)
+        cleaned.setdefault("notes", "")
+        cleaned.setdefault("icon_hash", "")
+        
+        # Strip whitespace from names
+        if cleaned["ocr_name"]:
+            new_name = cleaned["ocr_name"].strip()
+            if new_name != cleaned["ocr_name"]:
+                stats['cleaned_names'] += 1
+            cleaned["ocr_name"] = new_name
+        
+        if cleaned["friendly_name"]:
+            cleaned["friendly_name"] = cleaned["friendly_name"].strip()
+        
+        cleaned_servers[key] = cleaned
+    
+    # Save cleaned config
+    config["servers"] = cleaned_servers
+    save_config(config, config_path)
+    
+    stats['total_remaining'] = len(cleaned_servers)
+    
+    return stats

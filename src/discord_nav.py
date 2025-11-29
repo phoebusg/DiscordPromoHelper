@@ -15,10 +15,14 @@ if sys.platform.startswith('win32'):
     SCROLL_PER_ICON = 60     # Windows: ~60 units scrolls one server icon
     SCROLL_TO_TOP_PASSES = 3  # Number of scroll-up passes to reach top
 else:
-    # macOS: pyautogui scroll units are small but not tiny
-    # Testing shows ~10-15 units per icon on Retina displays
+    # macOS: pyautogui scroll units
+    # If we're scrolling too far (no overlap), reduce this value
+    # If we're not scrolling enough (too many duplicates), increase this value
     SCROLL_MULTIPLIER = 1
-    SCROLL_PER_ICON = 12     # macOS: ~12 units per server icon (increased from 3)
+    # SCROLL_PER_ICON: Critical value! Each icon is ~48px tall
+    # Too high = skip servers, too low = duplicates forever
+    # Value of 2 was still skipping, try 1 (very conservative)
+    SCROLL_PER_ICON = 1
     SCROLL_TO_TOP_PASSES = 5  # More passes on macOS to ensure we reach top
 
 try:
@@ -1303,7 +1307,7 @@ def find_and_hover_first_server(start_from_top: bool = True, hover_delay: float 
     return (cx, int(final_y))
 
 
-def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_servers: int = 200):
+def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_servers: int = 500):
     """Iterate through ALL servers and return their names and positions.
     
     Returns list of dicts: [{'index': int, 'y': int, 'name': str or None}, ...]
@@ -1332,7 +1336,9 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     left, top, width, height = bbox
     col_w = max(48, int(width * 0.08))
     col_box = (max(0, left - 2), top, min(left + col_w + 4, left + width), top + height)
-    cx = left + (col_w // 2)
+    # Icon center is at fixed position: Discord icons are 48px, centered at ~36px from left edge
+    # NOT col_w // 2 which varies with window size
+    cx = left + 36
     
     # Debug save dir
     debug_dir = None
@@ -1370,7 +1376,7 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                     left, top, width, height = bbox
                     col_w = max(48, int(width * 0.08))
                     col_box = (max(0, left - 2), top, min(left + col_w + 4, left + width), top + height)
-                    cx = left + (col_w // 2)
+                    cx = left + 36  # Fixed icon center position
             except Exception:
                 pass
         
@@ -1380,8 +1386,8 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         safe_y = min(safe_y, top + height - 80)  # Avoid bottom UI
         
         try:
-            pyautogui.moveTo(cx, safe_y, duration=0.15)
-            time.sleep(0.1)
+            pyautogui.moveTo(cx, safe_y, duration=0.05)
+            time.sleep(0.03)
         except Exception:
             pass
         
@@ -1412,21 +1418,18 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     # These appear at the bottom of the server list
     END_KEYWORDS = ('add a server', 'add server', 'explore public', 'discover', 'public servers', 'scover')  # 'scover' catches OCR errors on 'Discover'
     
-    # Scroll to ABSOLUTE TOP - multiple passes to ensure we reach the top
-    # regardless of starting position
+    # Scroll to ABSOLUTE TOP - scroll up enough to reach the first server
     print('Scrolling to top...')
     if pyautogui:
-        # Multiple aggressive scroll-up passes
-        # positive scroll = up on both Windows and macOS
-        scroll_up_amount = 20 * SCROLL_PER_ICON  # Scroll ~20 icons worth per pass
+        # Scroll up aggressively - 3 passes of 100 icons = 300 icons
+        scroll_up_amount = 100 * SCROLL_PER_ICON
         
-        for scroll_pass in range(SCROLL_TO_TOP_PASSES):
-            _focus_and_scroll(scroll_up_amount)
-            time.sleep(0.15)
+        for scroll_pass in range(3):
+            _focus_and_scroll(scroll_up_amount)  # Positive = scroll UP
+            time.sleep(0.03)
         
-        # Final pause to let UI settle
-        time.sleep(0.3)
-        print(f'Completed {SCROLL_TO_TOP_PASSES} scroll-to-top passes ({scroll_up_amount} units each)')
+        time.sleep(0.1)
+        print('Scrolled to top')
     
     # Helper to read tooltip at position
     def _read_tooltip(y_pos):
@@ -1440,61 +1443,39 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 time.sleep(hover_delay)
             except Exception:
                 pass
-        # Try multiple tooltip positions
+        # Tooltip capture - Discord tooltips appear to the right of the server icon
+        # Based on debug image analysis, tooltip text spans from about cx-20 to cx+175
+        # Use narrower boxes that focus on the tooltip area, avoiding channel list
         tooltip_boxes = [
-            (cx + 50, y_pos - 20, cx + 280, y_pos + 20),
-            (cx + 40, y_pos - 35, cx + 320, y_pos + 15),
-            (cx + 15, y_pos - 30, cx + 250, y_pos + 10),
-            (cx + 60, y_pos - 15, cx + 350, y_pos + 25),  # wider right
+            (cx - 10, y_pos - 18, cx + 180, y_pos + 18),   # Primary: centered on tooltip
+            (cx - 20, y_pos - 22, cx + 200, y_pos + 22),   # Slightly wider
+            (cx + 0, y_pos - 15, cx + 170, y_pos + 15),    # Tight, slightly right
         ]
         for tb in tooltip_boxes:
             try:
                 tbimg = _safe_grab(tb)
                 if tbimg:
-                    # Scale up 3x for better OCR (Tesseract needs 300+ DPI)
-                    w, h = tbimg.size
-                    scale = 3
-                    tbimg_scaled = tbimg.resize((w * scale, h * scale), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
-                    
-                    # Try multiple image preprocessing methods
-                    preprocessed = []
-                    
-                    # Method 1: Invert first (dark bg -> light bg), then autocontrast
-                    # Tesseract 4+ works best with dark text on light background
-                    gray = tbimg_scaled.convert('L')
-                    if ImageOps:
-                        inverted = ImageOps.invert(gray)
-                        # Add white border (10px) for better recognition
-                        from PIL import ImageOps as IOps
-                        bordered = IOps.expand(inverted, border=10, fill=255)
-                        preprocessed.append(bordered)
-                        
-                        # Also try autocontrast on inverted
-                        ac_inv = ImageOps.autocontrast(inverted, cutoff=5)
-                        bordered_ac = IOps.expand(ac_inv, border=10, fill=255)
-                        preprocessed.append(bordered_ac)
-                    
-                    # Method 2: Grayscale autocontrast with border
-                    if ImageOps:
-                        ac_gray = ImageOps.autocontrast(gray, cutoff=2)
-                        bordered_gray = ImageOps.expand(ac_gray, border=10, fill=255)
-                        preprocessed.append(bordered_gray)
-                    
-                    # OCR config: single line, LSTM engine
-                    ocr_config = '--psm 7 --oem 3'
-                    
-                    for pimg in preprocessed:
+                    # Pass original image - ocr_from_image handles all preprocessing
+                    txt = ocr_from_image(tbimg) if 'ocr_from_image' in globals() else ''
+                    if not txt:
+                        # Fallback to direct pytesseract with simple preprocessing
                         try:
-                            txt = ocr_from_image(pimg) if 'ocr_from_image' in globals() else pytesseract.image_to_string(pimg, config=ocr_config).strip()
+                            from PIL import ImageOps
+                            w, h = tbimg.size
+                            scaled = tbimg.resize((w * 3, h * 3), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
+                            gray = scaled.convert('L')
+                            inverted = ImageOps.invert(gray)
+                            bordered = ImageOps.expand(inverted, border=10, fill=255)
+                            txt = pytesseract.image_to_string(bordered, config='--psm 7 --oem 3').strip()
                         except Exception:
                             txt = ''
-                        # Clean common artifacts
-                        if txt:
-                            # Remove leading/trailing punctuation artifacts
-                            txt = txt.strip('|_-.,;:\'"°®©™><[]{}()')
-                            txt = txt.strip()
-                        if txt and len(txt) > 1:
-                            return txt
+                    # Clean common artifacts
+                    if txt:
+                        # Remove leading/trailing punctuation artifacts
+                        txt = txt.strip('|_-.,;:\'"°®©™><[]{}()')
+                        txt = txt.strip()
+                    if txt and len(txt) > 1:
+                        return txt
             except Exception:
                 pass
         return None
@@ -1537,14 +1518,15 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
     
     # Main iteration
     all_servers = []
-    seen_names = set()  # Track seen server names for deduplication
+    seen_hashes = set()  # Track seen icon hashes for deduplication (RELIABLE)
+    seen_names = set()  # Track seen server names (backup, for display)
     last_page_names = []  # Names from last page for overlap detection
     page = 0
     max_pages = 50  # Safety limit
     reached_end = False
     total_servers_counted = 0  # Track total position in the list
     stale_pages = 0  # Count consecutive pages with no new servers
-    max_stale = 3  # Stop after 3 consecutive stale pages
+    max_stale = 2  # Stop after 2 consecutive stale pages (faster end detection)
     
     while page < max_pages and not reached_end:
         print(f'\n=== Page {page} ===')
@@ -1563,7 +1545,7 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             dm_found_idx = None
             print('Scanning for DM anchor via OCR...')
             
-            for i, cy in enumerate(centers_abs[:6]):  # Check first 6 icons max
+            for i, cy in enumerate(centers_abs[:3]):  # Check first 3 icons only (DM is always first)
                 y_hover = _clamp_y(cy)
                 txt = _read_tooltip(y_hover)
                 ltxt = (txt or '').lower()
@@ -1600,98 +1582,150 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         new_servers_this_page = 0
         this_page_names = []  # Track names found on this page
         overlap_count = 0  # Count how many overlapping servers we see
+        this_page_hashes = []  # Track icon hashes on this page
         
+        # Process each icon - read tooltip for EVERY icon, capture hash too
+        # We need ALL the information to make robust dedup decisions
         for i in range(iter_start, iter_end):
             cy = centers_abs[i]
             y_hover = _clamp_y(cy)
-            is_very_last = (i == len(centers_abs) - 1)  # Only skip the absolute last icon
             
-            # Read tooltip - but DON'T skip position if OCR fails
+            # CAPTURE: Get icon image and hash
+            icon_img = None
+            icon_hash = None
+            try:
+                icon_box = (cx - 24, int(cy) - 24, cx + 24, int(cy) + 24)
+                icon_img = _safe_grab(icon_box)
+                if icon_img and utils:
+                    icon_hash = utils.compute_icon_hash(icon_img)
+            except Exception:
+                pass
+            
+            # READ: Get tooltip name (always, we need the info)
             name = _read_tooltip(y_hover)
             lname = (name or '').lower()
             
-            # Check for end marker FIRST - this is critical for "Add a Server" / "Discover"
-            # Also check the last icon specifically for end markers
+            # CHECK: End markers first
             if name and any(k in lname for k in END_KEYWORDS):
                 print(f'  Detected end marker "{name}" at index {i}')
                 reached_end = True
                 break
             
-            # Check last 3 icons for "Add a Server" / "Discover" button patterns
-            # These may have garbled OCR due to their different visual style
+            # CHECK: Last 3 icons for Add/Discover buttons
             if i >= len(centers_abs) - 3 and name:
-                add_server_patterns = ('server', 'dd a', 'add a', 'ddaserver')
-                discover_patterns = ('scover', 'iscover', 'xplore', 'iscov', 'ublic')
-                if any(p in lname for p in add_server_patterns + discover_patterns):
+                is_add_server = ('add' in lname and 'server' in lname) or 'addaserver' in lname.replace(' ', '')
+                is_discover = any(p in lname for p in ('discover', 'explore public', 'public servers'))
+                if is_add_server or is_discover:
                     print(f'  Detected likely end marker "{name}" at index {i}')
                     reached_end = True
                     break
             
-            # Skip DM (shouldn't happen after page 0, but safety check)
+            # CHECK: Skip DM
             if name and any(k in lname for k in DM_KEYWORDS):
                 print(f'  Skipping DM at index {i}: {name}')
                 continue
             
-            # Deduplication: skip if we've seen this name before (with OCR fuzzy matching)
-            # Only dedupe if name is not None and has content
+            # DEDUPLICATION: Use ALL signals together
+            # We compute confidence scores from multiple methods
             is_duplicate = False
+            dup_reason = None
+            
+            # Signal 1: Exact hash match (very strong - same icon pixels)
+            hash_exact_match = False
+            hash_close_match = False
+            if icon_hash and utils:
+                for seen_hash in seen_hashes:
+                    dist = utils.icon_hash_distance(icon_hash, seen_hash)
+                    if dist == 0:
+                        hash_exact_match = True
+                        break
+                    elif dist <= 5:
+                        hash_close_match = True
+            
+            # Signal 2: Exact name match (strong - OCR got same text)
+            name_exact_match = False
             if name and len(name.strip()) > 2:
                 name_key = name.strip().lower()
-                # Remove common OCR noise for comparison
-                name_clean = ''.join(c for c in name_key if c.isalnum() or c == ' ').strip()
-                
                 if name_key in seen_names:
-                    is_duplicate = True
-                    overlap_count += 1
-                    print(f'  Skipping duplicate at index {i}: {repr(name)}')
-                    continue
-                
-                # Check for fuzzy matches using cleaned versions
+                    name_exact_match = True
+            
+            # Signal 3: Fuzzy name match (medium - OCR variations)
+            name_fuzzy_match = False
+            fuzzy_match_name = None
+            if name and len(name.strip()) > 3:
+                name_clean = ''.join(c for c in name.strip().lower() if c.isalnum() or c == ' ').strip()
                 for seen in seen_names:
                     seen_clean = ''.join(c for c in seen if c.isalnum() or c == ' ').strip()
-                    
                     if len(seen_clean) > 3 and len(name_clean) > 3:
-                        # Method 1: Substring match
+                        # Substring match
                         if seen_clean in name_clean or name_clean in seen_clean:
-                            is_duplicate = True
-                            overlap_count += 1
-                            print(f'  Skipping fuzzy duplicate at index {i}: {repr(name)} ~ {repr(seen)}')
+                            name_fuzzy_match = True
+                            fuzzy_match_name = seen
                             break
-                        
-                        # Method 2: Common word overlap (>60% shared words = duplicate)
+                        # Word overlap (>50% shared words)
                         seen_words = set(seen_clean.split())
                         name_words = set(name_clean.split())
                         if seen_words and name_words:
                             common = seen_words & name_words
-                            # If more than half of the smaller set's words match
                             min_words = min(len(seen_words), len(name_words))
-                            if min_words > 0 and len(common) >= max(1, min_words * 0.6):
-                                is_duplicate = True
-                                overlap_count += 1
-                                print(f'  Skipping word-match duplicate at index {i}: {repr(name)} ~ {repr(seen)}')
+                            if min_words > 0 and len(common) >= max(1, min_words * 0.5):
+                                name_fuzzy_match = True
+                                fuzzy_match_name = seen
                                 break
-                        
-                        # Method 3: Character similarity (Jaccard on chars)
+                        # Character similarity (Jaccard > 80%)
                         seen_chars = set(seen_clean.replace(' ', ''))
                         name_chars = set(name_clean.replace(' ', ''))
                         if seen_chars and name_chars:
                             intersection = len(seen_chars & name_chars)
                             union = len(seen_chars | name_chars)
-                            similarity = intersection / union if union > 0 else 0
-                            if similarity > 0.85:  # 85% char similarity - be more strict
-                                is_duplicate = True
-                                overlap_count += 1
-                                print(f'  Skipping similar duplicate at index {i}: {repr(name)} ~ {repr(seen)} (sim={similarity:.2f})')
+                            if union > 0 and intersection / union > 0.8:
+                                name_fuzzy_match = True
+                                fuzzy_match_name = seen
                                 break
-                
-                if is_duplicate:
-                    continue
             
-            # Valid NEW server position - add it
+            # DECISION MATRIX: Combine signals
+            # - Hash exact + any name match = DEFINITE duplicate
+            # - Hash close + name exact = DEFINITE duplicate  
+            # - Hash exact alone = LIKELY duplicate (icon copied or holiday variant)
+            # - Name exact + no hash = LIKELY duplicate (icon changed but same server)
+            # - Hash close + name fuzzy = PROBABLE duplicate
+            # - Only fuzzy name = POSSIBLE duplicate (be conservative)
+            
+            if hash_exact_match and (name_exact_match or name_fuzzy_match):
+                is_duplicate = True
+                dup_reason = f'hash_exact + name_match'
+            elif hash_close_match and name_exact_match:
+                is_duplicate = True
+                dup_reason = f'hash_close + name_exact'
+            elif hash_exact_match:
+                # Icon pixels identical - very likely same server even if OCR failed
+                is_duplicate = True
+                dup_reason = f'hash_exact (OCR: {repr(name)})'
+            elif name_exact_match:
+                # Same name - likely same server even if icon changed
+                is_duplicate = True
+                dup_reason = f'name_exact (hash dist varies)'
+            elif hash_close_match and name_fuzzy_match:
+                is_duplicate = True
+                dup_reason = f'hash_close + name_fuzzy ({fuzzy_match_name})'
+            elif name_fuzzy_match and not icon_hash:
+                # Only fuzzy name, no hash - be conservative, call it duplicate
+                is_duplicate = True
+                dup_reason = f'name_fuzzy only ({fuzzy_match_name})'
+            
+            if is_duplicate:
+                overlap_count += 1
+                print(f'  Skipping duplicate at index {i}: {dup_reason}')
+                continue
+            
+            # Valid NEW server - add it
             new_servers_this_page += 1
             total_servers_counted += 1
             
-            # Track the name for deduplication
+            # Track for deduplication (add ALL info)
+            if icon_hash:
+                seen_hashes.add(icon_hash)
+                this_page_hashes.append(icon_hash)
             if name and len(name.strip()) > 2:
                 seen_names.add(name.strip().lower())
                 this_page_names.append(name.strip().lower())
@@ -1701,19 +1735,29 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                 'raw_index': i,
                 'page': page,
                 'y': y_hover,
-                'name': name  # May be None - that's OK
+                'name': name,
+                'icon_hash': icon_hash
             }
             all_servers.append(server_info)
-            print(f'  Server {server_info["index"]}: y={y_hover}, name={repr(name)}')
+            print(f'  Server {server_info["index"]}: y={y_hover}, name={repr(name)}, hash={icon_hash[:8] if icon_hash else "None"}...')
             
-            # Save debug image
-            if debug_dir:
+            # Save icon image for UI display (canonical location: data/icons/{hash}.png)
+            if icon_img and icon_hash:
                 try:
-                    hf = os.path.join(debug_dir, f'server_{len(all_servers)}_{int(time.time()*1000)}.png')
-                    rr = (cx - 50, int(cy) - 40, cx + 300, int(cy) + 40)
-                    img = _safe_grab(rr)
-                    if img:
-                        img.save(hf)
+                    icons_dir = os.path.join('data', 'icons')
+                    os.makedirs(icons_dir, exist_ok=True)
+                    icon_path = os.path.join(icons_dir, f'{icon_hash}.png')
+                    # Only save if we don't already have this icon
+                    if not os.path.exists(icon_path):
+                        icon_img.save(icon_path)
+                except Exception:
+                    pass
+            
+            # Also save to debug dir if enabled (for debugging)
+            if debug_dir and icon_img:
+                try:
+                    debug_icon_path = os.path.join(debug_dir, f'icon_{len(all_servers)}_{icon_hash[:8] if icon_hash else "unknown"}.png')
+                    icon_img.save(debug_icon_path)
                 except Exception:
                     pass
             
@@ -1726,8 +1770,16 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
         if reached_end:
             break
         
-        # BEFORE declaring stale: probe BELOW the last detected icon for end markers
-        # PROBE BEYOND DETECTED ICONS
+        # Report overlap status
+        if page > 0:
+            if overlap_count >= 2:
+                print(f'  Good overlap: {overlap_count} duplicates detected')
+            elif overlap_count == 1:
+                print(f'  WARNING: Only 1 overlap detected, scroll may be slightly off')
+            else:
+                print(f'  WARNING: No overlap detected! Scroll likely skipped servers')
+        
+        # PROBE BEYOND if no new servers found (looking for end markers)
         # The icon detection algorithm may miss icons near the bottom of the window
         # (e.g., near the account icon area which has a different background).
         # When all detected icons are duplicates, probe further down to find:
@@ -1739,16 +1791,14 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             
             print(f'  Probing below last detected icon (y={last_icon_y}) for more servers/end markers...')
             
-            # Common OCR variations of "Add a Server" and "Discover" buttons
-            ADD_SERVER_PATTERNS = ('server', 'dd a', 'add a', 'ddaserver', 'addaserver')
-            DISCOVER_PATTERNS = ('scover', 'iscover', 'xplore', 'iscov', 'ublic', 'discover')
-            
+            # Probe below last icon for more servers or end markers
             for offset_mult in range(1, 8):  # Probe up to 7 icon spacings below
                 probe_y = int(last_icon_y + (spacing * offset_mult))
                 
                 probe_name = _read_tooltip(probe_y)
                 if probe_name:
                     probe_lower = probe_name.lower()
+                    probe_nospace = probe_lower.replace(' ', '')
                     print(f'    Probe +{offset_mult} (y={probe_y}): {repr(probe_name)}')
                     
                     # Check for end markers (Add a Server / Discover buttons)
@@ -1757,7 +1807,11 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
                         reached_end = True
                         break
                     
-                    if any(p in probe_lower for p in ADD_SERVER_PATTERNS + DISCOVER_PATTERNS):
+                    # More specific check for "Add a Server" - require both words or joined pattern
+                    is_add_server = ('add' in probe_lower and 'server' in probe_lower) or 'ddaserver' in probe_nospace or 'addaserver' in probe_nospace
+                    is_discover = 'discover' in probe_lower or 'explore public' in probe_lower or 'public servers' in probe_lower
+                    
+                    if is_add_server or is_discover:
                         print(f'  -> Likely end marker detected')
                         reached_end = True
                         break
@@ -1800,49 +1854,73 @@ def iterate_all_servers(hover_delay: float = 0.4, debug_save: bool = False, max_
             if reached_end:
                 break
         
-        # Check if we found any new servers
+        # Simple end detection: if we only see duplicates (overlap) and no new servers
         if new_servers_this_page == 0:
-            stale_pages += 1
             if overlap_count > 0:
-                print(f'Only found {overlap_count} duplicates, no new servers (stale: {stale_pages}/{max_stale})')
-                if stale_pages >= max_stale:
-                    print(f'Reached {max_stale} consecutive stale pages, assuming end of list')
-                    reached_end = True
-                    break
-                # Try scrolling more aggressively to get past overlap zone
-                scroll_amount = -5 * SCROLL_PER_ICON  # Negative = scroll down
-                _focus_and_scroll(scroll_amount)
-                time.sleep(0.25)
-                page += 1
-                continue  # Try another page
+                # All icons were duplicates - we've reached the end
+                print(f'All {overlap_count} icons were duplicates - end of list')
+                break
             else:
-                print('No new servers found on this page, stopping')
+                # No icons at all? Something wrong
+                print('No servers detected on this page, stopping')
                 break
-        elif new_servers_this_page <= 2:
-            # Only found 1-2 new servers - likely near end, increment stale counter
-            stale_pages += 1
-            if stale_pages >= max_stale:
-                print(f'Only finding {new_servers_this_page} new servers per page for {stale_pages} pages, assuming end of list')
-                reached_end = True
-                break
-        else:
-            stale_pages = 0  # Reset stale counter when we find several new servers
+        
+        # Validate overlap: on page > 0, we should see at least 1-2 duplicates
+        # If we see 0 duplicates, scroll went too far - SCROLL BACK to recover!
+        if page > 0 and overlap_count == 0 and new_servers_this_page > 0:
+            print(f'  WARNING: No overlap on page {page}! Scrolling back to recover...')
+            # Scroll back UP by ~2 icons worth to reveal overlap
+            recovery_scroll = 2 * SCROLL_PER_ICON
+            _focus_and_scroll(recovery_scroll)  # Positive = scroll UP
+            time.sleep(0.2)
+            
+            # Re-analyze viewport after scroll-back
+            centers_abs, dm_idx, median = _analyze_viewport(is_first_page=False)
+            if centers_abs:
+                # Re-check for overlap with existing hashes
+                recovery_overlap = 0
+                for cy in centers_abs[:4]:  # Check first 4 icons
+                    try:
+                        icon_box = (cx - 24, int(cy) - 24, cx + 24, int(cy) + 24)
+                        icon_img = _safe_grab(icon_box)
+                        if icon_img and utils:
+                            icon_hash = utils.compute_icon_hash(icon_img)
+                            if icon_hash in seen_hashes:
+                                recovery_overlap += 1
+                    except Exception:
+                        pass
+                print(f'  Recovery: found {recovery_overlap} overlapping icons after scroll-back')
         
         # Update last page names for next iteration
-        last_page_names = this_page_names[-5:] if this_page_names else []  # Keep last 5 names
+        last_page_names = this_page_names[-5:] if this_page_names else []
+        
+        # EARLY END DETECTION: If overlap_count >= (total icons - 1), we're at the end
+        # This means almost all visible icons are duplicates
+        total_visible = len(centers_abs)
+        if overlap_count >= total_visible - 1 and new_servers_this_page <= 1:
+            print(f'Nearly all {overlap_count}/{total_visible} icons are duplicates - at end of list')
+            break
         
         # Scroll down for next page
-        # Scroll by (new_servers - 2) to leave ~2 icons overlap for deduplication
-        # This ensures we don't miss any servers while minimizing redundant scanning
-        icons_to_scroll = max(3, new_servers_this_page - 2)
+        # KEY INSIGHT: Scroll by (visible_icons - 3) to leave 3 icons as overlap (more conservative)
+        # The TOP 3 icons after scroll should be the BOTTOM 3 icons from before
+        # Using 3 instead of 2 for safety margin
+        icons_to_scroll = max(1, total_visible - 3)
         total_scroll = icons_to_scroll * SCROLL_PER_ICON
         
-        print(f'Found {new_servers_this_page} new servers, scrolling by ~{icons_to_scroll} icons ({total_scroll} units)...')
+        # ADAPTIVE: If no overlap was detected, reduce scroll even more for next page
+        if page > 0 and overlap_count == 0:
+            total_scroll = max(1, total_scroll // 2)
+            print(f'  Reducing scroll to {total_scroll} due to no overlap')
         
-        # Use _focus_and_scroll to ensure Discord has focus before scrolling
+        print(f'Page {page}: {total_visible} visible, {new_servers_this_page} new, {overlap_count} dups -> scroll {icons_to_scroll} icons ({total_scroll} units)')
+        
+        # Track position before scroll to detect if we've hit bottom
+        last_first_hash = this_page_hashes[0] if this_page_hashes else None
+        
         _focus_and_scroll(-total_scroll)  # Negative = scroll down
-        
         time.sleep(0.25)
+        
         page += 1
     
     print(f'\n=== Finished: found {len(all_servers)} servers across {page + 1} pages ===')

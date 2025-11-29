@@ -1,7 +1,7 @@
 """Minimal Tkinter UI for Discord Promo Helper.
 
 Features:
-- Server list with OCR names and editable friendly names
+- Server list with icon thumbnails and OCR names
 - Per-server promo channel configuration
 - Game tag filtering
 - Global settings (rate limit, etc.)
@@ -14,22 +14,36 @@ from typing import Optional, List, Dict, Any
 import json
 from pathlib import Path
 import threading
+import os
+import base64
+from io import BytesIO
 
 # Import our modules
 try:
     from .server_config import (
         load_config, save_config, get_server_config, set_server_config,
         get_display_name, import_from_servers_json, get_rate_limit_hours,
-        set_rate_limit_hours, get_enabled_servers, get_servers_by_game
+        set_rate_limit_hours, get_enabled_servers, get_servers_by_game,
+        clean_and_dedupe_servers
     )
     from .stream_info import get_stream_info, detect_platform, StreamInfo
+    from .discord_nav import iterate_all_servers
 except ImportError:
     from server_config import (
         load_config, save_config, get_server_config, set_server_config,
         get_display_name, import_from_servers_json, get_rate_limit_hours,
-        set_rate_limit_hours, get_enabled_servers, get_servers_by_game
+        set_rate_limit_hours, get_enabled_servers, get_servers_by_game,
+        clean_and_dedupe_servers
     )
     from stream_info import get_stream_info, detect_platform, StreamInfo
+    from discord_nav import iterate_all_servers
+
+# Try to import PIL for icon display
+try:
+    from PIL import Image, ImageTk
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
 
 
 class ServerSettingsDialog(tk.Toplevel):
@@ -58,6 +72,15 @@ class ServerSettingsDialog(tk.Toplevel):
         # Main frame with padding
         main = ttk.Frame(self, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
+        
+        # Icon ID (read-only) - unique identifier
+        icon_hash = self.server_cfg.get("icon_hash", "")
+        if icon_hash:
+            ttk.Label(main, text="Icon ID (unique):").pack(anchor=tk.W)
+            hash_entry = ttk.Entry(main, width=60)
+            hash_entry.insert(0, icon_hash)
+            hash_entry.configure(state="readonly")
+            hash_entry.pack(fill=tk.X, pady=(0, 10))
         
         # OCR Name (read-only)
         ttk.Label(main, text="OCR Name (detected):").pack(anchor=tk.W)
@@ -384,11 +407,14 @@ class DiscordPromoApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Discord Promo Helper")
-        self.geometry("800x600")
-        self.minsize(600, 400)
+        self.geometry("900x650")
+        self.minsize(700, 450)
         
         # Load config
         self.config = load_config()
+        
+        # Store icon images to prevent garbage collection
+        self.icon_images = {}
         
         # Load servers from servers.json if it exists
         self._import_servers()
@@ -465,21 +491,35 @@ class DiscordPromoApp(tk.Tk):
                        variable=self.show_enabled_only,
                        command=self._refresh_server_list).pack(side=tk.LEFT)
         
-        # Server treeview
+        # Server treeview with icon support
         tree_frame = ttk.Frame(left_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        columns = ("display_name", "channels", "tags", "enabled")
-        self.server_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+        # Columns: Rank, Icon (shown via image), Name, Channels, Tags, Enabled
+        columns = ("rank", "icon_hash", "display_name", "channels", "tags", "enabled")
+        self.server_tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings")
+        
+        # Configure tree column for icon display
+        self.server_tree.heading("#0", text="Icon")
+        self.server_tree.column("#0", width=50, minwidth=50, stretch=False)
+        
+        self.server_tree.heading("rank", text="#")
+        self.server_tree.heading("icon_hash", text="ID")
         self.server_tree.heading("display_name", text="Server Name")
-        self.server_tree.heading("channels", text="Promo Channels")
+        self.server_tree.heading("channels", text="Ch")
         self.server_tree.heading("tags", text="Game Tags")
         self.server_tree.heading("enabled", text="✓")
         
-        self.server_tree.column("display_name", width=200)
-        self.server_tree.column("channels", width=120)
-        self.server_tree.column("tags", width=100)
-        self.server_tree.column("enabled", width=30)
+        self.server_tree.column("rank", width=35, minwidth=30, stretch=False)
+        self.server_tree.column("icon_hash", width=75, minwidth=60, stretch=False)
+        self.server_tree.column("display_name", width=180, minwidth=100)
+        self.server_tree.column("channels", width=35, minwidth=30, stretch=False)
+        self.server_tree.column("tags", width=100, minwidth=60)
+        self.server_tree.column("enabled", width=30, minwidth=25, stretch=False)
+        
+        # Set row height for icon display (48px icons scaled to ~32px)
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=36)
         
         self.server_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
@@ -498,6 +538,8 @@ class DiscordPromoApp(tk.Tk):
         actions = ttk.LabelFrame(right_frame, text="Actions", padding="10")
         actions.pack(fill=tk.X, pady=5)
         
+        ttk.Button(actions, text="🔄 Scan Servers", command=self._rescan_servers).pack(fill=tk.X, pady=2)
+        ttk.Button(actions, text="🧹 Clean & Dedupe", command=self._clean_and_dedupe).pack(fill=tk.X, pady=2)
         ttk.Button(actions, text="Edit Selected", command=self._edit_selected).pack(fill=tk.X, pady=2)
         ttk.Button(actions, text="Quick Enable/Disable", command=self._toggle_enabled).pack(fill=tk.X, pady=2)
         ttk.Button(actions, text="Set Friendly Name...", command=self._quick_set_name).pack(fill=tk.X, pady=2)
@@ -541,11 +583,15 @@ class DiscordPromoApp(tk.Tk):
         for item in self.server_tree.get_children():
             self.server_tree.delete(item)
         
+        # Clear old icon references
+        self.icon_images.clear()
+        
         filter_text = self.filter_var.get().lower()
         enabled_only = self.show_enabled_only.get()
         
         servers = self.config.get("servers", {})
         count = 0
+        rank = 1  # Rank counter (temporary ID based on current order)
         
         for key, server in sorted(servers.items()):
             ocr_name = server.get("ocr_name", key)
@@ -554,24 +600,69 @@ class DiscordPromoApp(tk.Tk):
             enabled = server.get("enabled", True)
             channels = server.get("promo_channels", [])
             tags = server.get("game_tags", [])
+            icon_hash = server.get("icon_hash", "")
             
             # Apply filters
             if filter_text:
-                searchable = f"{ocr_name} {friendly_name}".lower()
+                searchable = f"{ocr_name} {friendly_name} {icon_hash}".lower()
                 if filter_text not in searchable:
                     continue
             
             if enabled_only and not enabled:
                 continue
             
-            # Insert row
-            self.server_tree.insert("", tk.END, iid=key, values=(
-                display,
-                len(channels),
-                ", ".join(tags[:2]) + ("..." if len(tags) > 2 else ""),
-                "✓" if enabled else ""
-            ))
+            # Try to load icon image from icons/ directory
+            icon_img = None
+            if _HAS_PIL and icon_hash:
+                # Primary location: icons/{hash}.png (canonical)
+                icons_dir = Path("data/icons")
+                icon_path = icons_dir / f"{icon_hash}.png"
+                
+                # Fallback: try old debug locations
+                if not icon_path.exists():
+                    # Try data/debug pattern
+                    debug_files = list(Path("data/debug").glob(f"icon_*_{icon_hash[:8]}*.png"))
+                    if debug_files:
+                        icon_path = debug_files[0]
+                
+                if icon_path.exists():
+                    try:
+                        pil_img = Image.open(icon_path)
+                        # Handle animated GIFs - get first frame
+                        if hasattr(pil_img, 'n_frames') and pil_img.n_frames > 1:
+                            pil_img.seek(0)  # First frame
+                            pil_img = pil_img.convert('RGBA')
+                        # Scale to 32x32 for display
+                        pil_img = pil_img.resize((32, 32), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
+                        icon_img = ImageTk.PhotoImage(pil_img)
+                        self.icon_images[key] = icon_img  # Keep reference
+                    except Exception as e:
+                        pass  # Silently skip problematic icons
+            
+            # Insert row with icon
+            short_hash = icon_hash[:8] + "..." if icon_hash and len(icon_hash) > 8 else (icon_hash or "—")
+            
+            if icon_img:
+                self.server_tree.insert("", tk.END, iid=key, image=icon_img, values=(
+                    rank,
+                    short_hash,
+                    display[:40],
+                    len(channels),
+                    ", ".join(tags[:2]) + ("..." if len(tags) > 2 else ""),
+                    "✓" if enabled else ""
+                ))
+            else:
+                self.server_tree.insert("", tk.END, iid=key, values=(
+                    rank,
+                    short_hash,
+                    display[:40],
+                    len(channels),
+                    ", ".join(tags[:2]) + ("..." if len(tags) > 2 else ""),
+                    "✓" if enabled else ""
+                ))
+            
             count += 1
+            rank += 1
         
         self.server_count_label.configure(text=f"({count})")
     
@@ -591,6 +682,12 @@ class DiscordPromoApp(tk.Tk):
         server = self.config.get("servers", {}).get(key, {})
         
         info = []
+        
+        # Icon hash (unique ID)
+        icon_hash = server.get('icon_hash', '')
+        if icon_hash:
+            info.append(f"Icon ID: {icon_hash}\n")
+        
         info.append(f"OCR Name:\n{server.get('ocr_name', 'N/A')}\n")
         info.append(f"Friendly Name:\n{server.get('friendly_name', '(not set)')}\n")
         info.append(f"Enabled: {'Yes' if server.get('enabled', True) else 'No'}\n")
@@ -701,21 +798,141 @@ class DiscordPromoApp(tk.Tk):
         GameFilterDialog(self, self.config)
     
     def _rescan_servers(self):
-        """Trigger a server rescan (will run discord_nav)."""
+        """Trigger a server rescan using discord_nav."""
         result = messagebox.askyesno(
             "Rescan Servers",
             "This will scan Discord for all servers.\n\n"
-            "Make sure Discord is open and visible.\n\n"
+            "Make sure Discord is open and visible.\n"
+            "The scan will take a few minutes.\n\n"
             "Continue?"
         )
         
-        if result:
-            messagebox.showinfo(
-                "Rescan",
-                "Server scanning is not yet integrated.\n\n"
-                "Run the scan manually:\n"
-                "python -m src.discord_nav"
-            )
+        if not result:
+            return
+        
+        # Create progress dialog
+        progress_window = tk.Toplevel(self)
+        progress_window.title("Scanning Servers")
+        progress_window.geometry("350x150")
+        progress_window.transient(self)
+        progress_window.grab_set()
+        
+        ttk.Label(progress_window, text="Scanning Discord servers...", 
+                  font=("TkDefaultFont", 12)).pack(pady=20)
+        
+        self.scan_status_var = tk.StringVar(value="Starting scan...")
+        status_label = ttk.Label(progress_window, textvariable=self.scan_status_var)
+        status_label.pack(pady=5)
+        
+        progress = ttk.Progressbar(progress_window, mode='indeterminate', length=300)
+        progress.pack(pady=10)
+        progress.start(10)
+        
+        def do_scan():
+            """Run the scan in a background thread."""
+            try:
+                import json
+                
+                # Run the scan
+                servers = iterate_all_servers(hover_delay=0.4, debug_save=False, max_servers=500)
+                
+                if not servers:
+                    self.after(0, lambda: self.scan_status_var.set("No servers found!"))
+                    self.after(2000, progress_window.destroy)
+                    return
+                
+                # Capture count before any other operations
+                server_count = len(servers)
+                
+                # Update status
+                self.after(0, lambda: self.scan_status_var.set(f"Found {server_count} servers, saving..."))
+                
+                # Save to servers.json
+                servers_data = []
+                for srv in servers:
+                    servers_data.append({
+                        "index": srv.get("index", 0),
+                        "y": srv.get("y", 0),
+                        "name": srv.get("name")
+                    })
+                
+                with open("servers.json", "w") as f:
+                    json.dump(servers_data, f, indent=2)
+                
+                # Import into config
+                imported_count = import_from_servers_json()
+                
+                # Update UI on main thread - capture values for closure
+                def finish(count=server_count, imported=imported_count):
+                    try:
+                        progress.stop()
+                    except Exception:
+                        pass
+                    try:
+                        progress_window.destroy()
+                    except Exception:
+                        pass
+                    self.config = load_config()
+                    self._refresh_server_list()
+                    messagebox.showinfo(
+                        "Scan Complete",
+                        f"Found {count} servers.\n"
+                        f"Imported {imported} new servers into config."
+                    )
+                
+                self.after(0, finish)
+                
+            except Exception as exc:
+                error_msg = str(exc)
+                def show_error(msg=error_msg):
+                    try:
+                        progress.stop()
+                    except Exception:
+                        pass
+                    try:
+                        progress_window.destroy()
+                    except Exception:
+                        pass
+                    messagebox.showerror("Scan Error", f"Error during scan:\n{msg}")
+                
+                self.after(0, show_error)
+        
+        # Run scan in background thread
+        scan_thread = threading.Thread(target=do_scan, daemon=True)
+        scan_thread.start()
+    
+    def _clean_and_dedupe(self):
+        """Clean up server config by removing duplicates and invalid entries."""
+        result = messagebox.askyesno(
+            "Clean & Dedupe",
+            "This will:\n"
+            "• Remove entries WITHOUT icon hash (old cruft)\n"
+            "• Remove near-duplicate icons (hash distance ≤ 2)\n"
+            "• Remove garbage OCR entries\n"
+            "• Clean up whitespace in names\n\n"
+            "Continue?"
+        )
+        
+        if not result:
+            return
+        
+        # Run cleanup
+        stats = clean_and_dedupe_servers()
+        
+        # Reload config and refresh UI
+        self.config = load_config()
+        self._refresh_server_list()
+        
+        # Show results
+        messagebox.showinfo(
+            "Clean & Dedupe Complete",
+            f"Before: {stats['total_before']} servers\n"
+            f"After: {stats['total_remaining']} servers\n\n"
+            f"Removed (no hash): {stats['removed_no_hash']}\n"
+            f"Removed (invalid): {stats['removed_invalid']}\n"
+            f"Removed (duplicates): {stats['removed_duplicates']}\n"
+            f"Cleaned names: {stats['cleaned_names']}"
+        )
     
     def _manual_import(self):
         """Manually import from servers.json."""

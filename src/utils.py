@@ -379,7 +379,7 @@ def find_and_focus_discord():
     if sys.platform.startswith('darwin'):
         try:
             subprocess.run(["osascript", "-e", 'tell application "Discord" to activate'], check=False)
-            time.sleep(0.4)
+            time.sleep(0.15)
         except Exception:
             pass
 
@@ -870,80 +870,110 @@ def _clean_ocr_text(text: str) -> str:
     - Special characters like #, @, -, _, etc.
     - Multiple words
     
-    Common OCR artifacts to remove:
-    - Random punctuation clusters from emoji/icon misreading
-    - "Muted" text (from Discord's tooltip showing mute status) - anywhere in text
-    - Leading/trailing garbage
-    
-    Strategy: Extract the longest contiguous "meaningful" text segment.
+    Strategy: Remove obvious garbage while preserving server names.
+    Be conservative - better to keep some noise than lose valid names.
     """
     if not text:
         return ""
     
     # Remove "Muted" anywhere in text (Discord tooltip artifact)
-    # It appears when server is muted, often on a separate line
     text = re.sub(r'\s*\bMuted\b\s*', ' ', text, flags=re.IGNORECASE)
     
     # Common garbage sequences that appear when OCR misreads emoji/icons
-    # These are typically at word boundaries
     garbage_patterns = [
         r'^[)\}\]>\|\\/=:;,.\'"`~!@#$%^&*_+\-\[\]{}]+\s*',  # Leading garbage
         r'\s*[)\}\]>\|\\/=:;,.\'"`~!@#$%^&*_+\-\[\]{}]+$',  # Trailing garbage
-        r'\s+[)\}\]>\|\\/=:;,\{\}]+\s+',  # Mid-text garbage clusters (3+ chars)
+        r'\s+[)\}\]>\|\\/=:;,\{\}]+\s+',  # Mid-text garbage clusters
         r'[@#]\s*$',  # Trailing @ or #
         r'^[\'"]+\s*',  # Leading quotes
         r'\s*[\'"]+$',  # Trailing quotes
-        r'\s+[»«]+\s+',  # Special quote marks (often from emoji)
-        r'\s+\++\s+',  # Isolated plus signs
     ]
     
     for pattern in garbage_patterns:
         text = re.sub(pattern, ' ', text)
     
+    # Remove leading "@ " or "# " from channel text bleeding in
+    # Also common OCR misreads like "a8 ", "al ", "a ", etc.
+    text = re.sub(r'^[@#]\s+', '', text)
+    text = re.sub(r'^[a-zA-Z][0-9]\s+', '', text)  # Like "a8 "
+    text = re.sub(r'^[a-z]{1,2}\s+[@#]\s*', '', text)  # Like "al @ "
+    
     # Collapse multiple spaces
     text = re.sub(r'\s+', ' ', text)
     text = text.strip()
     
-    # If we have multiple words, try to find the "core" server name
-    # by identifying runs of alphanumeric characters
-    words = text.split()
-    if not words:
-        return ""
-    
-    # Score each word - prefer longer words with actual letters
-    cleaned_words = []
-    for i, w in enumerate(words):
-        # Count letters vs symbols
-        letters = sum(1 for c in w if c.isalnum())
-        symbols = sum(1 for c in w if not c.isalnum() and not c.isspace())
-        
-        # Skip words that are mostly symbols (likely OCR garbage)
-        if len(w) > 1 and symbols > letters:
-            continue
-        
-        # Skip isolated single punctuation
-        if len(w) == 1 and not w.isalnum():
-            continue
-        
-        # Skip common OCR noise words that appear at the end
-        # (garbage from adjacent UI elements or channel names)
-        noise_suffixes = ('ae', 'an', 'le', 'rs', 'rr', 'irs', 'ate', 'ors', 'me', 're', 'er', 'ss', 'ff', 'tt')
-        if w.lower() in noise_suffixes and i > 0:
-            # Skip if it's one of the last 3 words (likely noise)
-            if i >= len(words) - 3:
-                continue
-        
-        cleaned_words.append(w)
-    
-    text = ' '.join(cleaned_words)
-    
-    # Final cleanup
-    text = text.strip()
-    
-    # Remove leading/trailing punctuation that shouldn't be there
+    # Remove leading/trailing punctuation
     text = text.strip('|_-.,;:\'"°®©™><[]{}()')
     
     return text
+
+
+def _detect_tooltip_region(img):
+    """Detect the tooltip region within an image by analyzing brightness.
+    
+    Discord tooltips:
+    - Appear as dark gray boxes (~RGB 35-55) on dark backgrounds
+    - Text (white) appears on the tooltip
+    - Are typically 100-200px wide
+    
+    The channel list to the right is darker (~RGB 25-32).
+    
+    Returns a cropped image containing just the tooltip, or the original if detection fails.
+    """
+    try:
+        w, h = img.size
+        if w < 100 or h < 20:
+            return img
+            
+        # Convert to RGB
+        if img.mode != 'RGB':
+            img_rgb = img.convert('RGB')
+        else:
+            img_rgb = img
+        
+        pixels = list(img_rgb.getdata())
+        
+        def get_col_stats(x):
+            """Get brightness stats for column x."""
+            col_pixels = [pixels[y * w + x] for y in range(h)]
+            avg = sum((p[0] + p[1] + p[2]) // 3 for p in col_pixels) // len(col_pixels)
+            white = sum(1 for p in col_pixels if (p[0] + p[1] + p[2]) // 3 > 180)
+            return avg, white
+        
+        # Find where text (white pixels) starts - this is the tooltip content
+        text_start = 0
+        for x in range(w):
+            _, white = get_col_stats(x)
+            if white >= 2:  # At least 2 white pixels = text
+                text_start = max(0, x - 5)  # Small margin before text
+                break
+        
+        # Find where brightness drops (transition from tooltip to channel list)
+        # Scan from after text start
+        drop_x = w
+        for x in range(max(text_start + 50, 100), w - 10, 5):
+            avg, _ = get_col_stats(x)
+            if avg < 32:  # Channel list is darker
+                drop_x = x
+                break
+        
+        # Crop region
+        left = text_start
+        right = min(drop_x + 10, w)
+        
+        # Sanity check: must have reasonable width
+        if right - left < 80:
+            right = min(left + 200, w)
+        
+        # Don't crop if already small enough
+        if right - left >= w - 20:
+            return img
+        
+        cropped = img.crop((left, 0, right, h))
+        return cropped
+        
+    except Exception:
+        return img
 
 
 def _preprocess_discord_tooltip(img) -> list:
@@ -960,10 +990,12 @@ def _preprocess_discord_tooltip(img) -> list:
     - White/light text on dark gray background (#2C2F33 ≈ RGB 44,47,51)
     - Font: Whitney Medium, ~13-14px
     - May contain emoji (rendered as icons)
-    
-    The v5_discord approach scored highest in testing (avg_score=111.6).
     """
     from PIL import ImageOps, ImageFilter
+    
+    # First, try to detect and crop to just the tooltip region
+    # This removes adjacent channel list text that bleeds into the capture
+    img = _detect_tooltip_region(img)
     
     variants = []
     
@@ -1123,6 +1155,102 @@ def ocr_image_to_text(img, debug: bool = False):
                     pass
     
     return best_text
+
+
+def compute_icon_hash(img, size=8):
+    """Compute a perceptual hash for an icon image.
+    
+    Uses average hash (aHash): resize to small size, convert to grayscale,
+    compare each pixel to the mean. Returns a hex string.
+    
+    This is MUCH more reliable than OCR for detecting duplicate icons.
+    """
+    if img is None:
+        return None
+    try:
+        # Resize to small square (removes minor position differences)
+        small = img.resize((size, size), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
+        gray = small.convert('L')
+        
+        # Get pixels and compute mean
+        pixels = list(gray.getdata())
+        mean = sum(pixels) / len(pixels)
+        
+        # Create hash: 1 if pixel > mean, 0 otherwise
+        bits = ''.join('1' if p > mean else '0' for p in pixels)
+        
+        # Convert to hex for compact storage
+        hash_val = hex(int(bits, 2))[2:].zfill(size * size // 4)
+        return hash_val
+    except Exception:
+        return None
+
+
+def icon_hash_distance(hash1, hash2):
+    """Compute Hamming distance between two icon hashes.
+    
+    Returns the number of differing bits. Lower = more similar.
+    0 = identical, 1-5 = very similar, >10 = different icons.
+    """
+    if not hash1 or not hash2 or len(hash1) != len(hash2):
+        return 999  # Can't compare
+    
+    try:
+        # Convert hex to int, XOR, count 1 bits
+        val1 = int(hash1, 16)
+        val2 = int(hash2, 16)
+        xor = val1 ^ val2
+        return bin(xor).count('1')
+    except Exception:
+        return 999
+
+
+def is_duplicate_icon(new_hash, seen_hashes, threshold=3):
+    """Check if an icon hash is a duplicate of any previously seen icon.
+    
+    Args:
+        new_hash: Hash of the new icon
+        seen_hashes: Set or list of previously seen hashes
+        threshold: Max Hamming distance to consider as duplicate (default 3)
+                   - 0 = identical
+                   - 1-3 = very similar (same icon, minor variations)
+                   - 4-6 = probably same icon with notifications/indicators
+                   - >6 = likely different icons
+    
+    Returns:
+        (is_duplicate, matching_hash) tuple
+    """
+    if not new_hash:
+        return False, None
+    
+    for seen in seen_hashes:
+        dist = icon_hash_distance(new_hash, seen)
+        if dist <= threshold:
+            return True, seen
+    
+    return False, None
+
+
+def capture_icon_image(cx, cy, size=48):
+    """Capture a server icon image at the given center coordinates.
+    
+    Args:
+        cx, cy: Center coordinates of the icon
+        size: Size of capture area (default 48x48 for Discord icons)
+    
+    Returns:
+        PIL Image of the icon, or None on failure
+    """
+    try:
+        half = size // 2
+        box = (cx - half, cy - half, cx + half, cy + half)
+        if ImageGrab:
+            return ImageGrab.grab(box)
+        elif pyautogui:
+            return pyautogui.screenshot(region=(box[0], box[1], size, size))
+    except Exception:
+        return None
+    return None
 
 
 
