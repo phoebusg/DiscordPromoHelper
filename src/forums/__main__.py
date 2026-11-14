@@ -34,6 +34,36 @@ def _load_profile_or_exit(profile_id: str, profiles_path: str) -> ForumProfile:
     return prof
 
 
+def _session_controller_for(prof: ForumProfile) -> SessionController:
+    return SessionController(state_path=Path(prof.db_path).with_suffix(".session.json"))
+
+
+def _select_provider(
+    provider_mode: str,
+    prof: ForumProfile,
+    desktop: DesktopDiscordProvider,
+    session_desc: Any,
+) -> tuple[Any, bool]:
+    use_seed = provider_mode == "seed" or (
+        provider_mode == "auto"
+        and not session_desc.capabilities.get("can_read_semantic")
+        and not session_desc.capabilities.get("can_read_ocr")
+        and prof.seed_index_path
+        and Path(prof.seed_index_path).exists()
+    )
+    if use_seed:
+        return (
+            SeededDiscordProvider(
+                guild_id=prof.guild_id,
+                forum_id=prof.forum_id,
+                forum_name=prof.name,
+                seed_path=prof.seed_index_path,
+            ),
+            True,
+        )
+    return desktop, False
+
+
 def cmd_session(_args: argparse.Namespace) -> int:
     provider = DesktopDiscordProvider()
     desc = provider.describe_session()
@@ -92,25 +122,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     session_desc = desktop.describe_session()
     store = ForumStore(prof.db_path)
     try:
-        use_seed = args.provider == "seed" or (
-            args.provider == "auto"
-            and not session_desc.capabilities.get("can_read_semantic")
-            and not session_desc.capabilities.get("can_read_ocr")
-            and prof.seed_index_path
-            and Path(prof.seed_index_path).exists()
-        )
-
-        if use_seed:
-            provider: Any = SeededDiscordProvider(
-                guild_id=prof.guild_id,
-                forum_id=prof.forum_id,
-                forum_name=prof.name,
-                seed_path=prof.seed_index_path,
-            )
-        else:
-            provider = desktop
-
-        reader = ForumReader(prof, store, provider)
+        provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
+        ctrl = _session_controller_for(prof)
+        reader = ForumReader(prof, store, provider, session_controller=ctrl)
         if args.backfill:
             res = reader.initial_backfill(max_topics_per_run=args.max_topics)
         else:
@@ -125,17 +139,12 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                 keep_existing_errors=True,
             )
 
-        exported: dict[str, str] = {}
+        exported: dict[str, Any] = {}
         if args.export:
-            ex_dir = Path(prof.exchange_dir)
-            ex_dir.mkdir(parents=True, exist_ok=True)
-            snap = store.export_snapshot()
-            snap_path = ex_dir / f"{prof.profile_id}.snapshot.v1.json"
-            write_record_atomic(snap_path, snap)
-            chg_batch = store.export_changes()
-            chg_path = ex_dir / f"{prof.profile_id}.changes.v1.json"
-            write_record_atomic(chg_path, chg_batch)
-            exported = {"snapshot": str(snap_path), "changes": str(chg_path)}
+            exported = store.export_exchange_dir(
+                prof.exchange_dir,
+                force_snapshot=getattr(args, "snapshot", False),
+            )
 
         _print_json(
             {
@@ -204,7 +213,12 @@ def cmd_stage(args: argparse.Namespace) -> int:
     draft = read_record(args.draft_file)
     store = ForumStore(prof.db_path)
     try:
-        mgr = HandoffManager(store, DesktopDiscordProvider(), session_controller=SessionController())
+        mgr = HandoffManager(
+            store,
+            DesktopDiscordProvider(),
+            session_controller=_session_controller_for(prof),
+            exchange_dir=prof.exchange_dir,
+        )
         receipt = mgr.stage_draft_request(draft, prof, source_kind=args.source_kind)
         if args.receipt_out:
             write_record_atomic(args.receipt_out, receipt)
@@ -218,7 +232,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     prof = _load_profile_or_exit(args.profile, args.profiles_path)
     store = ForumStore(prof.db_path)
     try:
-        mgr = HandoffManager(store, DesktopDiscordProvider(), session_controller=SessionController())
+        mgr = HandoffManager(
+            store,
+            DesktopDiscordProvider(),
+            session_controller=_session_controller_for(prof),
+            exchange_dir=prof.exchange_dir,
+        )
         receipt = mgr.reconcile_submission(
             args.draft_id,
             draft_revision=args.revision,
@@ -228,6 +247,130 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         if args.receipt_out:
             write_record_atomic(args.receipt_out, receipt)
         _print_json(receipt)
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_session_state(args: argparse.Namespace) -> int:
+    prof = _load_profile_or_exit(args.profile, args.profiles_path)
+    ctrl = _session_controller_for(prof)
+    desktop = DesktopDiscordProvider()
+    _print_json(
+        {
+            "profile": prof.profile_id,
+            "state_path": str(Path(prof.db_path).with_suffix(".session.json")),
+            "session_state": ctrl.status(),
+            "desktop_session": asdict(desktop.describe_session()),
+        }
+    )
+    return 0
+
+
+def cmd_release_review(args: argparse.Namespace) -> int:
+    prof = _load_profile_or_exit(args.profile, args.profiles_path)
+    ctrl = _session_controller_for(prof)
+    ctrl.release_review()
+    _print_json(
+        {
+            "profile": prof.profile_id,
+            "released": True,
+            "session_state": ctrl.status(),
+        }
+    )
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    prof = _load_profile_or_exit(args.profile, args.profiles_path)
+    desktop = DesktopDiscordProvider()
+    session_desc = desktop.describe_session()
+    store = ForumStore(prof.db_path)
+    try:
+        ctrl = _session_controller_for(prof)
+        provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
+        reconciled: list[dict[str, Any]] = []
+        if args.reconcile:
+            mgr = HandoffManager(
+                store,
+                desktop,
+                session_controller=ctrl,
+                exchange_dir=prof.exchange_dir,
+            )
+            latest_by_draft: dict[tuple[str, int], dict[str, Any]] = {}
+            for rec in store.list_receipts():
+                dest = rec.get("destination") or {}
+                if dest.get("guild_id") == prof.guild_id and dest.get("forum_id") == prof.forum_id:
+                    latest_by_draft[(rec["draft_id"], int(rec["draft_revision"]))] = rec
+            for (did, rev), rec in latest_by_draft.items():
+                if rec.get("status") in ("staged", "in_discord_review", "needs_review"):
+                    reconciled.append(
+                        mgr.reconcile_submission(did, draft_revision=rev, profile=prof)
+                    )
+
+        reader = ForumReader(prof, store, provider, session_controller=ctrl)
+        refresh_res = reader.incremental_refresh(
+            deep_reread_count=args.deep_reread,
+            max_topics_per_run=args.max_topics,
+        )
+
+        exported: dict[str, Any] = {}
+        if not refresh_res.get("paused"):
+            exported = store.export_exchange_dir(
+                prof.exchange_dir,
+                force_snapshot=args.snapshot,
+            )
+
+        staged: list[dict[str, Any]] = []
+        if args.stage_pending:
+            mgr = HandoffManager(
+                store,
+                desktop,
+                session_controller=ctrl,
+                exchange_dir=prof.exchange_dir,
+            )
+            drafts_dir = Path(prof.exchange_dir) / "drafts"
+            if drafts_dir.is_dir():
+                for draft_path in sorted(drafts_dir.glob("*.json")):
+                    try:
+                        draft = read_record(draft_path)
+                    except Exception:
+                        continue
+                    if draft.get("schema") != "draft.request.v1":
+                        continue
+                    dest = draft.get("destination") or {}
+                    if dest.get("guild_id") != prof.guild_id or dest.get("forum_id") != prof.forum_id:
+                        continue
+                    row = store.get_draft_row(draft["draft_id"], int(draft["revision"]))
+                    if row is not None and row["status"] in (
+                        "staged",
+                        "in_discord_review",
+                        "submission_observed",
+                        "user_confirmed_submitted",
+                        "rejected",
+                        "needs_review",
+                    ):
+                        continue
+                    receipt = mgr.stage_draft_request(
+                        draft,
+                        prof,
+                        source_kind=args.source_kind,
+                    )
+                    staged.append(receipt)
+                    if receipt["status"] in ("staged", "in_discord_review", "needs_review"):
+                        break
+
+        _print_json(
+            {
+                "profile": prof.profile_id,
+                "provider_used": "seed+desktop_probe" if use_seed else "desktop",
+                "reconciled": reconciled,
+                "refresh": refresh_res,
+                "exported": exported,
+                "staged": staged,
+                "session_state": ctrl.status(),
+            }
+        )
     finally:
         store.close()
     return 0
@@ -279,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ref.add_argument("--deep-reread", type=int, default=2)
     p_ref.add_argument("--max-topics", type=int)
     p_ref.add_argument("--export", action="store_true")
+    p_ref.add_argument("--snapshot", action="store_true", help="Force a snapshot cutover on export")
 
     p_stat = sub.add_parser("status", help="Show local forum or topic mirror status")
     p_stat.add_argument("--profile", required=True)
@@ -311,6 +455,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_val = sub.add_parser("validate-contract", help="Validate a v1 JSON exchange file")
     p_val.add_argument("file")
 
+    p_ss = sub.add_parser("session-state", help="Show persistent cross-process UI session/review lock state")
+    p_ss.add_argument("--profile", required=True)
+
+    p_rr = sub.add_parser("release-review", help="Clear persistent in_discord_review lock after manual review")
+    p_rr.add_argument("--profile", required=True)
+
+    p_sync = sub.add_parser("sync", help="Run reconcile -> incremental refresh -> exchange export -> stage pending")
+    p_sync.add_argument("--profile", required=True)
+    p_sync.add_argument("--provider", choices=["auto", "desktop", "seed"], default="auto")
+    p_sync.add_argument("--deep-reread", type=int, default=2)
+    p_sync.add_argument("--max-topics", type=int)
+    p_sync.add_argument("--snapshot", action="store_true", help="Force a snapshot cutover on export")
+    p_sync.add_argument("--stage-pending", action="store_true", help="Stage next un-staged draft in exchange/drafts")
+    p_sync.add_argument("--reconcile", action="store_true", help="Reconcile previously staged drafts first")
+    p_sync.add_argument("--source-kind", choices=["external", "promotion"], default="external")
+
     return parser
 
 
@@ -328,6 +488,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "stage": cmd_stage,
         "reconcile": cmd_reconcile,
         "validate-contract": cmd_validate_contract,
+        "session-state": cmd_session_state,
+        "release-review": cmd_release_review,
+        "sync": cmd_sync,
     }
     return dispatch[args.command](args)
 

@@ -873,5 +873,657 @@ class TestOCRAndLegacyTargets(unittest.TestCase):
         mock_post.assert_called_once_with("Live Title", "https://example.invalid/live", (120, 220))
 
 
+class TestCompletionHandoffPriorities(unittest.TestCase):
+    def test_shared_scenario_fixture_and_cutover_export(self):
+        from src.forums.config import upsert_forum_profile
+
+        scenario = json.loads((FIXTURE_DIR / "shared_scenario.json").read_text(encoding="utf-8"))
+        snap_unres = validate_exchange_record(scenario["snapshot_unresolved"])
+        snap_res = validate_exchange_record(scenario["snapshot_resolved"])
+        changes_recs = [validate_exchange_record(rec) for rec in scenario["changes"]]
+        draft_rec = validate_exchange_record(scenario["draft_request"])
+        receipt_recs = [validate_exchange_record(rec) for rec in scenario["receipts"]]
+
+        self.assertEqual(snap_unres["schema"], "forum.snapshot.v1")
+        self.assertEqual(snap_res["schema"], "forum.snapshot.v1")
+        self.assertEqual(len(changes_recs), 2)
+        self.assertEqual(len(receipt_recs), 2)
+
+        # Evidence resolves strictly within FIXTURE_DIR.parent (tests/fixtures)
+        resolved_ev = resolve_evidence_files(draft_rec["evidence"], FIXTURE_DIR.parent)
+        self.assertEqual(len(resolved_ev), 1)
+        self.assertTrue(Path(resolved_ev[0]["resolved_path"]).is_file())
+        self.assertEqual(Path(resolved_ev[0]["resolved_path"]).name, "map-note.txt")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            profile = _make_profile(tmp_dir)
+            upsert_forum_profile(profile, tmp_dir / "profiles.json")
+            store = ForumStore(profile.db_path)
+            try:
+                store.ensure_scope(
+                    GUILD_ID,
+                    FORUM_ID,
+                    actor={"user_id": ACTOR_USER_ID, "label": "Fixture account"},
+                )
+                store.upsert_forum(
+                    forum_id=FORUM_ID,
+                    name="Fictional POI testing",
+                    source_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                )
+                store.upsert_requirement(
+                    forum_id=FORUM_ID,
+                    requirement_id="poi-guidance",
+                    body="Check geometry and prop behavior.",
+                )
+                # Two distinct same-title unresolved observations
+                store.record_unresolved_topic(
+                    forum_id=FORUM_ID,
+                    observation_ref="poi-observation-a",
+                    title="Amberfall Crossing",
+                )
+                store.record_unresolved_topic(
+                    forum_id=FORUM_ID,
+                    observation_ref="poi-observation-b",
+                    title="Amberfall Crossing",
+                )
+                store.update_coverage(topics="partial", histories="partial", requirements="partial")
+
+                # Bootstrap export writes snapshot without redundant 0..cursor delta file
+                boot = store.export_exchange_dir(profile.exchange_dir)
+                self.assertEqual(boot["mode"], "bootstrap_snapshot")
+                self.assertIsNotNone(boot["snapshot"])
+                self.assertIsNone(boot["changes"])
+                boot_snap = read_record(boot["snapshot"])
+                pending_titles = {p["observation_ref"]: p["observed_title"] for p in boot_snap["coverage"]["pending"]}
+                self.assertEqual(pending_titles["poi-observation-a"], "Amberfall Crossing")
+                self.assertEqual(pending_titles["poi-observation-b"], "Amberfall Crossing")
+
+                # Quiet re-export emits neither snapshot nor empty delta batch
+                noop = store.export_exchange_dir(profile.exchange_dir)
+                self.assertEqual(noop["mode"], "quiet_noop")
+                self.assertIsNone(noop["snapshot"])
+                self.assertIsNone(noop["changes"])
+                self.assertEqual(noop["change_count"], 0)
+
+                # Resolve both observations cleanly while preserving observation_ref
+                store.resolve_topic_observation(
+                    observation_ref="poi-observation-a",
+                    thread_id=THREAD_A,
+                    title="Amberfall Crossing",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_A),
+                )
+                store.resolve_topic_observation(
+                    observation_ref="poi-observation-b",
+                    thread_id=THREAD_B,
+                    title="Amberfall Crossing",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_B),
+                )
+                store.update_coverage(topics="complete")
+                store.upsert_message(
+                    thread_id=THREAD_A,
+                    entity_ref="msg:100000000000000501",
+                    message_id="100000000000000501",
+                    author={"user_id": ACTOR_USER_ID, "label": "Fixture account"},
+                    body="Verified bridge railing.",
+                )
+
+                inc = store.export_exchange_dir(profile.exchange_dir)
+                self.assertEqual(inc["mode"], "incremental_changes")
+                self.assertIsNone(inc["snapshot"])
+                self.assertIsNotNone(inc["changes"])
+                delta = read_record(inc["changes"])
+                self.assertEqual(delta["after_cursor"]["position"], boot_snap["cursor"]["position"])
+                self.assertEqual(delta["snapshot_revision"], boot_snap["revision"])
+
+                # Snapshot cutover archives older delta batches before writing fresh snapshot
+                cut = store.export_exchange_dir(profile.exchange_dir, force_snapshot=True)
+                self.assertEqual(cut["mode"], "cutover_snapshot")
+                self.assertIsNotNone(cut["snapshot"])
+                self.assertEqual(list((Path(profile.exchange_dir) / "changes").glob("*.json")), [])
+                self.assertEqual(len(list((Path(profile.exchange_dir) / "archive" / "changes").glob("*.json"))), 1)
+                cut_snap = read_record(cut["snapshot"])
+                obs_refs = {t["thread_id"]: t.get("observation_ref") for t in cut_snap["topics"]}
+                self.assertEqual(obs_refs[THREAD_A], "poi-observation-a")
+                self.assertEqual(obs_refs[THREAD_B], "poi-observation-b")
+            finally:
+                store.close()
+
+    def test_desktop_provider_list_topics_and_read_topic_pagination(self):
+        from src.forums.providers import desktop as desktop_mod
+        from src.forums.providers.desktop import DesktopDiscordProvider
+
+        provider = DesktopDiscordProvider()
+        session = SessionDescription(
+            actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            app_name="Discord",
+            window_title="#forum - Discord",
+            window_bbox=(0, 0, 1280, 800),
+            current_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+            capabilities={"can_read_semantic": True, "can_read_ocr": True, "can_stage_composer": True},
+        )
+
+        # Build 65 virtualized directory topic items sliced in sliding windows
+        all_cards = [
+            TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=str(200000000000000000 + i),
+                title=f"Post Title {i}",
+                source_url=build_discord_channel_url(GUILD_ID, str(200000000000000000 + i)),
+                source_method="accessibility",
+            )
+            for i in range(65)
+        ]
+        scroll_pos = {"idx": 0}
+        list_sentinel = object()
+
+        def fake_extract(_nodes, _gid, _fid):
+            start = scroll_pos["idx"]
+            return all_cards[start : min(65, start + 12)], [], list_sentinel
+
+        def fake_scroll(_x, _y, delta_lines):
+            if delta_lines > 0:
+                scroll_pos["idx"] = max(0, scroll_pos["idx"] - 10)
+            else:
+                scroll_pos["idx"] = min(55, scroll_pos["idx"] + 9)
+            return True
+
+        fake_win_nodes = [{"role": "AXButton", "description": "Post 0", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()}]
+        with patch.object(provider, "describe_session", return_value=session), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(provider, "navigate_to_url", return_value=True), \
+             patch.object(provider, "_extract_post_cards_and_links", side_effect=fake_extract), \
+             patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_win_nodes), \
+             patch.object(desktop_mod, "_ax_bounds", return_value=(100.0, 150.0, 360.0, 600.0)), \
+             patch.object(desktop_mod, "_scroll_at_point", side_effect=fake_scroll), \
+             patch.object(desktop_mod.time, "sleep"):
+            page1 = provider.list_topics(GUILD_ID, FORUM_ID, limit=35)
+            self.assertEqual(len(page1.topics), 35)
+            self.assertFalse(page1.complete)
+            self.assertTrue((page1.next_cursor or "").startswith("dirscroll:"))
+
+            # Reset to top and seek via dirscroll cursor like a resumed backfill run
+            scroll_pos["idx"] = 0
+            page2 = provider.list_topics(GUILD_ID, FORUM_ID, cursor=page1.next_cursor, limit=50)
+            self.assertEqual(len(page2.topics), 30)
+            self.assertTrue(page2.complete)
+            self.assertIsNone(page2.next_cursor)
+            combined_ids = [t.thread_id for t in page1.topics + page2.topics]
+            self.assertEqual(combined_ids, [t.thread_id for t in all_cards])
+
+        # Test read_topic upward pagination until starter message id == thread_id, then return to bottom
+        tid = "300000000000000001"
+        ml_elem = object()
+        msg_win_nodes = [
+            {
+                "role": "AXList",
+                "description": "Messages in Colossus Crater",
+                "title": "",
+                "value": "",
+                "url": "",
+                "dom_id": f"chat-messages-{tid}-300000000000000005",
+                "depth": 4,
+                "element": ml_elem,
+            }
+        ]
+        msg_view = {"step": 0}
+        slices = [
+            # Initial bottom slice
+            (
+                "Colossus Crater",
+                [{"name": "poi"}],
+                {
+                    "300000000000000004": MessageObservation(thread_id=tid, message_id="300000000000000004", author={"user_id": None, "label": "Tester"}, body="Fourth"),
+                    "300000000000000005": MessageObservation(thread_id=tid, message_id="300000000000000005", author={"user_id": None, "label": "Tester"}, body="Latest", attachments=[{"name": "shot.png", "url": "https://cdn.example/shot.png"}]),
+                },
+            ),
+            # 1st scroll up
+            (
+                "Colossus Crater",
+                [],
+                {
+                    "300000000000000002": MessageObservation(thread_id=tid, message_id="300000000000000002", author={"user_id": None, "label": "Tester"}, body="Second"),
+                    "300000000000000003": MessageObservation(thread_id=tid, message_id="300000000000000003", author={"user_id": None, "label": "Tester"}, body="Third"),
+                },
+            ),
+            # 2nd scroll up reaches starter tid
+            (
+                "Colossus Crater",
+                [],
+                {
+                    tid: MessageObservation(thread_id=tid, message_id=tid, author={"user_id": None, "label": "Tester"}, body="Starter post"),
+                    "300000000000000002": MessageObservation(thread_id=tid, message_id="300000000000000002", author={"user_id": None, "label": "Tester"}, body="Second"),
+                },
+            ),
+            # Final return-to-bottom check
+            (
+                "Colossus Crater",
+                [],
+                {
+                    "300000000000000005": MessageObservation(thread_id=tid, message_id="300000000000000005", author={"user_id": None, "label": "Tester"}, body="Latest", attachments=[{"name": "shot.png", "url": "https://cdn.example/shot.png"}]),
+                },
+            ),
+        ]
+
+        def fake_parse_msgs(_ml, _gid, _tid):
+            idx = min(msg_view["step"], len(slices) - 1)
+            msg_view["step"] += 1
+            return slices[idx]
+
+        with patch.object(provider, "describe_session", return_value=session), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(desktop_mod, "_walk_ax_tree", return_value=msg_win_nodes), \
+             patch.object(desktop_mod, "_ax_attr", return_value=[]), \
+             patch.object(desktop_mod, "_ax_bounds", return_value=(400.0, 120.0, 700.0, 600.0)), \
+             patch.object(desktop_mod, "_scroll_at_point", return_value=True), \
+             patch.object(desktop_mod.time, "sleep"), \
+             patch.object(provider, "_parse_messages_from_ax_list", side_effect=fake_parse_msgs):
+            hist = provider.read_topic(GUILD_ID, FORUM_ID, tid)
+            self.assertTrue(hist.complete)
+            self.assertIsNone(hist.next_cursor)
+            self.assertEqual([m.message_id for m in hist.messages], [tid, "300000000000000002", "300000000000000003", "300000000000000004", "300000000000000005"])
+            self.assertEqual(hist.messages[-1].attachments[0]["url"], "https://cdn.example/shot.png")
+
+    def test_cross_process_session_controller_and_cli_sync_workflow(self):
+        import io
+        from contextlib import redirect_stdout
+        from src.forums.__main__ import main as cli_main
+        from src.forums.config import upsert_forum_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            state_path = tmp_dir / "mirror.session.json"
+            ctrl_reader = SessionController(state_path=state_path)
+            ctrl_stager = SessionController(state_path=state_path)
+
+            # Separate instances coordinate read vs stage exclusivity
+            self.assertTrue(ctrl_reader.acquire_for_read())
+            self.assertFalse(ctrl_stager.acquire_for_staging(wait_seconds=0.0))
+            ctrl_reader.release_read()
+            self.assertTrue(ctrl_stager.acquire_for_staging(wait_seconds=0.0))
+            self.assertFalse(ctrl_reader.acquire_for_read())
+            ctrl_stager.release_staging()
+
+            # Simulate dead-PID stale transient lock on disk -> recovered automatically
+            state_path.write_text(
+                json.dumps({"mode": "reading", "owner_pid": 9999999, "updated_at": "2026-11-14T12:00:00Z", "review_draft": None}),
+                encoding="utf-8",
+            )
+            self.assertTrue(ctrl_reader.acquire_for_read())
+            ctrl_reader.release_read()
+
+            # Durable human review lock survives across independent instances and pauses reader
+            ctrl_stager.enter_discord_review("draft-x", 1, reason="staged_for_review")
+            self.assertTrue(ctrl_reader.is_review_active())
+            self.assertFalse(ctrl_reader.can_navigate())
+
+            profile = _make_profile(tmp_dir)
+            store = ForumStore(profile.db_path)
+            try:
+                fake_provider = FakeForumProvider()
+                paused = ForumReader(profile, store, fake_provider, session_controller=ctrl_reader).incremental_refresh()
+                self.assertTrue(paused["paused"])
+                self.assertEqual(paused["reason"], "session_in_review_or_staging")
+            finally:
+                store.close()
+            ctrl_reader.release_review()
+
+            # Partial staging failure activates review lock and writes receipt to exchange/receipts
+            fake_stage_provider = FakeForumProvider()
+            partial_obs = ComposerStageObservation(
+                status="needs_review",
+                observed_actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                destination={"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1, "message_id": None},
+                observed_composer_text="Line 1\nLine 2",
+                staged_evidence_ids=[],
+                reason="attachment_preview_unverified:map-note.txt",
+            )
+            store = ForumStore(profile.db_path)
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID, actor={"user_id": ACTOR_USER_ID, "label": "Tester"})
+                mgr = HandoffManager(store, fake_stage_provider, session_controller=ctrl_stager, exchange_dir=profile.exchange_dir)
+                req = {
+                    "schema": "draft.request.v1",
+                    "record_id": "req-partial-1",
+                    "producer_id": "test",
+                    "created_at": "2026-11-14T12:00:00Z",
+                    "scope": {
+                        "guild_id": GUILD_ID,
+                        "forum_id": FORUM_ID,
+                        "actor": {"user_id": ACTOR_USER_ID, "label": "Tester"},
+                    },
+                    "draft_id": "draft-partial-1",
+                    "revision": 1,
+                    "action": "reply_existing",
+                    "destination": {
+                        "guild_id": GUILD_ID,
+                        "forum_id": FORUM_ID,
+                        "thread_id": THREAD_1,
+                        "message_id": None,
+                        "source_url": build_discord_channel_url(GUILD_ID, THREAD_1),
+                    },
+                    "body": "Line 1\nLine 2",
+                    "title": None,
+                    "tags": [],
+                    "evidence": [],
+                    "baseline": {
+                        "snapshot_id": None,
+                        "snapshot_revision": None,
+                        "requirements": [],
+                        "message_content_hash": None,
+                    },
+                }
+                with patch.object(fake_stage_provider, "stage_draft", return_value=partial_obs):
+                    rec = mgr.stage_draft_request(req, profile)
+                self.assertEqual(rec["status"], "needs_review")
+                self.assertTrue(ctrl_reader.is_review_active())
+                receipt_files = list((Path(profile.exchange_dir) / "receipts").glob("*.json"))
+                self.assertEqual(len(receipt_files), 1)
+                self.assertEqual(read_record(receipt_files[0])["receipt_id"], rec["receipt_id"])
+            finally:
+                store.close()
+                ctrl_reader.release_review()
+
+            # CLI workflow: sync -> session-state -> paused sync -> release-review -> reconcile
+            profiles_path = tmp_dir / "profiles.json"
+            seed_path = tmp_dir / "seed.json"
+            seed_path.write_text(
+                json.dumps({"groups": [{"label": "POI", "topics": [["Amberfall Crossing", THREAD_1]]}]}),
+                encoding="utf-8",
+            )
+            cli_prof = ForumProfile(
+                profile_id="cli-sync-test",
+                name="CLI Sync Forum",
+                guild_id=GUILD_ID,
+                forum_id=FORUM_ID,
+                source_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                purpose="external_project",
+                catalog_enabled=True,
+                promotion_enabled=False,
+                external_drafts_enabled=True,
+                stage_enabled=True,
+                seed_index_path=str(seed_path),
+                transfer_root=str(FIXTURE_DIR.parent),
+                db_path=str(tmp_dir / "cli_mirror.sqlite3"),
+                exchange_dir=str(tmp_dir / "cli_exchange"),
+            )
+            upsert_forum_profile(cli_prof, profiles_path)
+            scenario = json.loads((FIXTURE_DIR / "shared_scenario.json").read_text(encoding="utf-8"))
+            cli_draft = copy.deepcopy(scenario["draft_request"])
+            cli_draft["baseline"] = {
+                "snapshot_id": None,
+                "snapshot_revision": None,
+                "requirements": [],
+                "message_content_hash": None,
+            }
+            draft_path = Path(cli_prof.exchange_dir) / "drafts" / "draft_1.json"
+            write_record_atomic(draft_path, cli_draft)
+
+            mock_desk = FakeForumProvider()
+            mock_desk.session_desc = SessionDescription(
+                actor={"user_id": ACTOR_USER_ID, "label": "Fixture account"},
+                app_name="Discord",
+                window_title="Discord",
+                window_bbox=(0, 0, 1280, 800),
+                capabilities={"can_read_semantic": False, "can_read_ocr": False, "can_stage_composer": True},
+            )
+            with patch("src.forums.__main__.DesktopDiscordProvider", return_value=mock_desk):
+                buf1 = io.StringIO()
+                with redirect_stdout(buf1):
+                    cli_main(["--profiles-path", str(profiles_path), "sync", "--profile", "cli-sync-test", "--provider", "seed", "--stage-pending"])
+                out1 = json.loads(buf1.getvalue())
+                self.assertEqual(len(out1["staged"]), 1)
+                self.assertEqual(out1["staged"][0]["status"], "staged")
+                self.assertEqual(out1["session_state"]["mode"], "in_discord_review")
+
+                # Separate session-state query confirms persistent review lock
+                buf_ss = io.StringIO()
+                with redirect_stdout(buf_ss):
+                    cli_main(["--profiles-path", str(profiles_path), "session-state", "--profile", "cli-sync-test"])
+                self.assertEqual(json.loads(buf_ss.getvalue())["session_state"]["mode"], "in_discord_review")
+
+                # Subsequent sync automatically pauses refresh while in_discord_review
+                buf2 = io.StringIO()
+                with redirect_stdout(buf2):
+                    cli_main(["--profiles-path", str(profiles_path), "sync", "--profile", "cli-sync-test", "--provider", "seed"])
+                out2 = json.loads(buf2.getvalue())
+                self.assertTrue(out2["refresh"]["paused"])
+
+                # Real separate OS child process also sees persistent in_discord_review and pauses cleanly
+                import subprocess as _sp
+                import sys as _sys
+
+                sub_proc = _sp.run(
+                    [
+                        _sys.executable,
+                        "-m",
+                        "src.forums",
+                        "--profiles-path",
+                        str(profiles_path),
+                        "refresh",
+                        "--profile",
+                        "cli-sync-test",
+                        "--provider",
+                        "seed",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                sub_out = json.loads(sub_proc.stdout)
+                self.assertTrue(sub_out["result"]["paused"])
+                self.assertEqual(sub_out["result"]["reason"], "session_in_review_or_staging")
+
+                # Reconcile observes human-edited submission and releases review lock
+                mock_desk.next_submission = SubmissionObservation(
+                    status="submission_observed",
+                    observed_actor=dict(mock_desk.actor),
+                    message_id="100000000000000900",
+                    message_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                    observed_body=scenario["expected"]["human_edited_body"],
+                    reason="matched_posted_message",
+                )
+                buf3 = io.StringIO()
+                with redirect_stdout(buf3):
+                    cli_main(["--profiles-path", str(profiles_path), "sync", "--profile", "cli-sync-test", "--provider", "seed", "--reconcile"])
+                out3 = json.loads(buf3.getvalue())
+                self.assertEqual(out3["reconciled"][0]["status"], "submission_observed")
+                self.assertEqual(out3["session_state"]["mode"], "idle")
+
+                # Explicit release-review subcommand succeeds cleanly
+                buf4 = io.StringIO()
+                with redirect_stdout(buf4):
+                    cli_main(["--profiles-path", str(profiles_path), "release-review", "--profile", "cli-sync-test"])
+                out4 = json.loads(buf4.getvalue())
+                self.assertTrue(out4["released"])
+                self.assertEqual(out4["session_state"]["mode"], "idle")
+
+    def test_desktop_stage_draft_and_observe_submission(self):
+        from src.forums.providers import desktop as desktop_mod
+        from src.forums.providers.desktop import DesktopDiscordProvider
+
+        provider = DesktopDiscordProvider()
+        # Verify Slate empty sentinel and newline exact-match helper
+        self.assertEqual(provider._normalize_composer_text("\ufeff\n"), "")
+        self.assertTrue(provider._composer_text_matches("Line 1\nLine 2", "Line 1\nLine 2\n"))
+        self.assertFalse(provider._composer_text_matches("Line 1\nLine 2", "Line 1 Line 2"))
+
+        wrong_url_session = SessionDescription(
+            actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            app_name="Discord",
+            window_title="Discord",
+            window_bbox=(0, 0, 1280, 800),
+            current_url=build_discord_channel_url(GUILD_ID, THREAD_2),
+            capabilities={"can_read_semantic": True, "can_read_ocr": True, "can_stage_composer": True},
+        )
+        draft_req = {
+            "draft_id": "d-1",
+            "revision": 1,
+            "action": "reply_existing",
+            "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1},
+            "body": "Line 1\nLine 2 ✓",
+        }
+        with patch.object(provider, "describe_session", return_value=wrong_url_session), \
+             patch.object(provider, "navigate_to_url", return_value=True), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(provider, "_inspect_composer", return_value=(object(), "")), \
+             patch.object(desktop_mod.time, "sleep"):
+            mismatch = provider.stage_draft(draft_req, [])
+            self.assertEqual(mismatch.status, "needs_review")
+            self.assertIn("destination_url_mismatch", mismatch.reason or "")
+
+        # Successful focus, exact text verification, attachment verification, and clipboard restore
+        good_session = SessionDescription(
+            actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            app_name="Discord",
+            window_title="Discord",
+            window_bbox=(0, 0, 1280, 800),
+            current_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+            capabilities={"can_read_semantic": True, "can_read_ocr": True, "can_stage_composer": True},
+        )
+        clip_state = {"val": "user-prior-clipboard", "attached": False}
+
+        class FakeClip:
+            @staticmethod
+            def paste():
+                return clip_state["val"]
+
+            @staticmethod
+            def copy(txt):
+                clip_state["val"] = txt
+
+        class FakePyAutoGui:
+            @staticmethod
+            def click(*_a, **_k):
+                pass
+
+            @staticmethod
+            def hotkey(*_a, **_k):
+                pass
+
+        comp_elem = object()
+        att_seq = [
+            [],  # baseline before staging: clean
+            [{"role": "AXGroup", "text": "map-note.txt", "dom_id": "upload-1", "element": object(), "is_remove_button": False}],
+        ]
+
+        def fake_inspect_comp(_ax):
+            return comp_elem, ("Line 1\nLine 2 ✓\n" if clip_state["attached"] else "")
+
+        def fake_stage_single(_ax, _comp, _path, _name):
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            att_file = Path(tmp) / "map-note.txt"
+            att_file.write_text("evidence\n", encoding="utf-8")
+            resolved_ev = [{"evidence_id": "ev-1", "name": "map-note.txt", "resolved_path": str(att_file)}]
+
+            def fake_hotkey(*args):
+                if args[-1] == "v":
+                    clip_state["attached"] = True
+
+            FakePyAutoGui.hotkey = staticmethod(fake_hotkey)  # type: ignore[assignment]
+            with patch.object(provider, "describe_session", return_value=good_session), \
+                 patch.object(provider, "navigate_to_url", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_focus_element", return_value=True) as mock_focus, \
+                 patch.object(provider, "_inspect_composer", side_effect=lambda _ax: (comp_elem, "Line 1\nLine 2 ✓\n" if clip_state["attached"] else "")), \
+                 patch.object(provider, "_inspect_staged_attachments", side_effect=att_seq), \
+                 patch.object(provider, "_stage_single_attachment", return_value=True) as mock_att, \
+                 patch.object(desktop_mod, "pyperclip", FakeClip), \
+                 patch.object(desktop_mod, "pyautogui", FakePyAutoGui), \
+                 patch.object(desktop_mod.time, "sleep"):
+                res = provider.stage_draft(draft_req, resolved_ev)
+                self.assertEqual(res.status, "staged")
+                self.assertEqual(res.staged_evidence_ids, ["ev-1"])
+                self.assertEqual(clip_state["val"], "user-prior-clipboard")
+                mock_focus.assert_called_once()
+                mock_att.assert_called_once()
+
+        # observe_submission handles reply correlation, edit correlation, create_topic, and in_discord_review
+        reply_hist = TopicHistoryObservation(
+            topic=TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_1, title="Target Thread"),
+            messages=[
+                MessageObservation(thread_id=THREAD_1, message_id="100", author={"user_id": None, "label": "Tester"}, body="Older msg"),
+                MessageObservation(
+                    thread_id=THREAD_1,
+                    message_id="105",
+                    author={"user_id": None, "label": "Tester"},
+                    body="Line 1\nLine 2 ✓ with human polish",
+                    attachments=[{"name": "map-note.txt", "url": "https://cdn.example/map-note.txt"}],
+                ),
+            ],
+            complete=True,
+        )
+        with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "read_topic", return_value=reply_hist):
+            sub_reply = provider.observe_submission(
+                {**draft_req, "evidence": [{"name": "map-note.txt"}]},
+                {"actor": {"user_id": ACTOR_USER_ID, "label": "Tester"}, "baseline_latest_message_id": "100"},
+            )
+            self.assertEqual(sub_reply.status, "submission_observed")
+            self.assertEqual(sub_reply.message_id, "105")
+
+        # Unsubmitted draft still in composer returns in_discord_review
+        empty_hist = TopicHistoryObservation(topic=TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_1, title="Target Thread"), messages=[], complete=True)
+        with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "read_topic", return_value=empty_hist), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(provider, "_inspect_composer", return_value=(comp_elem, "Line 1\nLine 2 ✓")), \
+             patch.object(provider, "_inspect_staged_attachments", return_value=[]):
+            sub_rev = provider.observe_submission(draft_req, {})
+            self.assertEqual(sub_rev.status, "in_discord_review")
+
+        # create_topic without thread_id resolves by title
+        tlist = TopicListObservation(
+            topics=[TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_2, title="New Field Report")],
+            complete=True,
+        )
+        created_hist = TopicHistoryObservation(
+            topic=TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_2, title="New Field Report"),
+            messages=[MessageObservation(thread_id=THREAD_2, message_id=THREAD_2, author={"user_id": None, "label": "Tester"}, body="New report body details")],
+            complete=True,
+        )
+        with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "list_topics", return_value=tlist), \
+             patch.object(provider, "read_topic", return_value=created_hist):
+            sub_create = provider.observe_submission(
+                {"action": "create_topic", "title": "New Field Report", "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": None}, "body": "New report body details"},
+                {},
+            )
+            self.assertEqual(sub_create.status, "submission_observed")
+            self.assertEqual(sub_create.message_id, THREAD_2)
+
+        # Bounds-keyed Remove Attachment slots remain distinct even with empty DOM ids,
+        # and semantic-only session without OCR still observes composer/submission cleanly.
+        b1, b2 = object(), object()
+        fake_cards = [
+            {"role": "AXButton", "title": "", "description": "Remove Attachment", "value": "", "dom_id": "", "depth": 5, "element": b1},
+            {"role": "AXButton", "title": "", "description": "Remove Attachment", "value": "", "dom_id": "", "depth": 5, "element": b2},
+        ]
+        with patch.object(desktop_mod, "_ax_attr", return_value=None), \
+             patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_cards), \
+             patch.object(desktop_mod, "_ax_bounds", side_effect=lambda el: (598.0, 633.0, 32.0, 32.0) if el is b1 else ((840.0, 633.0, 32.0, 32.0) if el is b2 else (450.0, 860.0, 375.0, 56.0))):
+            staged = provider._inspect_staged_attachments(object(), object())
+            self.assertEqual(provider._count_staged_attachment_slots(staged), 2)
+
+        no_ocr_session = SessionDescription(
+            actor={"user_id": None, "label": "Tester"},
+            app_name="Discord",
+            window_title="Discord",
+            window_bbox=(0, 0, 1280, 800),
+            capabilities={"can_read_semantic": True, "can_read_ocr": False, "can_stage_composer": True},
+            errors=[{"code": "screen_capture_unavailable", "message": "No Screen Recording", "thread_id": None}],
+        )
+        with patch.object(provider, "describe_session", return_value=no_ocr_session), \
+             patch.object(provider, "read_topic", return_value=reply_hist):
+            sub_no_ocr = provider.observe_submission(
+                {**draft_req, "evidence": [{"name": "map-note.txt"}]},
+                {"actor": {"user_id": ACTOR_USER_ID, "label": "Tester"}, "baseline_latest_message_id": "100"},
+            )
+            self.assertEqual(sub_no_ocr.status, "submission_observed")
+            self.assertEqual(sub_no_ocr.message_id, "105")
+
+
 if __name__ == "__main__":
     unittest.main()

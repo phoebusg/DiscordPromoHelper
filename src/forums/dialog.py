@@ -114,6 +114,11 @@ class ForumMirrorDialog(tk.Toplevel):
             text="Reconcile / Mark Submitted",
             command=self._reconcile_current_draft,
         ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            stage_bar,
+            text="Release Review Pause",
+            command=self._release_review_pause,
+        ).pack(side=tk.LEFT, padx=6)
 
     def _current_profile(self) -> Optional[ForumProfile]:
         pid = self.profile_var.get()
@@ -128,16 +133,21 @@ class ForumMirrorDialog(tk.Toplevel):
     def _load_selected_profile(self) -> None:
         prof = self._current_profile()
         if prof is None:
+            self.session_controller = SessionController()
             self.coverage_var.set("No forum profile configured")
             return
+        self.session_controller = SessionController(
+            state_path=Path(prof.db_path).with_suffix(".session.json")
+        )
         store = ForumStore(prof.db_path)
         try:
             store.ensure_scope(prof.guild_id, prof.forum_id)
             st = store.get_forum_status()
             cov = st["coverage"]
+            lock_suffix = " | Review Pause Active" if self.session_controller.is_review_active() else ""
             self.coverage_var.set(
                 f"Topics: {st['counts']['topics']} ({cov['topics']}) | "
-                f"Histories: {cov['histories']} | Reqs: {cov['requirements']}"
+                f"Histories: {cov['histories']} | Reqs: {cov['requirements']}{lock_suffix}"
             )
             self._populate_topics(store.search("", forum_id=prof.forum_id)["topics"])
         finally:
@@ -255,12 +265,18 @@ class ForumMirrorDialog(tk.Toplevel):
             return
         store = ForumStore(prof.db_path)
         try:
-            mgr = HandoffManager(store, DesktopDiscordProvider(), session_controller=self.session_controller)
+            mgr = HandoffManager(
+                store,
+                DesktopDiscordProvider(),
+                session_controller=self.session_controller,
+                exchange_dir=prof.exchange_dir,
+            )
             receipt = mgr.stage_draft_request(self.current_draft, prof)
             messagebox.showinfo(
                 "Staging Result",
                 f"Status: {receipt['status']}\nReason: {receipt.get('reason') or 'Ready in composer for your review and Send.'}",
             )
+            self._load_selected_profile()
         except Exception as exc:
             messagebox.showerror("Staging Error", str(exc))
         finally:
@@ -272,7 +288,12 @@ class ForumMirrorDialog(tk.Toplevel):
             return
         store = ForumStore(prof.db_path)
         try:
-            mgr = HandoffManager(store, DesktopDiscordProvider(), session_controller=self.session_controller)
+            mgr = HandoffManager(
+                store,
+                DesktopDiscordProvider(),
+                session_controller=self.session_controller,
+                exchange_dir=prof.exchange_dir,
+            )
             receipt = mgr.reconcile_submission(
                 self.current_draft["draft_id"],
                 draft_revision=self.current_draft["revision"],
@@ -280,10 +301,16 @@ class ForumMirrorDialog(tk.Toplevel):
                 user_confirmed=True,
             )
             messagebox.showinfo("Reconcile Result", f"Status: {receipt['status']}")
+            self._load_selected_profile()
         except Exception as exc:
             messagebox.showerror("Reconcile Error", str(exc))
         finally:
             store.close()
+
+    def _release_review_pause(self) -> None:
+        self.session_controller.release_review()
+        self._load_selected_profile()
+        messagebox.showinfo("Review Lock Released", "Forum background refresh is allowed again.")
 
 
 def launch_forum_dialog(profiles_path: str | Path = DEFAULT_PROFILES_PATH) -> None:

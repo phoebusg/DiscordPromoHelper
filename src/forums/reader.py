@@ -115,6 +115,7 @@ class ForumReader:
     ) -> dict[str, Any]:
         """Run or resume initial backfill of forum guidance, topics, and accessible histories."""
         if not self.session.acquire_for_read():
+            self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
             return {"paused": True, "reason": "session_in_review_or_staging", "coverage": self.store.get_coverage()}
 
         try:
@@ -268,6 +269,7 @@ class ForumReader:
     ) -> dict[str, Any]:
         """Refresh requirements, new/active topics, unread histories, and rotate deep history rereads."""
         if not self.session.acquire_for_read():
+            self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
             return {"paused": True, "reason": "session_in_review_or_staging", "coverage": self.store.get_coverage()}
 
         try:
