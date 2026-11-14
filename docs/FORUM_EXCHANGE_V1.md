@@ -1,6 +1,6 @@
 # Forum exchange v1 — shared field contract
 
-Updated 14 November 2026. Normative field names for parallel implementation; transport/validation code is still to implement. See the [public forum design](https://github.com/phoebusg/DiscordPromoHelper/blob/661d07577daefa9ad8b8b5eaceee0952c7248fe4/docs/FORUM_SUPPORT_PLAN.md) for behavior.
+Updated 14 November 2026. Normative field names for parallel implementation; transport/validation code is still to implement. See the [public forum design](FORUM_SUPPORT_PLAN.md) for behavior.
 
 ## Common encoding and fields
 

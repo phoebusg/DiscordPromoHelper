@@ -37,6 +37,9 @@ import urllib.request
 import re
 import unicodedata
 import json
+import hashlib
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from PIL import ImageStat, ImageFilter
 
@@ -651,34 +654,54 @@ def read_screen_with_tesseract():
     print(text)
 
 
+def normalize_text(s: str) -> str:
+    """Normalize OCR text to a canonical channel-like name.
+
+    - lowercases
+    - removes control chars and diacritics
+    - removes punctuation except dashes/underscores
+    - collapses whitespace
+    """
+    if not s:
+        return ""
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(ch for ch in s if not unicodedata.category(ch).startswith('M'))
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\-\_\s]", ' ', s)
+    s = re.sub(r"\s+", ' ', s).strip()
+    return s
+
+
+def _safe_grab(bbox=None, timeout_sec: float = 1.0):
+    """Best-effort screen grab using PIL ImageGrab with pyautogui fallback."""
+    if _HAS_PIL and ImageGrab is not None:
+        try:
+            img = ImageGrab.grab(bbox=bbox) if bbox else ImageGrab.grab()
+            if img is not None and getattr(img, 'size', (0, 0))[0] > 0 and img.size[1] > 0:
+                return img
+        except Exception:
+            pass
+    if _HAS_PYAUTOGUI and pyautogui is not None:
+        try:
+            if bbox and len(bbox) == 4:
+                left, top, right, bottom = [int(v) for v in bbox]
+                w, h = right - left, bottom - top
+                if w > 0 and h > 0:
+                    return pyautogui.screenshot(region=(left, top, w, h))
+            else:
+                return pyautogui.screenshot()
+        except Exception:
+            pass
+    return None
+
+
 def find_channel_position(keywords):
     """Attempt to locate a channel in the left sidebar using OCR.
 
-    Returns center (x, y) tuple if found, else None.
+    Returns ((x, y), matched_name, confidence) tuple if found, else None.
     """
     if not _HAS_PIL:
         return None
-
-    def normalize_text(s: str) -> str:
-        """Normalize OCR text to a canonical channel-like name.
-
-        - lowercases
-        - removes control chars and diacritics
-        - removes punctuation except dashes/underscores
-        - collapses whitespace
-        """
-        if not s:
-            return ""
-        # Normalize unicode and remove diacritics
-        s = unicodedata.normalize('NFKD', s)
-        s = ''.join(ch for ch in s if not unicodedata.category(ch).startswith('M'))
-        # Lowercase
-        s = s.lower()
-        # Replace punctuation (keep - and _)
-        s = re.sub(r"[^a-z0-9\-\_\s]", ' ', s)
-        # Collapse whitespace
-        s = re.sub(r"\s+", ' ', s).strip()
-        return s
     # Prefer capturing the Discord window area if we can find it; this avoids
     # problems when Discord is not full-screen or is positioned away from the
     # left edge of the primary display.
@@ -1087,6 +1110,317 @@ def _preprocess_discord_tooltip(img) -> list:
         variants.append(('threshold', v3))
     
     return variants
+
+
+@dataclass
+class OCRTokenBox:
+    """Word/token bounding box produced by structured OCR."""
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    confidence: float
+    line_num: int = 0
+
+
+@dataclass
+class OCRResult:
+    """Structured OCR output preserving raw text, lines, token boxes and metadata."""
+    raw_text: str
+    text: str
+    lines: list[str]
+    boxes: list[OCRTokenBox]
+    confidence: float  # 0.0 .. 1.0
+    crop_size: tuple[int, int]
+    engine: str = "tesseract"
+    settings: str = ""
+    task: str = "server_tooltip"
+    cached: bool = False
+
+
+_OCR_CROP_CACHE: OrderedDict[tuple[str, str, str, str], OCRResult] = OrderedDict()
+_OCR_CACHE_MAX_ENTRIES = 256
+
+
+def clear_ocr_cache() -> None:
+    """Clear the in-memory structured OCR crop cache."""
+    _OCR_CROP_CACHE.clear()
+
+
+def _clean_ocr_text_for_task(text: str, task: str) -> str:
+    """Apply task-appropriate text cleanup without destroying multiline forum content."""
+    if not text:
+        return ""
+    if task == "server_tooltip":
+        return _clean_ocr_text(text)
+    if task == "channel_name":
+        cleaned = _clean_ocr_text(text)
+        # Keep short valid channel names and strip leading '#'
+        return cleaned.lstrip('#').strip()
+    if task == "forum_title":
+        # Preserve valid one-word titles, punctuation, parentheses, quotes, and case
+        s = text.replace('\r\n', '\n').replace('\r', '\n')
+        s = ''.join(ch for ch in s if ch == '\n' or ch == '\t' or ord(ch) >= 32)
+        lines = [re.sub(r'[ \t]+', ' ', ln).strip() for ln in s.split('\n')]
+        return ' '.join(ln for ln in lines if ln).strip()
+    if task == "message_body":
+        # Preserve multiline line breaks, punctuation, URLs, markdown and Unicode
+        s = text.replace('\r\n', '\n').replace('\r', '\n')
+        s = ''.join(ch for ch in s if ch == '\n' or ch == '\t' or ord(ch) >= 32)
+        lines = [re.sub(r'[ \t]+', ' ', ln).strip() for ln in s.split('\n')]
+        # Collapse runs of 3+ empty lines to at most 1 blank line, trim outer blank lines
+        out_lines = []
+        prev_blank = False
+        for ln in lines:
+            if not ln:
+                if out_lines and not prev_blank:
+                    out_lines.append("")
+                prev_blank = True
+            else:
+                out_lines.append(ln)
+                prev_blank = False
+        while out_lines and out_lines[-1] == "":
+            out_lines.pop()
+        return '\n'.join(out_lines)
+    return _clean_ocr_text(text)
+
+
+def _image_content_digest(img) -> str:
+    """Compute a stable SHA-256 digest of PIL image mode, size and pixel bytes."""
+    rgb = img.convert('RGB')
+    h = hashlib.sha256()
+    h.update(f"{rgb.mode}:{rgb.size[0]}x{rgb.size[1]}:".encode('ascii'))
+    h.update(rgb.tobytes())
+    return h.hexdigest()
+
+
+def _preprocess_for_task(img, task: str) -> list[tuple[str, object, int]]:
+    """Build ordered (variant_name, pil_image, scale_factor) candidates for a given OCR task."""
+    from PIL import ImageOps, ImageFilter
+
+    if task in ("server_tooltip", "channel_name"):
+        return [(name, var, 4 if name == 'discord' else 3) for name, var in _preprocess_discord_tooltip(img)]
+
+    w, h = img.size
+    gray_check = img.convert('L')
+    is_dark = ImageStat.Stat(gray_check).mean[0] < 120
+    variants = []
+
+    # Cheap first pass: 2x-3x scale + invert if dark + gentle autocontrast + border padding
+    scale = 3 if (w < 400 or h < 120) else 2
+    resample = Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC
+    scaled = img.resize((max(1, w * scale), max(1, h * scale)), resample).convert('L')
+    if is_dark:
+        scaled = ImageOps.invert(scaled)
+    v_primary = ImageOps.autocontrast(scaled, cutoff=1)
+    v_primary = ImageOps.expand(v_primary, border=16, fill=255)
+    variants.append(('primary', v_primary, scale))
+
+    # Fallback pass 2: CLAHE + sharpen + padding (for low-contrast/anti-aliased text)
+    clahe_img = _pil_clahe(scaled)
+    if is_dark:
+        v_clahe = ImageOps.autocontrast(clahe_img, cutoff=0)
+    else:
+        v_clahe = ImageOps.autocontrast(clahe_img, cutoff=2)
+    v_clahe = v_clahe.filter(ImageFilter.SHARPEN)
+    v_clahe = ImageOps.expand(v_clahe, border=16, fill=255)
+    variants.append(('clahe_fallback', v_clahe, scale))
+
+    return variants
+
+
+def _extract_lines_and_boxes(data: dict, scale: int) -> tuple[str, list[str], list[OCRTokenBox], float]:
+    """Reconstruct preserved lines, token boxes and 0..100 confidence from image_to_data dict."""
+    texts = data.get('text', []) if isinstance(data, dict) else []
+    confs = data.get('conf', []) if isinstance(data, dict) else []
+    lefts = data.get('left', []) if isinstance(data, dict) else []
+    tops = data.get('top', []) if isinstance(data, dict) else []
+    widths = data.get('width', []) if isinstance(data, dict) else []
+    heights = data.get('height', []) if isinstance(data, dict) else []
+    blocks = data.get('block_num', []) if isinstance(data, dict) else []
+    pars = data.get('par_num', []) if isinstance(data, dict) else []
+    lines_idx = data.get('line_num', []) if isinstance(data, dict) else []
+
+    boxes: list[OCRTokenBox] = []
+    line_groups: dict[tuple[int, int, int], list[str]] = OrderedDict()
+    conf_vals: list[float] = []
+
+    for i, raw_tok in enumerate(texts):
+        tok = (raw_tok or '').strip()
+        try:
+            c = float(confs[i]) if i < len(confs) else -1.0
+        except Exception:
+            c = -1.0
+        if c >= 0 and tok:
+            conf_vals.append(c)
+        if not tok:
+            continue
+
+        blk = int(blocks[i]) if i < len(blocks) else 0
+        par = int(pars[i]) if i < len(pars) else 0
+        ln = int(lines_idx[i]) if i < len(lines_idx) else 0
+        key = (blk, par, ln)
+        line_groups.setdefault(key, []).append(tok)
+
+        s = max(1, scale)
+        boxes.append(OCRTokenBox(
+            text=tok,
+            left=int((lefts[i] if i < len(lefts) else 0) / s),
+            top=int((tops[i] if i < len(tops) else 0) / s),
+            width=int((widths[i] if i < len(widths) else 0) / s),
+            height=int((heights[i] if i < len(heights) else 0) / s),
+            confidence=(c / 100.0) if c >= 0 else 0.0,
+            line_num=ln,
+        ))
+
+    lines = [' '.join(words) for words in line_groups.values() if words]
+    raw_text = '\n'.join(lines)
+    avg_conf_pct = (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0
+    return raw_text, lines, boxes, avg_conf_pct
+
+
+def ocr_image_structured(
+    img,
+    task: str = "server_tooltip",
+    lang: str = "eng",
+    use_cache: bool = True,
+    low_confidence_threshold: float = 65.0,
+) -> OCRResult:
+    """Run task-specific OCR returning structured lines, token boxes, confidence and metadata.
+
+    Tasks:
+    - ``server_tooltip``: tooltip region detection + emoji artifact cleanup
+    - ``channel_name``: sidebar channel names
+    - ``forum_title``: full title/header preserving valid one-word names and punctuation
+    - ``message_body``: multiline body preserving line breaks, URLs and Unicode
+    """
+    crop_size = getattr(img, 'size', (0, 0)) if img is not None else (0, 0)
+    if img is None or not _HAS_PYTESSERACT or not pytesseract:
+        return OCRResult(
+            raw_text="",
+            text="",
+            lines=[],
+            boxes=[],
+            confidence=0.0,
+            crop_size=crop_size,
+            engine="unavailable",
+            settings="",
+            task=task,
+            cached=False,
+        )
+
+    psm_cfg = "--psm 6 --oem 3"
+    cache_key = None
+    if use_cache:
+        try:
+            digest = _image_content_digest(img)
+            cache_key = (digest, task, lang, psm_cfg)
+            cached_res = _OCR_CROP_CACHE.get(cache_key)
+            if cached_res is not None:
+                _OCR_CROP_CACHE.move_to_end(cache_key)
+                return OCRResult(
+                    raw_text=cached_res.raw_text,
+                    text=cached_res.text,
+                    lines=list(cached_res.lines),
+                    boxes=list(cached_res.boxes),
+                    confidence=cached_res.confidence,
+                    crop_size=cached_res.crop_size,
+                    engine=cached_res.engine,
+                    settings=cached_res.settings,
+                    task=cached_res.task,
+                    cached=True,
+                )
+        except Exception:
+            cache_key = None
+
+    try:
+        variants = _preprocess_for_task(img, task)
+    except Exception:
+        variants = [('raw', img, 1)]
+
+    configs = ['--psm 6 --oem 3', '--psm 7 --oem 3'] if task in ('server_tooltip', 'channel_name', 'forum_title') else ['--psm 6 --oem 3', '--psm 4 --oem 3']
+    if lang and lang != 'eng':
+        configs = [f"{c} -l {lang}" for c in configs]
+
+    o_output = getattr(pytesseract, 'Output', None)
+    best_result: OCRResult | None = None
+    best_score = -1.0
+
+    for var_idx, (var_name, variant, scale) in enumerate(variants):
+        for cfg_idx, cfg in enumerate(configs):
+            raw_text = ""
+            lines: list[str] = []
+            boxes: list[OCRTokenBox] = []
+            conf_pct = 0.0
+            try:
+                out_type = o_output.DICT if o_output else None
+                data = pytesseract.image_to_data(variant, output_type=out_type, config=cfg)
+                raw_text, lines, boxes, conf_pct = _extract_lines_and_boxes(data, scale)
+            except Exception:
+                try:
+                    raw_text = (pytesseract.image_to_string(variant, config=cfg) or '').strip()
+                    lines = [ln for ln in raw_text.splitlines() if ln.strip()]
+                    conf_pct = 50.0 if raw_text else 0.0
+                except Exception:
+                    raw_text = ""
+                    conf_pct = 0.0
+
+            cleaned = _clean_ocr_text_for_task(raw_text, task)
+            cleaned_lines = [ln for ln in cleaned.split('\n') if ln.strip()] if task == 'message_body' else ([cleaned] if cleaned else [])
+            eff_score = conf_pct
+            if cleaned:
+                if task in ('server_tooltip', 'channel_name'):
+                    if len(cleaned.split()) >= 2:
+                        eff_score *= 1.2
+                    elif len(cleaned) < 3:
+                        eff_score *= 0.5
+            else:
+                eff_score = 0.0
+
+            candidate = OCRResult(
+                raw_text=raw_text,
+                text=cleaned,
+                lines=cleaned_lines if cleaned_lines else lines,
+                boxes=boxes,
+                confidence=round(max(0.0, min(1.0, conf_pct / 100.0)), 4),
+                crop_size=crop_size,
+                engine="tesseract",
+                settings=f"variant={var_name} {cfg}",
+                task=task,
+                cached=False,
+            )
+
+            if best_result is None or (cleaned and eff_score > best_score):
+                best_score = eff_score
+                best_result = candidate
+
+            # Bounded fallback: stop early if first cheap pass is already confident
+            if task in ('forum_title', 'message_body') and var_idx == 0 and cfg_idx == 0 and cleaned and conf_pct >= low_confidence_threshold:
+                break
+        if task in ('forum_title', 'message_body') and best_result and best_result.text and (best_result.confidence * 100.0) >= low_confidence_threshold:
+            break
+
+    if best_result is None:
+        best_result = OCRResult(
+            raw_text="",
+            text="",
+            lines=[],
+            boxes=[],
+            confidence=0.0,
+            crop_size=crop_size,
+            engine="tesseract",
+            settings="",
+            task=task,
+            cached=False,
+        )
+
+    if use_cache and cache_key is not None:
+        _OCR_CROP_CACHE[cache_key] = best_result
+        while len(_OCR_CROP_CACHE) > _OCR_CACHE_MAX_ENTRIES:
+            _OCR_CROP_CACHE.popitem(last=False)
+
+    return best_result
 
 
 def ocr_image_to_text(img, debug: bool = False):

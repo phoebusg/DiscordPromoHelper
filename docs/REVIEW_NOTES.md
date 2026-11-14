@@ -1,8 +1,22 @@
 # Forum design review notes
 
+> Cross-agent reference codes (`<EXT_APP_01>`, `<ACTOR_OWNER_01>`, `<FORUM_01>`, etc.) resolve locally via the gitignored codebook at `docs/local/AGENT_CODEBOOK.md` (`docs/local/AGENT_CODEBOOK.json`).
+
 ## PR #2 — 14 November 2026
 
 - Copilot topic-identity finding: accepted. Exchanged topics require verified non-null thread/forum IDs. Unresolved local observations have distinct stable keys, remain pending with partial coverage, and cannot supply exchanged messages or stage targets until resolved. Resolution preserves local mappings and emits a single addition; same-title topics never collapse to a null/title key. Added the two-unresolved-topics/resolution scenario to shared fixture requirements.
 - Copilot source-baseline finding: accepted. Earlier prose described local uncommitted `channel_nav.py` and a callback addition absent from the PR. Corrected design/TODO to describe tracked sidebar OCR lookup, the existing utility-to-PIL screenshot fallback, and the iterator's list-returning/coverage limitations. Existing uncommitted runtime changes remain outside this documentation PR.
 - Product direction: generic promotion support includes owner-designated self-promotion forums, not only text channels. Immediate project-testing use shares the logic through an opt-in profile/purpose and separate enable flags; it does not replace the promotion product or expose private domain code/data.
 - Readiness: documentation reviewed; runtime forum retrieval, refresh/diff and actual composer staging remain unimplemented in this PR. The immediate-use gate requires a real vertical-slice run with recorded coverage and staging evidence, stopping before human Send. Do not infer readiness from the design or unrelated green tests.
+
+## Forum implementation & verification — 14 November 2026
+
+- Implemented modules: added `src/forums/` (`config.py`, `models.py`, `exchange.py`, `changes.py`, `store.py`, `drafts.py`, `handoff.py`, `reader.py`, `dialog.py`, `providers/base.py`, `providers/desktop.py`, `__main__.py`), added optional `get_forum_profiles`/`set_forum_profile` helpers in `src/server_config.py`, added `normalize_text`, `_safe_grab`, and `ocr_image_structured` in `src/utils.py`, fixed filtered `servers` targeting in `src/promotion_helper.py` and `src/main.py`, and fixed mock isolation in `tests/test_nav_logic.py`. Left unrelated pre-existing uncommitted channel-scanner files untouched.
+- Automated verification: added public fictional fixtures in `tests/fixtures/forum_exchange_v1/` and tests in `tests/test_forums.py`; `.venv/bin/python -m unittest discover -s tests -v` passed 33 tests (0 failures, 0 skipped).
+- Live read-only desktop verification (macOS, `.venv/bin/python`, Discord pid `<LOCAL_PID_01>`, `AXIsProcessTrusted() == True`):
+  - `python -m src.forums session` detected `actor.label = "<ACTOR_OWNER_01>"`, `#<FORUM_01> | <COMMUNITY_01>`, `can_read_semantic = true`, `can_navigate_deep_link = true`, `can_stage_composer = true`.
+  - Read-only `DesktopDiscordProvider` vertical slice against ignored `data/forums/<PROFILE_01>.sqlite3` (`purpose = "external_project"`, `promotion_enabled = false`) seeded 77 topics + 1 unresolved observation (`<TOPIC_UNRESOLVED_01>`), read live `<FORUM_01>` tags (`<TAG_SET_01>`) and 78 topic links/cards, read guidance thread `<THREAD_GUIDE_01>` (10,088 chars requirement), read `"<THREAD_TOPIC_01>"` (`<THREAD_TOPIC_01_ID>`) starter (`<ACTOR_COMMUNITY_01>`, edited marker true) + reply (`<ACTOR_OWNER_01>`), verified composer `AXTextArea` detected and empty (`\ufeff` stripped), confirmed quiet second read emitted 0 changes, verified CLI `status`/`search`/`changes`, and validated exported `forum.snapshot.v1` and `forum.changes.v1` contracts under `data/forums/exchange/`.
+- Remaining coverage gaps before calling live attachment staging & OCR fallback complete:
+  - macOS `Screen Recording` (`CGWindowListCreateImage` / `ImageGrab`) was unavailable (`screen_capture_unavailable`, `can_read_ocr: false`) in this session, so live desktop OCR fallback could not be exercised end-to-end against Discord (OCR paths are verified on synthetic images in tests).
+  - Live interactive composer pasting with a genuine producer draft and OS file-picker attachment upload preview has not been run yet (skipped rather than fabricating community posts; verified end-to-end against `FakeForumProvider`).
+  - Live remote mid-session edits, new replies, and guidance changes await live remote activity (verified via `FakeForumProvider` tests).

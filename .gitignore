@@ -49,3 +49,6 @@ clean_requirements.txt
 installed.txt
 servers*.json
 *.png
+
+# Local private notes & cross-agent reference codebook
+docs/local/
