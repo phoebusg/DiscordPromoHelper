@@ -1,0 +1,47 @@
+{
+  "schema": "draft.request.v1",
+  "record_id": "rec-draft-0001",
+  "producer_id": "fixture-consumer-v1",
+  "created_at": "2026-11-14T10:12:00Z",
+  "scope": {
+    "guild_id": "100000000000000001",
+    "forum_id": "100000000000000002",
+    "actor": {
+      "user_id": "100000000000000099",
+      "label": "Fixture Reviewer"
+    }
+  },
+  "draft_id": "draft-north-ridge-01",
+  "revision": 1,
+  "action": "reply_existing",
+  "destination": {
+    "guild_id": "100000000000000001",
+    "forum_id": "100000000000000002",
+    "thread_id": "100000000000000003",
+    "message_id": null,
+    "source_url": "https://discord.com/channels/100000000000000001/100000000000000003"
+  },
+  "body": "Weekly sector update — North Ridge 🧭\nLine 2: verified 14 crates.",
+  "title": null,
+  "tags": [],
+  "evidence": [
+    {
+      "evidence_id": "ev-001",
+      "name": "synthetic_probe.png",
+      "media_type": "image/png",
+      "sha256": "1e0d40885f1663d9b2ec0f442d4191a5105e1c4e700f4ddb52148d12bbbaf6b8",
+      "local_ref": "evidence/synthetic_probe.png"
+    }
+  ],
+  "baseline": {
+    "snapshot_id": "mirror-fixture-main",
+    "snapshot_revision": 4,
+    "requirements": [
+      {
+        "requirement_id": "guidelines-fixture",
+        "revision": 2
+      }
+    ],
+    "message_content_hash": null
+  }
+}

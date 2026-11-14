@@ -1,0 +1,129 @@
+{
+  "schema": "forum.snapshot.v1",
+  "record_id": "rec-snap-partial-0001",
+  "producer_id": "fixture-producer-v1",
+  "created_at": "2026-11-14T10:00:00Z",
+  "scope": {
+    "guild_id": "100000000000000001",
+    "forum_id": "100000000000000002",
+    "actor": {
+      "user_id": "100000000000000099",
+      "label": "Fixture Reviewer"
+    }
+  },
+  "x_consumer_hint": {
+    "keep_me": true
+  },
+  "snapshot_id": "mirror-fixture-main",
+  "revision": 1,
+  "captured_at": "2026-11-14T10:00:00Z",
+  "cursor": {
+    "stream_id": "stream-fixture-01",
+    "position": "1"
+  },
+  "forum": {
+    "forum_id": "100000000000000002",
+    "name": "Example Supply Forum",
+    "source_url": "https://discord.com/channels/100000000000000001/100000000000000002",
+    "tags": [
+      {
+        "tag_id": "100000000000000201",
+        "name": "Verified"
+      }
+    ],
+    "revision": 1,
+    "observed_at": "2026-11-14T09:59:50Z"
+  },
+  "topics": [
+    {
+      "thread_id": "100000000000000003",
+      "forum_id": "100000000000000002",
+      "title": "North Ridge Depot",
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000003",
+      "revision": 1,
+      "observed_at": "2026-11-14T09:59:52Z",
+      "tags": [
+        {
+          "tag_id": "100000000000000201",
+          "name": "Verified"
+        }
+      ],
+      "starter_message_id": "100000000000000101",
+      "archived": false,
+      "locked": false,
+      "remote_last_activity_at": "2026-11-14T09:55:00Z"
+    }
+  ],
+  "messages": [
+    {
+      "entity_ref": "msg:100000000000000101",
+      "message_id": "100000000000000101",
+      "thread_id": "100000000000000003",
+      "author": {
+        "user_id": "100000000000000050",
+        "label": "ReporterOne"
+      },
+      "body": "Pinned station overview\nSector: North Ridge\nStatus: active",
+      "content_hash": "67a06ad960e0e564da55e285e0b6ba4863e9a0a6eb2dbec67e41acb0a7678d4b",
+      "revision": 1,
+      "observed_at": "2026-11-14T09:59:52Z",
+      "remote_created_at": "2026-11-14T09:50:00Z",
+      "remote_edited_at": null,
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000003/100000000000000101",
+      "identity_verified": true,
+      "attachments": []
+    },
+    {
+      "entity_ref": "msg:100000000000000102",
+      "message_id": "100000000000000102",
+      "thread_id": "100000000000000003",
+      "author": {
+        "user_id": "100000000000000050",
+        "label": "ReporterOne"
+      },
+      "body": "Initial cargo count confirmed — 12 crates.",
+      "content_hash": "3a91f8776d1d0f3180f556fd1083d46a2cc0fe470e67a6e8b2702e99db7ec89e",
+      "revision": 1,
+      "observed_at": "2026-11-14T09:59:55Z",
+      "remote_created_at": "2026-11-14T09:55:00Z",
+      "remote_edited_at": null,
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000003/100000000000000102",
+      "identity_verified": true,
+      "attachments": []
+    }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "guidelines-fixture",
+      "source_entity_ref": "forum-guidelines",
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000002",
+      "body": "Guidelines v1: Include sector name and screenshot evidence.",
+      "content_hash": "063e013e03f7b334658ff239d802c7aebe1ddede458c9bdfc6dd13f86d330b3d",
+      "revision": 1,
+      "observed_at": "2026-11-14T09:59:50Z"
+    }
+  ],
+  "coverage": {
+    "topics": "partial",
+    "histories": "partial",
+    "requirements": "complete",
+    "pending": [
+      {
+        "observation_ref": "obs-supply-a",
+        "thread_id": null,
+        "reason": "unresolved_same_title_observation",
+        "resume_token": "tok-a",
+        "title": "Supply Cache"
+      },
+      {
+        "observation_ref": "obs-supply-b",
+        "thread_id": null,
+        "reason": "unresolved_same_title_observation",
+        "resume_token": "tok-b",
+        "title": "Supply Cache"
+      }
+    ],
+    "errors": [],
+    "last_success_at": "2026-11-14T10:00:00Z"
+  }
+}

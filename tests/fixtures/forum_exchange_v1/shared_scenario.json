@@ -1,0 +1,454 @@
+{
+  "fixture_schema": "aos.shared_fixture_set.v1",
+  "fixture_id": "same-title-resolution-and-reviewed-report",
+  "description": "Fictional Forum Exchange v1 scenario. All identifiers and content are synthetic.",
+  "snapshot_unresolved": {
+    "schema": "forum.snapshot.v1",
+    "record_id": "fixture-snapshot-unresolved",
+    "producer_id": "shared-fixture-v1",
+    "created_at": "2026-11-14T12:00:00Z",
+    "scope": {
+      "guild_id": "100000000000000001",
+      "forum_id": "100000000000000002",
+      "actor": {
+        "user_id": null,
+        "label": "Fixture account"
+      }
+    },
+    "snapshot_id": "shared-fixture-mirror",
+    "revision": 1,
+    "captured_at": "2026-11-14T12:00:00Z",
+    "cursor": {
+      "stream_id": "shared-fixture-stream",
+      "position": "opaque-position-0"
+    },
+    "forum": {
+      "forum_id": "100000000000000002",
+      "name": "Fictional POI testing",
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000002",
+      "tags": [],
+      "revision": 1,
+      "observed_at": "2026-11-14T12:00:00Z"
+    },
+    "topics": [],
+    "messages": [],
+    "requirements": [
+      {
+        "requirement_id": "poi-guidance",
+        "source_entity_ref": null,
+        "source_url": null,
+        "body": "Check geometry and prop behavior.",
+        "content_hash": "49af48a0291269f3cc8bc8caa7705abb7208f0372243964ebaa179c818bf2c70",
+        "revision": 1,
+        "observed_at": "2026-11-14T12:00:00Z"
+      }
+    ],
+    "coverage": {
+      "topics": "partial",
+      "histories": "partial",
+      "requirements": "partial",
+      "pending": [
+        {
+          "observation_ref": "poi-observation-a",
+          "observed_title": "Amberfall Crossing",
+          "thread_id": null,
+          "reason": "thread_id_not_verified",
+          "resume_token": "resume-a"
+        },
+        {
+          "observation_ref": "poi-observation-b",
+          "observed_title": "Amberfall Crossing",
+          "thread_id": null,
+          "reason": "thread_id_not_verified",
+          "resume_token": "resume-b"
+        }
+      ],
+      "errors": [],
+      "last_success_at": "2026-11-14T12:00:00Z"
+    }
+  },
+  "snapshot_resolved": {
+    "schema": "forum.snapshot.v1",
+    "record_id": "fixture-snapshot-resolved",
+    "producer_id": "shared-fixture-v1",
+    "created_at": "2026-11-14T12:02:00Z",
+    "scope": {
+      "guild_id": "100000000000000001",
+      "forum_id": "100000000000000002",
+      "actor": {
+        "user_id": null,
+        "label": "Fixture account"
+      }
+    },
+    "snapshot_id": "shared-fixture-mirror",
+    "revision": 2,
+    "captured_at": "2026-11-14T12:02:00Z",
+    "cursor": {
+      "stream_id": "shared-fixture-stream",
+      "position": "opaque-position-2"
+    },
+    "forum": {
+      "forum_id": "100000000000000002",
+      "name": "Fictional POI testing",
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000002",
+      "tags": [],
+      "revision": 1,
+      "observed_at": "2026-11-14T12:02:00Z"
+    },
+    "topics": [
+      {
+        "thread_id": "100000000000000003",
+        "forum_id": "100000000000000002",
+        "title": "Amberfall Crossing",
+        "source_url": "https://discord.com/channels/100000000000000001/100000000000000003",
+        "revision": 1,
+        "observed_at": "2026-11-14T12:02:00Z",
+        "tags": [],
+        "starter_message_id": null,
+        "archived": false,
+        "locked": false,
+        "observation_ref": "poi-observation-a"
+      },
+      {
+        "thread_id": "100000000000000004",
+        "forum_id": "100000000000000002",
+        "title": "Amberfall Crossing",
+        "source_url": "https://discord.com/channels/100000000000000001/100000000000000004",
+        "revision": 1,
+        "observed_at": "2026-11-14T12:02:00Z",
+        "tags": [],
+        "starter_message_id": null,
+        "archived": false,
+        "locked": false,
+        "observation_ref": "poi-observation-b"
+      }
+    ],
+    "messages": [
+      {
+        "entity_ref": "starter-a",
+        "message_id": "100000000000000101",
+        "thread_id": "100000000000000003",
+        "author": {
+          "user_id": "100000000000000010",
+          "label": "Fixture reporter"
+        },
+        "body": "The west wall appears intact.",
+        "content_hash": "80851f9ed8dc48f52cfb5341355f471072baf5ef9eecc6416850b32a836bb97e",
+        "revision": 1,
+        "observed_at": "2026-11-14T12:02:00Z",
+        "remote_created_at": "2026-11-14T11:58:00Z",
+        "remote_edited_at": null,
+        "source_url": "https://discord.com/channels/100000000000000001/100000000000000003/100000000000000101",
+        "identity_verified": true,
+        "attachments": []
+      },
+      {
+        "entity_ref": "starter-b",
+        "message_id": "100000000000000102",
+        "thread_id": "100000000000000004",
+        "author": {
+          "user_id": "100000000000000010",
+          "label": "Fixture reporter"
+        },
+        "body": "No hazard observed in the eastern field.",
+        "content_hash": "6a01b7c6a0a0852065f60d966c348bae7010bc3472145035a820bd55512e227f",
+        "revision": 1,
+        "observed_at": "2026-11-14T12:02:00Z",
+        "remote_created_at": "2026-11-14T11:59:00Z",
+        "remote_edited_at": null,
+        "source_url": "https://discord.com/channels/100000000000000001/100000000000000004/100000000000000102",
+        "identity_verified": true,
+        "attachments": []
+      }
+    ],
+    "requirements": [
+      {
+        "requirement_id": "poi-guidance",
+        "source_entity_ref": null,
+        "source_url": null,
+        "body": "Check geometry and prop behavior.",
+        "content_hash": "49af48a0291269f3cc8bc8caa7705abb7208f0372243964ebaa179c818bf2c70",
+        "revision": 1,
+        "observed_at": "2026-11-14T12:02:00Z"
+      }
+    ],
+    "coverage": {
+      "topics": "complete",
+      "histories": "partial",
+      "requirements": "partial",
+      "pending": [],
+      "errors": [],
+      "last_success_at": "2026-11-14T12:02:00Z"
+    }
+  },
+  "changes": [
+    {
+      "schema": "forum.changes.v1",
+      "record_id": "fixture-changes-reply-and-requirement",
+      "producer_id": "shared-fixture-v1",
+      "created_at": "2026-11-14T12:06:00Z",
+      "scope": {
+        "guild_id": "100000000000000001",
+        "forum_id": "100000000000000002",
+        "actor": {
+          "user_id": null,
+          "label": "Fixture account"
+        }
+      },
+      "snapshot_id": "shared-fixture-mirror",
+      "snapshot_revision": 2,
+      "after_cursor": {
+        "stream_id": "shared-fixture-stream",
+        "position": "opaque-position-2"
+      },
+      "cursor": {
+        "stream_id": "shared-fixture-stream",
+        "position": "opaque-position-3"
+      },
+      "changes": [
+        {
+          "change_id": "fixture-reply-added",
+          "entity_type": "message",
+          "entity_ref": "reply-a",
+          "kind": "added",
+          "before_revision": null,
+          "after_revision": 1,
+          "observed_at": "2026-11-14T12:06:00Z",
+          "source": {
+            "method": "fictional_fixture",
+            "source_url": null,
+            "confidence": null
+          },
+          "after": {
+            "entity_ref": "reply-a",
+            "message_id": "100000000000000103",
+            "thread_id": "100000000000000003",
+            "author": {
+              "user_id": "100000000000000010",
+              "label": "Fixture reporter"
+            },
+            "body": "The north trail was blocked on my latest visit.",
+            "content_hash": "9531d7910cd357af165a39c3829edf2af086a3ac74528590ae3fab2e6072abfa",
+            "revision": 1,
+            "observed_at": "2026-11-14T12:06:00Z",
+            "remote_created_at": "2026-11-14T12:05:00Z",
+            "remote_edited_at": null,
+            "source_url": "https://discord.com/channels/100000000000000001/100000000000000003/100000000000000103",
+            "identity_verified": true,
+            "attachments": []
+          }
+        },
+        {
+          "change_id": "fixture-requirement-changed",
+          "entity_type": "requirement",
+          "entity_ref": "poi-guidance",
+          "kind": "requirements_changed",
+          "before_revision": 1,
+          "after_revision": 2,
+          "observed_at": "2026-11-14T12:06:00Z",
+          "source": {
+            "method": "fictional_fixture",
+            "source_url": null,
+            "confidence": null
+          },
+          "after": {
+            "requirement_id": "poi-guidance",
+            "source_entity_ref": null,
+            "source_url": null,
+            "body": "Also check functional prop behavior.",
+            "content_hash": "81ef25b780f1046e230dbb062f4c5751a14c1e235e031c71cabb25d4c81248aa",
+            "revision": 2,
+            "observed_at": "2026-11-14T12:06:00Z"
+          }
+        }
+      ]
+    },
+    {
+      "schema": "forum.changes.v1",
+      "record_id": "fixture-changes-silent-edit",
+      "producer_id": "shared-fixture-v1",
+      "created_at": "2026-11-14T12:11:00Z",
+      "scope": {
+        "guild_id": "100000000000000001",
+        "forum_id": "100000000000000002",
+        "actor": {
+          "user_id": null,
+          "label": "Fixture account"
+        }
+      },
+      "snapshot_id": "shared-fixture-mirror",
+      "snapshot_revision": 2,
+      "after_cursor": {
+        "stream_id": "shared-fixture-stream",
+        "position": "opaque-position-3"
+      },
+      "cursor": {
+        "stream_id": "shared-fixture-stream",
+        "position": "opaque-position-4"
+      },
+      "changes": [
+        {
+          "change_id": "fixture-reply-silent-edit",
+          "entity_type": "message",
+          "entity_ref": "reply-a",
+          "kind": "edited",
+          "before_revision": 1,
+          "after_revision": 2,
+          "observed_at": "2026-11-14T12:11:00Z",
+          "source": {
+            "method": "fictional_fixture",
+            "source_url": null,
+            "confidence": null
+          },
+          "after": {
+            "entity_ref": "reply-a",
+            "message_id": "100000000000000103",
+            "thread_id": "100000000000000003",
+            "author": {
+              "user_id": "100000000000000010",
+              "label": "Fixture reporter"
+            },
+            "body": "The north trail remains blocked after three attempts.",
+            "content_hash": "574bbe5c9d219a409d8116172b4ff5f4dbe712a77f1991ae44b7f9e9bc23b4a0",
+            "revision": 2,
+            "observed_at": "2026-11-14T12:11:00Z",
+            "remote_created_at": "2026-11-14T12:05:00Z",
+            "remote_edited_at": "2026-11-14T12:10:00Z",
+            "source_url": "https://discord.com/channels/100000000000000001/100000000000000003/100000000000000103",
+            "identity_verified": true,
+            "attachments": []
+          }
+        }
+      ]
+    }
+  ],
+  "draft_request": {
+    "schema": "draft.request.v1",
+    "record_id": "fixture-draft-request-record",
+    "producer_id": "shared-fixture-v1",
+    "created_at": "2026-11-14T12:15:00Z",
+    "scope": {
+      "guild_id": "100000000000000001",
+      "forum_id": "100000000000000002",
+      "actor": {
+        "user_id": null,
+        "label": "Fixture account"
+      }
+    },
+    "draft_id": "fixture-draft-amberfall",
+    "revision": 1,
+    "action": "reply_existing",
+    "destination": {
+      "guild_id": "100000000000000001",
+      "forum_id": "100000000000000002",
+      "thread_id": "100000000000000003",
+      "message_id": null,
+      "source_url": "https://discord.com/channels/100000000000000001/100000000000000003"
+    },
+    "body": "POI update: the north trail was blocked after three attempts. I have attached a map note.",
+    "title": null,
+    "tags": [],
+    "evidence": [
+      {
+        "evidence_id": "fixture-evidence-map-note",
+        "name": "map-note.txt",
+        "media_type": "text/plain",
+        "sha256": "63c569f6a7f867785f2f82bbb80b2a8fca37790b2c72e8aa85a20a8945ce8c97",
+        "local_ref": "forum_exchange_v1/map-note.txt"
+      }
+    ],
+    "baseline": {
+      "snapshot_id": "shared-fixture-mirror",
+      "snapshot_revision": 2,
+      "requirements": [
+        {
+          "requirement_id": "poi-guidance",
+          "revision": 2
+        }
+      ],
+      "message_content_hash": null
+    }
+  },
+  "receipts": [
+    {
+      "schema": "handoff.receipt.v1",
+      "record_id": "fixture-staged-receipt-record",
+      "producer_id": "shared-fixture-v1",
+      "created_at": "2026-11-14T12:20:00Z",
+      "scope": {
+        "guild_id": "100000000000000001",
+        "forum_id": "100000000000000002",
+        "actor": {
+          "user_id": null,
+          "label": "Fixture account"
+        }
+      },
+      "receipt_id": "fixture-staged-receipt",
+      "draft_id": "fixture-draft-amberfall",
+      "draft_revision": 1,
+      "destination": {
+        "guild_id": "100000000000000001",
+        "forum_id": "100000000000000002",
+        "thread_id": "100000000000000003",
+        "message_id": null,
+        "source_url": "https://discord.com/channels/100000000000000001/100000000000000003"
+      },
+      "status": "staged",
+      "observed_at": "2026-11-14T12:20:00Z",
+      "message_id": null,
+      "message_url": null,
+      "observed_body_hash": "7e431313e13c2cf8016c7ff965145c2c82dfd7ac34087724b5d3aecee0511fd5",
+      "evidence_ids": [
+        "fixture-evidence-map-note"
+      ],
+      "reason": null
+    },
+    {
+      "schema": "handoff.receipt.v1",
+      "record_id": "fixture-submission-receipt-record",
+      "producer_id": "shared-fixture-v1",
+      "created_at": "2026-11-14T12:28:00Z",
+      "scope": {
+        "guild_id": "100000000000000001",
+        "forum_id": "100000000000000002",
+        "actor": {
+          "user_id": null,
+          "label": "Fixture account"
+        }
+      },
+      "receipt_id": "fixture-submission-receipt",
+      "draft_id": "fixture-draft-amberfall",
+      "draft_revision": 1,
+      "destination": {
+        "guild_id": "100000000000000001",
+        "forum_id": "100000000000000002",
+        "thread_id": "100000000000000003",
+        "message_id": "100000000000000104",
+        "source_url": "https://discord.com/channels/100000000000000001/100000000000000003"
+      },
+      "status": "submission_observed",
+      "observed_at": "2026-11-14T12:28:00Z",
+      "message_id": "100000000000000104",
+      "message_url": "https://discord.com/channels/100000000000000001/100000000000000003/100000000000000104",
+      "observed_body_hash": "aa7a3ad8ea7d7cf656e851cb0801615108393afaf28a3138997916580cd5d863",
+      "evidence_ids": [
+        "fixture-evidence-map-note"
+      ],
+      "reason": null
+    }
+  ],
+  "expected": {
+    "resolved_topics": 2,
+    "unresolved_observations": 0,
+    "messages_after_changes": 3,
+    "reply_entity_ref": "reply-a",
+    "reply_final_body": "The north trail remains blocked after three attempts.",
+    "requirements_revision": 2,
+    "change_ids": [
+      "fixture-reply-added",
+      "fixture-requirement-changed",
+      "fixture-reply-silent-edit"
+    ],
+    "human_edited_body": "POI update: the north trail was blocked after three attempts. I also checked the gate. [edited by user]"
+  }
+}
