@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Any, Optional
 import uuid
@@ -13,7 +14,7 @@ from .changes import (
     classify_body_change,
     make_record_id,
 )
-from .exchange import RecordConflictError, validate_exchange_record
+from .exchange import RecordConflictError, validate_exchange_record, write_record_atomic
 from .models import (
     build_discord_channel_url,
     compute_bytes_sha256,
@@ -54,6 +55,8 @@ class ForumStore:
                     snapshot_revision INTEGER NOT NULL,
                     stream_id TEXT NOT NULL,
                     cursor_seq INTEGER NOT NULL,
+                    exported_snapshot_revision INTEGER NOT NULL DEFAULT 0,
+                    exported_cursor_seq INTEGER NOT NULL DEFAULT 0,
                     actor_json TEXT NOT NULL,
                     coverage_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -83,6 +86,7 @@ class ForumStore:
                     revision INTEGER NOT NULL,
                     observed_at TEXT NOT NULL,
                     last_deep_read_at TEXT,
+                    observation_ref TEXT,
                     extra_json TEXT NOT NULL
                 );
 
@@ -201,6 +205,22 @@ class ForumStore:
                 );
                 """
             )
+            meta_cols = {
+                r["name"] for r in self._conn.execute("PRAGMA table_info(mirror_meta)").fetchall()
+            }
+            if "exported_snapshot_revision" not in meta_cols:
+                self._conn.execute(
+                    "ALTER TABLE mirror_meta ADD COLUMN exported_snapshot_revision INTEGER NOT NULL DEFAULT 0"
+                )
+            if "exported_cursor_seq" not in meta_cols:
+                self._conn.execute(
+                    "ALTER TABLE mirror_meta ADD COLUMN exported_cursor_seq INTEGER NOT NULL DEFAULT 0"
+                )
+            topic_cols = {
+                r["name"] for r in self._conn.execute("PRAGMA table_info(topics)").fetchall()
+            }
+            if "observation_ref" not in topic_cols:
+                self._conn.execute("ALTER TABLE topics ADD COLUMN observation_ref TEXT")
 
     def ensure_scope(
         self,
@@ -289,6 +309,8 @@ class ForumStore:
                 {
                     "thread_id": None,
                     "observation_ref": u["observation_ref"],
+                    "observed_title": u["title"],
+                    "title": u["title"],
                     "reason": u["reason"],
                     "resume_token": u["resume_token"],
                 }
@@ -338,7 +360,16 @@ class ForumStore:
         meta: sqlite3.Row,
         change: dict[str, Any],
     ) -> int:
-        new_rev = int(meta["snapshot_revision"]) + 1
+        """Append change to the active snapshot stream without advancing snapshot_revision per mutation.
+
+        snapshot_revision stays anchored to the active exported snapshot and increments only
+        at explicit snapshot cutover. cursor_seq advances monotonically for every change event.
+        """
+        fresh = self._conn.execute(
+            "SELECT snapshot_revision FROM mirror_meta WHERE scope_key = ?",
+            (meta["scope_key"],),
+        ).fetchone()
+        snap_rev = int(fresh["snapshot_revision"]) if fresh is not None else int(meta["snapshot_revision"])
         cur = self._conn.execute(
             """
             INSERT INTO changes (
@@ -349,7 +380,7 @@ class ForumStore:
             (
                 change["change_id"],
                 meta["stream_id"],
-                new_rev,
+                snap_rev,
                 change["entity_type"],
                 change["entity_ref"],
                 change["kind"],
@@ -362,10 +393,10 @@ class ForumStore:
         )
         seq = int(cur.lastrowid)
         self._conn.execute(
-            "UPDATE mirror_meta SET snapshot_revision = ?, cursor_seq = ?, updated_at = ? WHERE scope_key = ?",
-            (new_rev, seq, utc_now_iso(), meta["scope_key"]),
+            "UPDATE mirror_meta SET cursor_seq = ?, updated_at = ? WHERE scope_key = ?",
+            (seq, utc_now_iso(), meta["scope_key"]),
         )
-        return new_rev
+        return seq
 
     def _record_revision(
         self,
@@ -491,6 +522,7 @@ class ForumStore:
         archived: Optional[bool] = None,
         locked: Optional[bool] = None,
         remote_last_activity_at: Optional[str] = None,
+        observation_ref: Optional[str] = None,
         observed_at: Optional[str] = None,
         source_method: str = "semantic",
         confidence: Optional[float] = 1.0,
@@ -508,6 +540,7 @@ class ForumStore:
         locked_db = None if locked is None else int(bool(locked))
 
         row = self._conn.execute("SELECT * FROM topics WHERE thread_id = ?", (tid,)).fetchone()
+        eff_obs_ref = observation_ref or (row["observation_ref"] if row is not None else None)
         entity = {
             "thread_id": tid,
             "forum_id": fid,
@@ -521,6 +554,8 @@ class ForumStore:
             "observed_at": now,
             **(extra or {}),
         }
+        if eff_obs_ref is not None:
+            entity["observation_ref"] = eff_obs_ref
         payload_hash = compute_content_hash(
             json.dumps(
                 {
@@ -542,8 +577,9 @@ class ForumStore:
                     """
                     INSERT INTO topics (
                         thread_id, forum_id, title, source_url, tags_json, starter_message_id,
-                        archived, locked, remote_last_activity_at, revision, observed_at, extra_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        archived, locked, remote_last_activity_at, revision, observed_at,
+                        observation_ref, extra_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         tid,
@@ -557,6 +593,7 @@ class ForumStore:
                         remote_last_activity_at,
                         rev,
                         now,
+                        eff_obs_ref,
                         json.dumps(extra or {}),
                     ),
                 )
@@ -578,7 +615,10 @@ class ForumStore:
             changed_starter = (
                 starter_message_id is not None and row["starter_message_id"] != starter_message_id
             )
-            if not (changed_tags or changed_state or changed_title or changed_starter):
+            changed_obs_ref = (
+                observation_ref is not None and row["observation_ref"] != observation_ref
+            )
+            if not (changed_tags or changed_state or changed_title or changed_starter or changed_obs_ref):
                 if remote_last_activity_at and remote_last_activity_at != row["remote_last_activity_at"]:
                     self._conn.execute(
                         "UPDATE topics SET remote_last_activity_at = ?, observed_at = ? WHERE thread_id = ?",
@@ -596,7 +636,7 @@ class ForumStore:
                 UPDATE topics
                 SET title = ?, source_url = ?, tags_json = ?, starter_message_id = ?,
                     archived = ?, locked = ?, remote_last_activity_at = ?, revision = ?,
-                    observed_at = ?, extra_json = ?
+                    observed_at = ?, observation_ref = ?, extra_json = ?
                 WHERE thread_id = ?
                 """,
                 (
@@ -609,6 +649,7 @@ class ForumStore:
                     remote_last_activity_at or row["remote_last_activity_at"],
                     rev,
                     now,
+                    eff_obs_ref,
                     json.dumps(extra or {}),
                     tid,
                 ),
@@ -766,6 +807,7 @@ class ForumStore:
             starter_message_id=starter_message_id,
             archived=archived,
             locked=locked,
+            observation_ref=observation_ref,
             observed_at=now,
             source_method=source_method,
             confidence=confidence,
@@ -1441,9 +1483,20 @@ class ForumStore:
         *,
         producer_id: Optional[str] = None,
         record_id: Optional[str] = None,
+        cutover: bool = False,
+        advance_export_cursor: bool = False,
     ) -> dict[str, Any]:
         """Export a validated forum.snapshot.v1 record from current mirror state."""
         meta = self._get_meta()
+        if cutover and int(meta["exported_snapshot_revision"]) > 0:
+            next_rev = int(meta["snapshot_revision"]) + 1
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE mirror_meta SET snapshot_revision = ?, updated_at = ? WHERE scope_key = ?",
+                    (next_rev, utc_now_iso(), meta["scope_key"]),
+                )
+            meta = self._get_meta(meta["scope_key"])
+
         now = utc_now_iso()
         forum_row = self._conn.execute(
             "SELECT * FROM forums WHERE forum_id = ?", (meta["forum_id"],)
@@ -1476,22 +1529,23 @@ class ForumStore:
         known_tids = set()
         for t in topics_rows:
             known_tids.add(t["thread_id"])
-            topics_list.append(
-                {
-                    "thread_id": t["thread_id"],
-                    "forum_id": t["forum_id"],
-                    "title": t["title"],
-                    "source_url": t["source_url"],
-                    "revision": int(t["revision"]),
-                    "observed_at": t["observed_at"],
-                    "tags": json.loads(t["tags_json"]),
-                    "starter_message_id": t["starter_message_id"],
-                    "archived": None if t["archived"] is None else bool(t["archived"]),
-                    "locked": None if t["locked"] is None else bool(t["locked"]),
-                    "remote_last_activity_at": t["remote_last_activity_at"],
-                    **json.loads(t["extra_json"]),
-                }
-            )
+            t_obj = {
+                "thread_id": t["thread_id"],
+                "forum_id": t["forum_id"],
+                "title": t["title"],
+                "source_url": t["source_url"],
+                "revision": int(t["revision"]),
+                "observed_at": t["observed_at"],
+                "tags": json.loads(t["tags_json"]),
+                "starter_message_id": t["starter_message_id"],
+                "archived": None if t["archived"] is None else bool(t["archived"]),
+                "locked": None if t["locked"] is None else bool(t["locked"]),
+                "remote_last_activity_at": t["remote_last_activity_at"],
+                **json.loads(t["extra_json"]),
+            }
+            if t["observation_ref"]:
+                t_obj["observation_ref"] = t["observation_ref"]
+            topics_list.append(t_obj)
 
         messages_rows = self._conn.execute(
             "SELECT * FROM messages ORDER BY observed_at, entity_ref"
@@ -1540,6 +1594,8 @@ class ForumStore:
                 req_obj["parsed_checks"] = json.loads(r["parsed_checks_json"])
             req_list.append(req_obj)
 
+        snap_rev = int(meta["snapshot_revision"])
+        cur_seq = int(meta["cursor_seq"])
         snap = {
             "schema": "forum.snapshot.v1",
             "record_id": record_id or make_record_id("snap"),
@@ -1551,11 +1607,11 @@ class ForumStore:
                 "actor": json.loads(meta["actor_json"]),
             },
             "snapshot_id": meta["snapshot_id"],
-            "revision": int(meta["snapshot_revision"]),
+            "revision": snap_rev,
             "captured_at": now,
             "cursor": {
                 "stream_id": meta["stream_id"],
-                "position": str(meta["cursor_seq"]),
+                "position": str(cur_seq),
             },
             "forum": forum_obj,
             "topics": topics_list,
@@ -1563,11 +1619,34 @@ class ForumStore:
             "requirements": req_list,
             "coverage": self.get_coverage(),
         }
-        return validate_exchange_record(snap)
+        validated = validate_exchange_record(snap)
+        if advance_export_cursor:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    UPDATE mirror_meta
+                    SET exported_snapshot_revision = ?, exported_cursor_seq = ?, updated_at = ?
+                    WHERE scope_key = ?
+                    """,
+                    (snap_rev, cur_seq, utc_now_iso(), meta["scope_key"]),
+                )
+        return validated
 
     def current_cursor(self) -> dict[str, str]:
         meta = self._get_meta()
         return {"stream_id": meta["stream_id"], "position": str(meta["cursor_seq"])}
+
+    def exported_checkpoint(self) -> dict[str, Any]:
+        """Return the last exported snapshot revision and cursor position."""
+        meta = self._get_meta()
+        return {
+            "exported_snapshot_revision": int(meta["exported_snapshot_revision"]),
+            "snapshot_revision": int(meta["snapshot_revision"]),
+            "cursor": {
+                "stream_id": meta["stream_id"],
+                "position": str(meta["exported_cursor_seq"]),
+            },
+        }
 
     def export_changes(
         self,
@@ -1575,11 +1654,11 @@ class ForumStore:
         *,
         producer_id: Optional[str] = None,
         record_id: Optional[str] = None,
+        advance_export_cursor: bool = False,
     ) -> dict[str, Any]:
-        """Export validated forum.changes.v1 batch after the given consumer cursor."""
+        """Export validated forum.changes.v1 batch after the given or last-exported cursor."""
         meta = self._get_meta()
         stream_id = meta["stream_id"]
-        after_seq = 0
         if after_cursor is not None:
             if after_cursor.get("stream_id") != stream_id:
                 raise CursorStreamMismatchError(
@@ -1589,9 +1668,9 @@ class ForumStore:
                 after_seq = int(after_cursor["position"])
             except Exception as exc:
                 raise ValueError(f"Invalid cursor position {after_cursor.get('position')!r}") from exc
-            eff_after_cursor = {"stream_id": stream_id, "position": str(after_seq)}
         else:
-            eff_after_cursor = {"stream_id": stream_id, "position": "0"}
+            after_seq = int(meta["exported_cursor_seq"])
+        eff_after_cursor = {"stream_id": stream_id, "position": str(after_seq)}
 
         rows = self._conn.execute(
             "SELECT * FROM changes WHERE stream_id = ? AND seq > ? ORDER BY seq ASC",
@@ -1616,6 +1695,7 @@ class ForumStore:
                 }
             )
 
+        anchor_rev = int(meta["exported_snapshot_revision"]) or int(meta["snapshot_revision"])
         now = utc_now_iso()
         batch = {
             "schema": "forum.changes.v1",
@@ -1628,12 +1708,105 @@ class ForumStore:
                 "actor": json.loads(meta["actor_json"]),
             },
             "snapshot_id": meta["snapshot_id"],
-            "snapshot_revision": int(meta["snapshot_revision"]),
+            "snapshot_revision": anchor_rev,
             "after_cursor": eff_after_cursor,
             "cursor": {"stream_id": stream_id, "position": str(last_seq)},
             "changes": changes_list,
         }
-        return validate_exchange_record(batch)
+        validated = validate_exchange_record(batch)
+        if advance_export_cursor:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE mirror_meta SET exported_cursor_seq = ?, updated_at = ? WHERE scope_key = ?",
+                    (last_seq, utc_now_iso(), meta["scope_key"]),
+                )
+        return validated
+
+    def export_exchange_dir(
+        self,
+        exchange_dir: str | Path,
+        *,
+        force_snapshot: bool = False,
+        export_empty_changes: bool = False,
+    ) -> dict[str, Any]:
+        """Export ordered bootstrap snapshot, incremental delta batch, or snapshot cutover into exchange_dir.
+
+        Directory layout matches consumer expectations:
+        - snapshots/  (forum.snapshot.v1)
+        - changes/    (forum.changes.v1)
+        - acks/       (consumer acknowledgements)
+        - drafts/     (incoming draft.request.v1)
+        - receipts/   (outgoing handoff.receipt.v1)
+        - archive/    (superseded pre-cutover delta files)
+        """
+        ex_dir = Path(exchange_dir)
+        snapshots_dir = ex_dir / "snapshots"
+        changes_dir = ex_dir / "changes"
+        acks_dir = ex_dir / "acks"
+        drafts_dir = ex_dir / "drafts"
+        receipts_dir = ex_dir / "receipts"
+        archive_dir = ex_dir / "archive" / "changes"
+        for d in (snapshots_dir, changes_dir, acks_dir, drafts_dir, receipts_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        meta = self._get_meta()
+        is_bootstrap = int(meta["exported_snapshot_revision"]) == 0
+        if is_bootstrap or force_snapshot:
+            # Archive superseded delta files before writing a new snapshot cutover so a restarted
+            # consumer processes snapshots first and does not replay stale pre-cutover deltas.
+            if changes_dir.exists():
+                pending_deltas = sorted(changes_dir.glob("*.json"))
+                if pending_deltas:
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    for old_file in pending_deltas:
+                        shutil.move(str(old_file), str(archive_dir / old_file.name))
+
+            snap = self.export_snapshot(
+                cutover=(force_snapshot and not is_bootstrap),
+                advance_export_cursor=True,
+            )
+            snap_name = (
+                f"{int(snap['revision']):06d}-"
+                f"{int(snap['cursor']['position']):08d}-"
+                f"{snap['record_id']}.snapshot.v1.json"
+            )
+            snap_path = write_record_atomic(snapshots_dir / snap_name, snap)
+            return {
+                "mode": "bootstrap_snapshot" if is_bootstrap else "cutover_snapshot",
+                "snapshot": str(snap_path),
+                "snapshot_revision": snap["revision"],
+                "cursor": snap["cursor"],
+                "changes": None,
+                "change_count": 0,
+            }
+
+        batch = self.export_changes(after_cursor=None, advance_export_cursor=True)
+        if not batch["changes"] and not export_empty_changes:
+            return {
+                "mode": "quiet_noop",
+                "snapshot": None,
+                "snapshot_revision": batch["snapshot_revision"],
+                "cursor": batch["cursor"],
+                "changes": None,
+                "change_count": 0,
+            }
+
+        chg_name = (
+            f"{int(batch['snapshot_revision']):06d}-"
+            f"{int(batch['after_cursor']['position']):08d}-"
+            f"{int(batch['cursor']['position']):08d}-"
+            f"{batch['record_id']}.changes.v1.json"
+        )
+        chg_path = write_record_atomic(changes_dir / chg_name, batch)
+        return {
+            "mode": "incremental_changes",
+            "snapshot": None,
+            "snapshot_revision": batch["snapshot_revision"],
+            "after_cursor": batch["after_cursor"],
+            "cursor": batch["cursor"],
+            "changes": str(chg_path),
+            "change_count": len(batch["changes"]),
+        }
 
     def search(self, query: str, forum_id: Optional[str] = None) -> dict[str, Any]:
         """Local search across topics, messages, unresolved observations, and requirements."""

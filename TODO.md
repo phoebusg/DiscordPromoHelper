@@ -6,8 +6,8 @@ Long term: support promotion in owner-designated self-promotion forums as well a
 
 ## P0 — Demonstrate the immediate configured workflow
 
-- [ ] Run the full interactive end-to-end staging path with a genuine producer draft and OS file-picker attachment upload preview on Discord, leaving final editing and Send to the person (live AX read -> SQLite mirror -> quiet refresh -> CLI query -> snapshot/changes export verified; live OS attachment upload preview & Screen Recording OCR fallback remain to verify interactively).
-- [ ] Keep the project-testing profile opt-in and independent of promotion enablement; preserve existing product defaults (implemented and unit-tested; full usability gate awaits the interactive attachment staging run above).
+- [ ] Run a real end-to-end producer submission flow through user Send and `reconcile_submission` (live paginated read -> SQLite mirror -> `export_exchange_dir` -> unmodified `<EXT_STORE_01>` ingestion -> live non-sending staging of multiline Unicode + `map-note.txt` via POSIX file paste -> cross-process `refresh` pause -> clean composer teardown all verified; awaiting a real user-authored submission rather than manufacturing community test posts, plus Screen Recording permission if OCR fallback is needed).
+- [x] Keep the project-testing profile opt-in and independent of promotion enablement; preserve existing product defaults (`purpose`: `external_project` forbids `promotion_enabled=True`).
 
 ## P0 — GET forum state and keep a local mirror
 
@@ -24,7 +24,7 @@ Long term: support promotion in owner-designated self-promotion forums as well a
 ## P0 — Stage the complete update for final review and Send
 
 - [x] Navigate to the exact existing topic/create/edit target from canonical target references (`DesktopDiscordProvider.navigate_to_url` + `_inspect_composer`, stripping Slate `\ufeff` empty-editor markers).
-- [ ] Insert full body/title and selected attachments into the actual Discord composer and verify upload previews (validated with `FakeForumProvider` + `HandoffManager`; live `DesktopDiscordProvider` pauses with `needs_review` for attachments until interactive OS file-picker verification is wired and tested).
+- [x] Insert full body/title and selected attachments into the actual Discord composer and verify upload previews (`DesktopDiscordProvider.stage_draft`: explicit composer focus, normalized multiline Unicode check, clipboard save/restore, macOS POSIX file paste + `"More message options"` -> `AXSheet` fallback, bounds-keyed `Remove Attachment` slot & filename verification, `clear_staged_composer()`; verified live on Discord without pressing Send).
 - [x] Leave final edits and Send/save to the person. Never reuse a path that automatically presses Enter.
 - [x] Serialize Discord UI navigation (`SessionController`); pause refresh during staging/review, preserve existing human drafts, and pause on account/target changes.
 - [x] Recheck changed requirements/baseline before staging (`check_draft_conflicts`); preserve user edits when new draft revisions arrive during active review.
@@ -44,7 +44,7 @@ Long term: support promotion in owner-designated self-promotion forums as well a
 - [x] Implement validation for that field contract (`src/forums/exchange.py`) and keep producers/consumers aligned.
 - [x] Add fictional round-trip examples (`tests/fixtures/forum_exchange_v1/`), atomic file exchange (`write_record_atomic`), stable IDs/revisions/cursors and `transfer_root`-bounded evidence SHA-256 verification without cross-repo Python imports or credentials.
 - [x] Export reads/changes independently of publishing; accept externally prepared drafts and return staging/submission observations.
-- [ ] Verify an independent producer (<EXT_APP_01>) can consume a live exported snapshot/change feed and stage one genuine draft without private code in the public app.
+- [x] Verify an independent producer (<EXT_APP_01>) can consume a live exported snapshot/change feed and return exchange contracts without private code in the public app (verified unmodified `<EXT_STORE_01>` + `<EXT_INBOX_01>` ingesting both synthetic full lifecycle—bootstrap, `observation_ref` resolution, deltas with continuous `after_cursor` & anchored `snapshot_revision`, quiet refresh, cutover archive—and live Discord exported bootstrap snapshot of `50` topics / `23` messages; real user-initiated Send + post-send `reconcile_submission` remains non-manufactured).
 
 ## P1 — Focused existing correctness fixes
 

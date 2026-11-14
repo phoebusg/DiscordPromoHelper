@@ -1,14 +1,22 @@
 """Installed-runtime Discord desktop adapter using OS accessibility + OCR fallback."""
 from __future__ import annotations
 
+import difflib
+import json
 import logging
+from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 from typing import Any, Optional
 
-from ..models import build_discord_channel_url, parse_discord_channel_url, utc_now_iso
+from ..models import (
+    build_discord_channel_url,
+    normalize_text_for_hash,
+    parse_discord_channel_url,
+    utc_now_iso,
+)
 from .base import (
     ComposerStageObservation,
     DiscordViewProvider,
@@ -99,6 +107,48 @@ def _ax_attr(element: Any, attr: str) -> Any:
     except Exception:
         pass
     return None
+
+
+def _ax_bounds(element: Any) -> Optional[tuple[float, float, float, float]]:
+    """Extract (x, y, width, height) screen coordinates from an AXUIElement."""
+    pos_val = _ax_attr(element, "AXPosition")
+    sz_val = _ax_attr(element, "AXSize")
+    if pos_val is None or sz_val is None:
+        return None
+    pos_m = re.search(r"x:\s*([-\d.]+)\s+y:\s*([-\d.]+)", str(pos_val))
+    sz_m = re.search(r"w:\s*([-\d.]+)\s+h:\s*([-\d.]+)", str(sz_val))
+    if not (pos_m and sz_m):
+        return None
+    return (
+        float(pos_m.group(1)),
+        float(pos_m.group(2)),
+        float(sz_m.group(1)),
+        float(sz_m.group(2)),
+    )
+
+
+def _scroll_at_point(x: float, y: float, delta_lines: int) -> bool:
+    """Post a wheel scroll event at screen coordinates (x, y)."""
+    if sys.platform.startswith("darwin"):
+        try:
+            import Quartz
+
+            ev = Quartz.CGEventCreateScrollWheelEvent(
+                None, Quartz.kCGScrollEventUnitLine, 1, int(delta_lines)
+            )
+            if ev is not None:
+                Quartz.CGEventSetLocation(ev, (float(x), float(y)))
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                return True
+        except Exception:
+            pass
+    if pyautogui is not None:
+        try:
+            pyautogui.scroll(int(delta_lines), x=int(x), y=int(y))
+            return True
+        except Exception:
+            pass
+    return False
 
 
 def _walk_ax_tree(
@@ -398,21 +448,50 @@ class DesktopDiscordProvider(DiscordViewProvider):
             raw={"errors": session.errors},
         )
 
-    def _extract_forum_directory_cards(
+    def _activate_discord_window(self) -> None:
+        if sys.platform.startswith("darwin"):
+            try:
+                subprocess.run(["open", "-a", "Discord"], check=False)
+                time.sleep(0.25)
+            except Exception:
+                pass
+            ax_win = self._get_ax_window()
+            if ax_win is not None:
+                try:
+                    import ApplicationServices as AS
+
+                    AS.AXUIElementPerformAction(ax_win, "AXRaise")
+                except Exception:
+                    pass
+
+    def _extract_post_cards_and_links(
         self,
         nodes: list[dict[str, Any]],
         guild_id: str,
         forum_id: str,
-    ) -> list[TopicObservation]:
-        topics: list[TopicObservation] = []
-        seen_tids: set[str] = set()
-        # 1. Extract visible forum post cards
+    ) -> tuple[list[TopicObservation], list[TopicObservation], Optional[Any]]:
+        """Extract visible forum post cards, secondary canonical links, and the scrollable AXList container."""
+        card_topics: list[TopicObservation] = []
+        link_topics: list[TopicObservation] = []
+        seen_cards: set[str] = set()
+        seen_links: set[str] = set()
+        card_list_elem: Optional[Any] = None
+
         for n in nodes:
             desc = n["description"] or ""
             if n["role"] == "AXButton" and desc.startswith("Post ") and desc != "Post Guidelines":
                 parent = _ax_attr(n["element"], "AXParent")
                 if parent is None:
                     continue
+                if card_list_elem is None:
+                    cur = parent
+                    for _ in range(8):
+                        cur = _ax_attr(cur, "AXParent")
+                        if cur is None:
+                            break
+                        if str(_ax_attr(cur, "AXRole") or "") == "AXList":
+                            card_list_elem = cur
+                            break
                 p_sub = _walk_ax_tree(parent, max_nodes=60, max_depth=6)
                 tid: Optional[str] = None
                 title = ""
@@ -422,9 +501,9 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         tid = m.group(1)
                     if s["role"] == "AXHeading" and s["title"] and not title:
                         title = s["title"].strip()
-                if tid and tid not in seen_tids:
-                    seen_tids.add(tid)
-                    topics.append(
+                if tid and tid not in seen_cards:
+                    seen_cards.add(tid)
+                    card_topics.append(
                         TopicObservation(
                             forum_id=forum_id,
                             thread_id=tid,
@@ -433,11 +512,10 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             starter_message_id=tid,
                             source_method="accessibility",
                             confidence=0.98,
-                            raw={"card_description": desc},
+                            raw={"card_description": desc, "from_directory_card": True},
                         )
                     )
 
-        # 2. Extract canonical thread links inside forum/guidance view (excluding channel sidebar)
         for n in nodes:
             if n["role"] != "AXLink":
                 continue
@@ -448,11 +526,11 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 parsed = parse_discord_channel_url(cand)
                 if parsed and parsed[0] == guild_id and parsed[1] != forum_id:
                     tid = parsed[1]
-                    if tid in seen_tids:
+                    if tid in seen_cards or tid in seen_links:
                         continue
-                    seen_tids.add(tid)
+                    seen_links.add(tid)
                     title = (n["description"] or n["title"] or n["value"] or f"Topic {tid}").strip()
-                    topics.append(
+                    link_topics.append(
                         TopicObservation(
                             forum_id=forum_id,
                             thread_id=tid,
@@ -463,7 +541,16 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             raw={"role": n["role"], "url": cand},
                         )
                     )
-        return topics
+        return card_topics, link_topics, card_list_elem
+
+    def _extract_forum_directory_cards(
+        self,
+        nodes: list[dict[str, Any]],
+        guild_id: str,
+        forum_id: str,
+    ) -> list[TopicObservation]:
+        cards, links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+        return cards + links
 
     def list_topics(
         self,
@@ -473,7 +560,6 @@ class DesktopDiscordProvider(DiscordViewProvider):
         limit: int = 50,
     ) -> TopicListObservation:
         session = self.describe_session()
-        topics: list[TopicObservation] = []
         if session.capabilities.get("can_read_semantic"):
             ax_win = self._get_ax_window()
             if ax_win is not None:
@@ -487,13 +573,126 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     self.navigate_to_url(build_discord_channel_url(guild_id, forum_id))
                     time.sleep(1.5)
                     ax_win = self._get_ax_window()
-                    if ax_win is not None:
+                    if ax_win is None:
+                        return TopicListObservation(
+                            topics=[],
+                            next_cursor=None,
+                            complete=False,
+                            errors=session.errors,
+                            source_method="unavailable",
+                        )
+                    nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
+
+                anchor_tid: Optional[str] = None
+                if cursor and cursor.startswith("dirscroll:"):
+                    anchor_tid = cursor.split(":", 1)[1].strip() or None
+
+                cards, links, list_elem = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                bounds = _ax_bounds(list_elem) if list_elem is not None else None
+                if bounds is not None:
+                    scroll_x = bounds[0] + (bounds[2] * 0.5)
+                    scroll_y = bounds[1] + (bounds[3] * 0.5)
+                elif session.window_bbox is not None:
+                    wx, wy, ww, wh = session.window_bbox
+                    scroll_x = wx + min(560.0, ww * 0.45)
+                    scroll_y = wy + min(500.0, wh * 0.55)
+                else:
+                    scroll_x, scroll_y = 560.0, 500.0
+
+                # Starting fresh from the top of the directory if user scrolled previously
+                if anchor_tid is None and cards and list_elem is not None:
+                    _scroll_at_point(scroll_x, scroll_y, 28)
+                    time.sleep(0.25)
+                    _scroll_at_point(scroll_x, scroll_y, 28)
+                    time.sleep(0.35)
+                    nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
+                    cards, links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+
+                collected_cards: dict[str, TopicObservation] = {}
+                collected_links: dict[str, TopicObservation] = {t.thread_id: t for t in links if t.thread_id}
+                past_anchor = anchor_tid is None
+                reached_bottom = False
+                stagnant_steps = 0
+                prev_last_tid: Optional[str] = None
+                max_steps = max(4, (max(1, limit) // 3) + 12)
+
+                for step in range(max_steps):
+                    if step > 0:
                         nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
-                topics = self._extract_forum_directory_cards(nodes, guild_id, forum_id)
+                        cards, step_links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                        for lt in step_links:
+                            if lt.thread_id and lt.thread_id not in collected_links:
+                                collected_links[lt.thread_id] = lt
+
+                    visible_tids = [c.thread_id for c in cards if c.thread_id]
+                    before_count = len(collected_cards)
+                    for c in cards:
+                        if not c.thread_id:
+                            continue
+                        if not past_anchor:
+                            if c.thread_id == anchor_tid:
+                                past_anchor = True
+                            continue
+                        if c.thread_id not in collected_cards:
+                            collected_cards[c.thread_id] = c
+
+                    last_visible = visible_tids[-1] if visible_tids else None
+                    if not past_anchor and anchor_tid and step >= 2 and not cards:
+                        # Anchor card not in active cards (e.g. only link topics present)
+                        past_anchor = True
+
+                    if len(collected_cards) >= limit:
+                        break
+
+                    if step > 0 and len(collected_cards) == before_count and last_visible == prev_last_tid:
+                        if not past_anchor and anchor_tid:
+                            # If seeking failed after reaching bottom/stagnation, avoid infinite loop
+                            stagnant_steps += 1
+                            if stagnant_steps >= 2:
+                                reached_bottom = True
+                                break
+                        else:
+                            stagnant_steps += 1
+                            if stagnant_steps >= 2:
+                                reached_bottom = True
+                                break
+                    else:
+                        stagnant_steps = 0
+                    prev_last_tid = last_visible
+
+                    if not _scroll_at_point(scroll_x, scroll_y, -18):
+                        break
+                    time.sleep(0.4)
+
+                ordered_out: list[TopicObservation] = list(collected_cards.values())
+                if reached_bottom and len(ordered_out) < limit:
+                    for tid, lt in collected_links.items():
+                        if tid not in collected_cards:
+                            ordered_out.append(lt)
+
+                if len(ordered_out) > limit:
+                    page_topics = ordered_out[:limit]
+                    last_tid = page_topics[-1].thread_id
+                    return TopicListObservation(
+                        topics=page_topics,
+                        next_cursor=f"dirscroll:{last_tid}" if last_tid else None,
+                        complete=False,
+                        source_method="accessibility",
+                    )
+
+                if reached_bottom:
+                    return TopicListObservation(
+                        topics=ordered_out,
+                        next_cursor=None,
+                        complete=True,
+                        source_method="accessibility",
+                    )
+
+                last_tid = ordered_out[-1].thread_id if ordered_out else anchor_tid
                 return TopicListObservation(
-                    topics=topics[:limit],
-                    next_cursor=None,
-                    complete=False,  # Directory view alone cannot prove archived/unscrolled completeness
+                    topics=ordered_out,
+                    next_cursor=f"dirscroll:{last_tid}" if (last_tid and len(ordered_out) >= limit) else None,
+                    complete=(len(ordered_out) == 0),
                     source_method="accessibility",
                 )
 
@@ -503,6 +702,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
             img = _capture_settled_region(list_box)
             if img is not None:
                 res = utils.ocr_image_structured(img, task="forum_title")
+                topics: list[TopicObservation] = []
                 for idx, line in enumerate(res.lines[:limit]):
                     topics.append(
                         TopicObservation(
@@ -531,6 +731,119 @@ class DesktopDiscordProvider(DiscordViewProvider):
             source_method="unavailable",
         )
 
+    def _parse_messages_from_ax_list(
+        self,
+        chosen_list: Any,
+        guild_id: str,
+        thread_id: str,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, MessageObservation]]:
+        """Extract visible messages, tags, and attachments from an AXList ('Messages in ...')."""
+        list_title = str(_ax_attr(chosen_list, "AXDescription") or "").replace("Messages in ", "", 1).strip()
+        children = _ax_attr(chosen_list, "AXChildren") or []
+        merged: dict[str, dict[str, Any]] = {}
+        topic_tags: list[dict[str, Any]] = []
+        last_author: Optional[str] = None
+
+        for ch in children:
+            ch_dom = str(_ax_attr(ch, "AXDOMIdentifier") or "")
+            m = re.match(r"^chat-messages-(\d+)-(\d+)$", ch_dom)
+            if not m or m.group(1) != thread_id:
+                continue
+            mid = m.group(2)
+            sub = _walk_ax_tree(ch, max_nodes=250, max_depth=12)
+
+            has_content_box = any(s["dom_id"] == f"message-content-{mid}" for s in sub)
+            has_accessories = any(s["dom_id"] == f"message-accessories-{mid}" for s in sub)
+            if not has_content_box and not has_accessories:
+                for s in sub:
+                    if s["role"] == "AXStaticText" and s["value"].strip():
+                        tname = s["value"].strip()
+                        if not any(t["name"] == tname for t in topic_tags):
+                            topic_tags.append({"tag_id": None, "name": tname})
+                continue
+
+            entry = merged.setdefault(
+                mid,
+                {
+                    "author": None,
+                    "body_parts": [],
+                    "timestamps": [],
+                    "edited": False,
+                    "links": [],
+                    "attachments": [],
+                },
+            )
+
+            seen_att_urls: set[str] = set()
+            for s in sub:
+                if s["dom_id"] == f"message-username-{mid}":
+                    u_sub = _walk_ax_tree(s["element"], max_nodes=25, max_depth=5)
+                    for u in u_sub:
+                        if u["role"] == "AXButton" and u["title"].strip():
+                            entry["author"] = u["title"].strip()
+                            last_author = entry["author"]
+                            break
+                elif s["dom_id"] == f"message-content-{mid}":
+                    c_sub = _walk_ax_tree(s["element"], max_nodes=180, max_depth=10)
+                    for c in c_sub:
+                        if c["role"] == "AXStaticText" and c["value"] == "edited":
+                            entry["edited"] = True
+                            continue
+                        if c["role"] in ("AXStaticText", "AXHeading"):
+                            val = (c["value"] or c["title"]).strip()
+                            if val and val not in ("(", ")"):
+                                entry["body_parts"].append(val)
+                        elif c["role"] == "AXLink" and c["url"]:
+                            entry["links"].append(c["url"])
+                elif s["dom_id"] == f"message-timestamp-{mid}":
+                    t_sub = _walk_ax_tree(s["element"], max_nodes=15, max_depth=4)
+                    for t in t_sub:
+                        if t["role"] == "AXStaticText" and t["value"].strip():
+                            entry["timestamps"].append(t["value"].strip())
+                elif s["dom_id"] == f"message-accessories-{mid}":
+                    a_sub = _walk_ax_tree(s["element"], max_nodes=120, max_depth=8)
+                    for a in a_sub:
+                        cand_url = a["url"] or ""
+                        if "cdn.discordapp.com/attachments/" in cand_url or "media.discordapp.net/attachments/" in cand_url:
+                            if cand_url not in seen_att_urls:
+                                seen_att_urls.add(cand_url)
+                                fname = cand_url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"
+                                entry["attachments"].append(
+                                    {
+                                        "attachment_id": None,
+                                        "name": fname,
+                                        "source_url": cand_url,
+                                        "sha256": None,
+                                        "local_ref": None,
+                                    }
+                                )
+
+            if entry["author"] is None and last_author:
+                entry["author"] = last_author
+
+        msgs_by_mid: dict[str, MessageObservation] = {}
+        for mid, ent in merged.items():
+            body = "\n".join(ent["body_parts"]).strip()
+            for link_url in ent["links"]:
+                if link_url and link_url not in body:
+                    body = f"{body}\n{link_url}".strip()
+            msgs_by_mid[mid] = MessageObservation(
+                thread_id=thread_id,
+                entity_ref=f"msg:{mid}",
+                message_id=mid,
+                author={"user_id": None, "label": ent["author"] or "Unknown"},
+                body=body,
+                source_url=build_discord_channel_url(guild_id, thread_id, mid),
+                identity_verified=False,
+                attachments=ent["attachments"],
+                recognition={"method": "accessibility", "confidence": 0.98},
+                explicit_edited_marker=bool(ent["edited"]),
+                source_method="accessibility",
+                confidence=0.98,
+                raw={"timestamps": ent["timestamps"], "links": ent["links"]},
+            )
+        return list_title, topic_tags, msgs_by_mid
+
     def read_topic(
         self,
         guild_id: str,
@@ -557,137 +870,139 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     self.navigate_to_url(url)
                     time.sleep(1.8)
                     ax_win = self._get_ax_window()
-                    if ax_win is not None:
-                        nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+                    if ax_win is None:
+                        return TopicHistoryObservation(
+                            topic=topic,
+                            messages=[],
+                            next_cursor=None,
+                            complete=False,
+                            errors=session.errors,
+                        )
+                    nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
 
-                msg_lists = [
-                    n for n in nodes
-                    if n["role"] == "AXList" and (n["description"] or "").startswith("Messages in ")
-                ]
-                chosen_list = None
-                for ml in msg_lists:
-                    children = _ax_attr(ml["element"], "AXChildren") or []
-                    if any(str(_ax_attr(c, "AXDOMIdentifier") or "").startswith(target_prefix) for c in children):
-                        chosen_list = ml
-                        break
-                if chosen_list is None and msg_lists:
-                    chosen_list = msg_lists[0]
+                def _find_msg_list(cur_nodes: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+                    msg_lists = [
+                        n for n in cur_nodes
+                        if n["role"] == "AXList" and (n["description"] or "").startswith("Messages in ")
+                    ]
+                    for ml in msg_lists:
+                        children = _ax_attr(ml["element"], "AXChildren") or []
+                        if any(str(_ax_attr(c, "AXDOMIdentifier") or "").startswith(target_prefix) for c in children):
+                            return ml
+                    return msg_lists[0] if msg_lists else None
 
+                chosen_list = _find_msg_list(nodes)
                 locked = any(
                     "you do not have permission to send messages" in (n["description"] or "").lower()
                     for n in nodes
                 )
 
-                msgs: list[MessageObservation] = []
-                topic_tags: list[dict[str, Any]] = []
-                if chosen_list is not None:
-                    list_title = (chosen_list["description"] or "").replace("Messages in ", "", 1).strip()
-                    children = _ax_attr(chosen_list["element"], "AXChildren") or []
-                    merged: dict[str, dict[str, Any]] = {}
-                    order: list[str] = []
-                    last_author: Optional[str] = None
-
-                    for ch in children:
-                        ch_dom = str(_ax_attr(ch, "AXDOMIdentifier") or "")
-                        m = re.match(r"^chat-messages-(\d+)-(\d+)$", ch_dom)
-                        if not m or m.group(1) != thread_id:
-                            continue
-                        mid = m.group(2)
-                        sub = _walk_ax_tree(ch, max_nodes=250, max_depth=12)
-
-                        has_content_box = any(s["dom_id"] == f"message-content-{mid}" for s in sub)
-                        if not has_content_box:
-                            # Starter tag pills share chat-messages-{tid}-{tid} before the starter message node
-                            for s in sub:
-                                if s["role"] == "AXStaticText" and s["value"].strip():
-                                    tname = s["value"].strip()
-                                    if not any(t["name"] == tname for t in topic_tags):
-                                        topic_tags.append({"tag_id": None, "name": tname})
-                            continue
-
-                        entry = merged.setdefault(
-                            mid,
-                            {
-                                "author": None,
-                                "body_parts": [],
-                                "timestamps": [],
-                                "edited": False,
-                                "links": [],
-                            },
-                        )
-                        if mid not in order:
-                            order.append(mid)
-
-                        for s in sub:
-                            if s["dom_id"] == f"message-username-{mid}":
-                                u_sub = _walk_ax_tree(s["element"], max_nodes=25, max_depth=5)
-                                for u in u_sub:
-                                    if u["role"] == "AXButton" and u["title"].strip():
-                                        entry["author"] = u["title"].strip()
-                                        last_author = entry["author"]
-                                        break
-                            elif s["dom_id"] == f"message-content-{mid}":
-                                c_sub = _walk_ax_tree(s["element"], max_nodes=180, max_depth=10)
-                                for c in c_sub:
-                                    if c["role"] == "AXStaticText" and c["value"] == "edited":
-                                        entry["edited"] = True
-                                        continue
-                                    if c["role"] in ("AXStaticText", "AXHeading"):
-                                        val = (c["value"] or c["title"]).strip()
-                                        if val and val not in ("(", ")"):
-                                            entry["body_parts"].append(val)
-                                    elif c["role"] == "AXLink" and c["url"]:
-                                        entry["links"].append(c["url"])
-                            elif s["dom_id"] == f"message-timestamp-{mid}":
-                                t_sub = _walk_ax_tree(s["element"], max_nodes=15, max_depth=4)
-                                for t in t_sub:
-                                    if t["role"] == "AXStaticText" and t["value"].strip():
-                                        entry["timestamps"].append(t["value"].strip())
-
-                        if entry["author"] is None and last_author:
-                            entry["author"] = last_author
-
-                    topic = TopicObservation(
-                        forum_id=forum_id,
-                        thread_id=thread_id,
-                        title=list_title or f"Topic {thread_id}",
-                        source_url=url,
-                        tags=topic_tags,
-                        starter_message_id=order[0] if order else None,
-                        locked=locked,
-                        source_method="accessibility",
-                        confidence=0.98,
-                        raw={"visible_message_count": len(order)},
+                if chosen_list is None:
+                    return TopicHistoryObservation(
+                        topic=topic,
+                        messages=[],
+                        next_cursor=None,
+                        complete=False,
                     )
 
-                    for mid in order:
-                        ent = merged[mid]
-                        body = "\n".join(ent["body_parts"]).strip()
-                        for link_url in ent["links"]:
-                            if link_url and link_url not in body:
-                                body = f"{body}\n{link_url}".strip()
-                        msgs.append(
-                            MessageObservation(
-                                thread_id=thread_id,
-                                entity_ref=f"msg:{mid}",
-                                message_id=mid,
-                                author={"user_id": None, "label": ent["author"] or "Unknown"},
-                                body=body,
-                                source_url=build_discord_channel_url(guild_id, thread_id, mid),
-                                identity_verified=False,
-                                recognition={"method": "accessibility", "confidence": 0.98},
-                                explicit_edited_marker=bool(ent["edited"]),
-                                source_method="accessibility",
-                                confidence=0.98,
-                                raw={"timestamps": ent["timestamps"], "links": ent["links"]},
-                            )
-                        )
+                bounds = _ax_bounds(chosen_list["element"])
+                if bounds is not None:
+                    scroll_x = bounds[0] + (bounds[2] * 0.5)
+                    scroll_y = bounds[1] + (bounds[3] * 0.5)
+                elif session.window_bbox is not None:
+                    wx, wy, ww, wh = session.window_bbox
+                    scroll_x = wx + (ww * 0.65)
+                    scroll_y = wy + (wh * 0.55)
+                else:
+                    scroll_x, scroll_y = 700.0, 500.0
+
+                merged_msgs: dict[str, MessageObservation] = {}
+                all_tags: list[dict[str, Any]] = []
+                seen_tag_names: set[str] = set()
+                list_title = ""
+
+                def _ingest_current_list(ml_elem: Any) -> list[str]:
+                    nonlocal list_title
+                    t_title, t_tags, batch = self._parse_messages_from_ax_list(ml_elem, guild_id, thread_id)
+                    if t_title:
+                        list_title = t_title
+                    for tg in t_tags:
+                        if tg["name"] not in seen_tag_names:
+                            seen_tag_names.add(tg["name"])
+                            all_tags.append(tg)
+                    for mid, obs in batch.items():
+                        merged_msgs[mid] = obs
+                    return sorted(batch.keys(), key=lambda x: int(x))
+
+                cur_mids = _ingest_current_list(chosen_list["element"])
+                top_reached = thread_id in merged_msgs
+                stagnant_up = 0
+                prev_oldest: Optional[int] = int(cur_mids[0]) if cur_mids else None
+                scrolled_up = False
+
+                max_up_steps = 6
+                for _step in range(max_up_steps):
+                    if top_reached:
+                        break
+                    if not _scroll_at_point(scroll_x, scroll_y, 20):
+                        break
+                    scrolled_up = True
+                    time.sleep(0.4)
+                    step_nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+                    ml_now = _find_msg_list(step_nodes)
+                    if ml_now is None:
+                        break
+                    step_mids = _ingest_current_list(ml_now["element"])
+                    cur_oldest = int(step_mids[0]) if step_mids else None
+                    if thread_id in merged_msgs:
+                        top_reached = True
+                        break
+                    if cur_oldest is not None and prev_oldest is not None and cur_oldest >= prev_oldest:
+                        stagnant_up += 1
+                        if stagnant_up >= 2:
+                            top_reached = True
+                            break
+                    else:
+                        stagnant_up = 0
+                    if cur_oldest is not None:
+                        prev_oldest = cur_oldest if prev_oldest is None else min(prev_oldest, cur_oldest)
+
+                # Return to bottom if we scrolled up so newest messages aren't missed
+                if scrolled_up:
+                    _scroll_at_point(scroll_x, scroll_y, -35)
+                    time.sleep(0.25)
+                    _scroll_at_point(scroll_x, scroll_y, -35)
+                    time.sleep(0.3)
+                    end_nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+                    ml_end = _find_msg_list(end_nodes)
+                    if ml_end is not None:
+                        _ingest_current_list(ml_end["element"])
+
+                ordered_mids = sorted(merged_msgs.keys(), key=lambda x: int(x))
+                ordered_msgs = [merged_msgs[m] for m in ordered_mids]
+                if cursor and cursor.startswith("msgscroll:up:"):
+                    pass  # Full chronological merge covers all newly reached older slices
+
+                topic = TopicObservation(
+                    forum_id=forum_id,
+                    thread_id=thread_id,
+                    title=list_title or f"Topic {thread_id}",
+                    source_url=url,
+                    tags=all_tags,
+                    starter_message_id=(
+                        thread_id if thread_id in merged_msgs else (ordered_mids[0] if ordered_mids else None)
+                    ),
+                    locked=locked,
+                    source_method="accessibility",
+                    confidence=0.98,
+                    raw={"visible_message_count": len(ordered_msgs), "top_reached": top_reached},
+                )
 
                 return TopicHistoryObservation(
                     topic=topic,
-                    messages=msgs,
-                    next_cursor=None,
-                    complete=False,
+                    messages=ordered_msgs,
+                    next_cursor=None if top_reached or not ordered_mids else f"msgscroll:up:{ordered_mids[0]}",
+                    complete=bool(top_reached),
                 )
 
         return TopicHistoryObservation(
@@ -755,17 +1070,346 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     )
         return reqs
 
+    @staticmethod
+    def _normalize_composer_text(raw: Optional[str]) -> str:
+        cleaned = (raw or "").replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+        if cleaned == "\n":
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _composer_text_matches(expected: str, observed: str) -> bool:
+        exp_norm = (expected or "").replace("\r\n", "\n").replace("\r", "\n")
+        obs_norm = DesktopDiscordProvider._normalize_composer_text(observed)
+        if obs_norm == exp_norm:
+            return True
+        if not exp_norm.endswith("\n") and obs_norm == exp_norm + "\n":
+            return True
+        return False
+
     def _inspect_composer(self, ax_win: Any) -> tuple[Optional[Any], str]:
         nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+        fallback: Optional[tuple[Any, str]] = None
         for n in nodes:
             if n["role"] in ("AXTextArea", "AXTextField"):
                 desc = (n["description"] + " " + n["title"]).lower()
+                if "search" in desc or "title" in desc:
+                    continue
+                if "send a message" in desc or "message " in desc or "message#" in desc or "reply" in desc:
+                    return n["element"], self._normalize_composer_text(n["value"])
+                if "message" in desc or "post" in desc or "thread" in desc:
+                    if fallback is None:
+                        fallback = (n["element"], self._normalize_composer_text(n["value"]))
+        if fallback is not None:
+            return fallback
+        return None, ""
+
+    def _inspect_title_input(self, ax_win: Any) -> tuple[Optional[Any], str]:
+        nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+        for n in nodes:
+            if n["role"] in ("AXTextField", "AXTextArea"):
+                desc = (n["description"] + " " + n["title"]).lower()
                 if "search" in desc:
                     continue
-                if "message" in desc or "reply" in desc or "post" in desc or "thread" in desc:
-                    cleaned = (n["value"] or "").replace("\ufeff", "")
-                    return n["element"], cleaned
+                if "title" in desc or "post title" in desc:
+                    return n["element"], self._normalize_composer_text(n["value"])
         return None, ""
+
+    def _inspect_staged_attachments(
+        self,
+        ax_win: Any,
+        composer_elem: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
+        """Inspect attachment preview items currently staged in Discord's composer."""
+        comp_bounds = _ax_bounds(composer_elem) if composer_elem is not None else None
+        # Narrow scan to composer ancestor container (excluding chat message history) when possible
+        scan_root = ax_win
+        if composer_elem is not None:
+            cur = composer_elem
+            for _ in range(6):
+                parent = _ax_attr(cur, "AXParent")
+                if parent is None:
+                    break
+                p_bounds = _ax_bounds(parent)
+                if p_bounds is not None and comp_bounds is not None:
+                    # Stay tightly scoped around composer tray (avoid scanning full scroller)
+                    if p_bounds[3] > 500 or p_bounds[1] < max(0, comp_bounds[1] - 340):
+                        break
+                scan_root = parent
+                cur = parent
+
+        nodes = _walk_ax_tree(scan_root, max_nodes=1800, max_depth=24)
+        items: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for n in nodes:
+            dom_id = n["dom_id"] or ""
+            if dom_id.startswith("message-content-") or dom_id.startswith("chat-messages-"):
+                continue
+            bounds = _ax_bounds(n["element"])
+            if comp_bounds is not None and bounds is not None:
+                # Staged attachments sit immediately above/within composer band
+                if bounds[1] + bounds[3] < comp_bounds[1] - 340 or bounds[1] > comp_bounds[1] + comp_bounds[3] + 40:
+                    continue
+                if bounds[0] + bounds[2] < comp_bounds[0] - 140:
+                    continue
+            text = " ".join(
+                part.strip()
+                for part in (n["title"], n["description"], n["value"])
+                if part and part.strip()
+            )
+            if not text and "upload" not in dom_id.lower() and "attach" not in dom_id.lower():
+                continue
+            lower = text.lower()
+            is_remove_btn = n["role"] == "AXButton" and (
+                "remove attachment" in lower or "remove file" in lower
+            )
+            looks_like_file = bool(
+                re.search(r"[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}\b", text)
+            )
+            if is_remove_btn or looks_like_file or "upload" in dom_id.lower() or "attach" in dom_id.lower():
+                b_key = f"{round(bounds[0])},{round(bounds[1])}" if bounds is not None else str(len(items))
+                key = f"{n['role']}:{text}:{dom_id}:{b_key}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    items.append(
+                        {
+                            "role": n["role"],
+                            "text": text,
+                            "dom_id": dom_id,
+                            "bounds": bounds,
+                            "element": n["element"],
+                            "is_remove_button": is_remove_btn,
+                        }
+                    )
+        return items
+
+    @staticmethod
+    def _count_staged_attachment_slots(staged_items: list[dict[str, Any]]) -> int:
+        remove_btns = [i for i in staged_items if i.get("is_remove_button")]
+        if remove_btns:
+            return len(remove_btns)
+        return len(staged_items)
+
+    @staticmethod
+    def _attachment_preview_contains(staged_items: list[dict[str, Any]], filename: str) -> bool:
+        target = filename.strip().lower()
+        stem = Path(filename).stem.lower()
+        for item in staged_items:
+            txt = (item.get("text") or "").lower()
+            if target and target in txt:
+                return True
+            if stem and len(stem) >= 4 and stem in txt and ("remove attachment" in txt or "upload" in (item.get("dom_id") or "").lower()):
+                return True
+        return False
+
+    def _focus_element(self, elem: Any) -> bool:
+        self._activate_discord_window()
+        focused = False
+        try:
+            from ApplicationServices import AXUIElementSetAttributeValue, kAXFocusedAttribute  # type: ignore
+
+            err = AXUIElementSetAttributeValue(elem, kAXFocusedAttribute, True)
+            if err == 0:
+                focused = True
+        except Exception:
+            pass
+        bounds = _ax_bounds(elem)
+        if bounds is not None and pyautogui is not None:
+            cx = int(bounds[0] + max(12.0, min(bounds[2] * 0.5, 160.0)))
+            cy = int(bounds[1] + bounds[3] * 0.5)
+            try:
+                pyautogui.click(cx, cy)
+                time.sleep(0.15)
+                focused = True
+            except Exception:
+                pass
+        return focused
+
+    def _find_ax_sheet_open(self, ax_win: Any) -> Optional[Any]:
+        nodes = _walk_ax_tree(ax_win, max_nodes=800, max_depth=12)
+        for n in nodes:
+            if n["role"] == "AXSheet":
+                return n["element"]
+        return None
+
+    def _stage_single_attachment(
+        self,
+        ax_win: Any,
+        composer_elem: Any,
+        file_path: Path,
+        filename: str,
+    ) -> bool:
+        """Stage a single local file into the composer without ever pressing Send."""
+        import subprocess
+
+        resolved_str = str(file_path.resolve())
+        paste_mod = "command" if sys.platform.startswith("darwin") else "ctrl"
+        baseline_win = self._get_ax_window() or ax_win
+        baseline_comp, _ = self._inspect_composer(baseline_win)
+        baseline_slots = self._count_staged_attachment_slots(
+            self._inspect_staged_attachments(baseline_win, baseline_comp or composer_elem)
+        )
+
+        # Primary macOS strategy: POSIX file reference on clipboard + Cmd+V into focused composer
+        if sys.platform.startswith("darwin") and pyautogui is not None:
+            try:
+                escaped = resolved_str.replace("\\", "\\\\").replace('"', '\\"')
+                script = f'set the clipboard to POSIX file "{escaped}"'
+                subprocess.run(["osascript", "-e", script], check=True, timeout=5.0)
+                self._focus_element(composer_elem)
+                pyautogui.hotkey(paste_mod, "v")
+                deadline = time.monotonic() + 2.8
+                while time.monotonic() < deadline:
+                    time.sleep(0.35)
+                    cur_win = self._get_ax_window() or ax_win
+                    cur_comp, _ = self._inspect_composer(cur_win)
+                    items = self._inspect_staged_attachments(cur_win, cur_comp or composer_elem)
+                    if (
+                        self._attachment_preview_contains(items, filename)
+                        or self._count_staged_attachment_slots(items) > baseline_slots
+                    ):
+                        return True
+            except Exception:
+                pass
+
+        # Fallback strategy: open "More message options" -> "Upload a File" -> macOS AXSheet Go-To-Folder
+        if sys.platform.startswith("darwin") and pyautogui is not None and pyperclip is not None:
+            try:
+                cur_win = self._get_ax_window() or ax_win
+                nodes = _walk_ax_tree(cur_win, max_nodes=2500, max_depth=24)
+                more_btn = next(
+                    (
+                        n["element"]
+                        for n in nodes
+                        if n["role"] in ("AXPopUpButton", "AXButton")
+                        and "more message options" in (n["description"] + " " + n["title"]).lower()
+                    ),
+                    None,
+                )
+                if more_btn is not None:
+                    self._focus_element(more_btn)
+                    time.sleep(0.35)
+                    menu_win = self._get_ax_window() or cur_win
+                    menu_nodes = _walk_ax_tree(menu_win, max_nodes=1200, max_depth=16)
+                    upload_btn = next(
+                        (
+                            n["element"]
+                            for n in menu_nodes
+                            if n["role"] in ("AXMenuItem", "AXButton")
+                            and "upload a file" in (n["description"] + " " + n["title"]).lower()
+                        ),
+                        None,
+                    )
+                    if upload_btn is not None:
+                        self._focus_element(upload_btn)
+                        time.sleep(0.5)
+                        sheet = None
+                        for _ in range(6):
+                            sheet = self._find_ax_sheet_open(self._get_ax_window() or cur_win)
+                            if sheet is not None:
+                                break
+                            time.sleep(0.25)
+                        if sheet is not None:
+                            pyautogui.hotkey("command", "shift", "g")
+                            time.sleep(0.45)
+                            pyperclip.copy(resolved_str)
+                            pyautogui.hotkey("command", "v")
+                            time.sleep(0.25)
+                            # Confirm ONLY the Go-To-Folder dialog sheet (never Discord Send)
+                            pyautogui.press("return")
+                            time.sleep(0.45)
+                            sheet_nodes = _walk_ax_tree(sheet, max_nodes=400, max_depth=12)
+                            open_btn = next(
+                                (
+                                    n["element"]
+                                    for n in sheet_nodes
+                                    if n["role"] == "AXButton"
+                                    and (n["title"] or n["description"]).strip().lower() == "open"
+                                ),
+                                None,
+                            )
+                            if open_btn is not None:
+                                try:
+                                    from ApplicationServices import AXUIElementPerformAction, kAXPressAction  # type: ignore
+
+                                    AXUIElementPerformAction(open_btn, kAXPressAction)
+                                except Exception:
+                                    b = _ax_bounds(open_btn)
+                                    if b is not None:
+                                        pyautogui.click(b[0] + b[2] * 0.5, b[1] + b[3] * 0.5)
+                            deadline = time.monotonic() + 3.0
+                            while time.monotonic() < deadline:
+                                time.sleep(0.35)
+                                latest_win = self._get_ax_window() or cur_win
+                                latest_comp, _ = self._inspect_composer(latest_win)
+                                items = self._inspect_staged_attachments(latest_win, latest_comp or composer_elem)
+                                if (
+                                    self._attachment_preview_contains(items, filename)
+                                    or self._count_staged_attachment_slots(items) > baseline_slots
+                                ):
+                                    return True
+            except Exception:
+                pass
+        return False
+
+    def clear_staged_composer(self) -> bool:
+        """Clear staged composer text and attachment previews locally without ever pressing Send."""
+        ax_win = self._get_ax_window()
+        if ax_win is None or pyautogui is None:
+            return False
+        mod = "command" if sys.platform.startswith("darwin") else "ctrl"
+        # First clear staged attachment pills via their Remove attachment buttons
+        for _ in range(12):
+            cur_win = self._get_ax_window() or ax_win
+            comp_elem, _ = self._inspect_composer(cur_win)
+            items = self._inspect_staged_attachments(cur_win, comp_elem)
+            rem_item = next((i for i in items if i.get("is_remove_button")), None)
+            if rem_item is None:
+                break
+            b = rem_item.get("bounds") or _ax_bounds(rem_item["element"])
+            if b is not None:
+                self._activate_discord_window()
+                time.sleep(0.1)
+                pyautogui.click(int(b[0] + b[2] * 0.5), int(b[1] + b[3] * 0.5))
+            else:
+                try:
+                    from ApplicationServices import AXUIElementPerformAction, kAXPressAction  # type: ignore
+
+                    AXUIElementPerformAction(rem_item["element"], kAXPressAction)
+                except Exception:
+                    break
+            time.sleep(0.25)
+
+        cur_win = self._get_ax_window() or ax_win
+        comp_elem, existing = self._inspect_composer(cur_win)
+        if comp_elem is not None and existing:
+            self._focus_element(comp_elem)
+            pyautogui.hotkey(mod, "a")
+            time.sleep(0.1)
+            pyautogui.press("backspace")
+            time.sleep(0.2)
+
+        final_win = self._get_ax_window() or ax_win
+        final_comp, final_text = self._inspect_composer(final_win)
+        final_atts = self._inspect_staged_attachments(final_win, final_comp)
+        return not final_text.strip() and not final_atts
+
+    @staticmethod
+    def _actor_mismatch_reason(
+        expected_actor: Optional[dict[str, Any]],
+        observed_actor: dict[str, Any],
+    ) -> Optional[str]:
+        if not expected_actor:
+            return None
+        exp_uid = expected_actor.get("user_id")
+        obs_uid = observed_actor.get("user_id")
+        exp_lbl = (expected_actor.get("label") or "").strip().lower()
+        obs_lbl = (observed_actor.get("label") or "").strip().lower()
+        if exp_uid and obs_uid and exp_uid != obs_uid:
+            return f"account_mismatch: expected user_id={exp_uid}, observed={obs_uid}"
+        if exp_lbl and obs_lbl and obs_lbl != "unverified desktop session" and exp_lbl != obs_lbl:
+            return f"account_mismatch: expected label={expected_actor.get('label')!r}, observed={observed_actor.get('label')!r}"
+        return None
 
     def stage_draft(
         self,
@@ -785,27 +1429,16 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason="; ".join(e["code"] for e in session.errors),
             )
 
-        if expected_actor:
-            exp_uid = expected_actor.get("user_id")
-            obs_uid = session.actor.get("user_id")
-            exp_lbl = (expected_actor.get("label") or "").strip().lower()
-            obs_lbl = (session.actor.get("label") or "").strip().lower()
-            if exp_uid and obs_uid and exp_uid != obs_uid:
-                return ComposerStageObservation(
-                    status="needs_review",
-                    observed_actor=session.actor,
-                    destination=dest,
-                    reason=f"account_mismatch: expected user_id={exp_uid}, observed={obs_uid}",
-                )
-            if exp_lbl and obs_lbl and obs_lbl != "unverified desktop session" and exp_lbl != obs_lbl:
-                return ComposerStageObservation(
-                    status="needs_review",
-                    observed_actor=session.actor,
-                    destination=dest,
-                    reason=f"account_mismatch: expected label={expected_actor.get('label')!r}, observed={session.actor.get('label')!r}",
-                )
+        actor_err = self._actor_mismatch_reason(expected_actor, session.actor)
+        if actor_err:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=session.actor,
+                destination=dest,
+                reason=actor_err,
+            )
 
-        target_id = dest["thread_id"] or dest["forum_id"]
+        target_id = dest.get("thread_id") or dest["forum_id"]
         target_url = dest.get("source_url") or build_discord_channel_url(dest["guild_id"], target_id)
         if not self.navigate_to_url(target_url):
             return ComposerStageObservation(
@@ -815,28 +1448,78 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason="navigation_failed",
             )
 
-        ax_win = self._get_ax_window()
+        # Allow client route transition to settle before verifying destination/account/composer
+        ax_win = None
+        composer_elem = None
+        existing_text = ""
+        for _ in range(4):
+            time.sleep(0.3)
+            ax_win = self._get_ax_window()
+            if ax_win is not None:
+                composer_elem, existing_text = self._inspect_composer(ax_win)
+                if composer_elem is not None:
+                    break
+
+        post_session = self.describe_session()
+        post_actor_err = self._actor_mismatch_reason(expected_actor, post_session.actor)
+        if post_actor_err:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=post_session.actor,
+                destination=dest,
+                reason=post_actor_err,
+            )
+
+        if post_session.current_url:
+            parsed_url = re.search(r"/channels/(\d+)/(\d+)", post_session.current_url)
+            if parsed_url:
+                obs_guild, obs_chan = parsed_url.group(1), parsed_url.group(2)
+                if obs_guild != dest["guild_id"] or obs_chan != target_id:
+                    return ComposerStageObservation(
+                        status="needs_review",
+                        observed_actor=post_session.actor,
+                        destination=dest,
+                        reason=f"destination_url_mismatch: expected={target_url}, observed={post_session.current_url}",
+                    )
+
         if ax_win is None:
             return ComposerStageObservation(
                 status="needs_review",
-                observed_actor=session.actor,
+                observed_actor=post_session.actor,
                 destination=dest,
                 reason="ax_untrusted_cannot_verify_composer",
             )
 
-        composer_elem, existing_text = self._inspect_composer(ax_win)
+        if draft_request.get("action") == "create_topic" and composer_elem is None:
+            nodes = _walk_ax_tree(ax_win, max_nodes=2500, max_depth=24)
+            new_post_btn = next(
+                (
+                    n["element"]
+                    for n in nodes
+                    if n["role"] == "AXButton"
+                    and "new post" in (n["title"] + " " + n["description"]).lower()
+                ),
+                None,
+            )
+            if new_post_btn is not None:
+                self._focus_element(new_post_btn)
+                time.sleep(0.4)
+                ax_win = self._get_ax_window() or ax_win
+                composer_elem, existing_text = self._inspect_composer(ax_win)
+
         if composer_elem is None:
             return ComposerStageObservation(
                 status="needs_review",
-                observed_actor=session.actor,
+                observed_actor=post_session.actor,
                 destination=dest,
                 reason="composer_unavailable_or_locked",
             )
 
-        if existing_text.strip():
+        baseline_attachments = self._inspect_staged_attachments(ax_win, composer_elem)
+        if existing_text.strip() or baseline_attachments:
             return ComposerStageObservation(
                 status="needs_review",
-                observed_actor=session.actor,
+                observed_actor=post_session.actor,
                 destination=dest,
                 observed_composer_text=existing_text,
                 reason="existing_human_draft_present",
@@ -845,56 +1528,301 @@ class DesktopDiscordProvider(DiscordViewProvider):
         if pyperclip is None or pyautogui is None:
             return ComposerStageObservation(
                 status="failed",
-                observed_actor=session.actor,
+                observed_actor=post_session.actor,
                 destination=dest,
                 reason="clipboard_or_pyautogui_unavailable",
             )
 
-        # Stage complete multiline text via clipboard paste (never Send / Return)
-        pyperclip.copy(draft_request["body"])
+        prior_clipboard: Optional[str] = None
+        try:
+            prior_clipboard = pyperclip.paste()
+        except Exception:
+            prior_clipboard = None
+
         paste_mod = "command" if sys.platform.startswith("darwin") else "ctrl"
-        pyautogui.hotkey(paste_mod, "v")
-        time.sleep(0.35)
+        verified_text = ""
+        staged_ids: list[str] = []
+        try:
+            if draft_request.get("action") == "create_topic" and draft_request.get("title"):
+                title_elem, title_existing = self._inspect_title_input(ax_win)
+                if title_elem is not None and not title_existing.strip():
+                    self._focus_element(title_elem)
+                    pyperclip.copy(draft_request["title"])
+                    pyautogui.hotkey(paste_mod, "v")
+                    time.sleep(0.2)
 
-        _, verified_text = self._inspect_composer(ax_win)
-        if draft_request["body"].strip() not in verified_text:
-            return ComposerStageObservation(
-                status="needs_review",
-                observed_actor=session.actor,
-                destination=dest,
-                observed_composer_text=verified_text,
-                reason="composer_text_verification_mismatch",
-            )
+            # Focus body composer explicitly and paste exact multiline Unicode text (NEVER press Return/Send)
+            self._focus_element(composer_elem)
+            pyperclip.copy(draft_request["body"])
+            pyautogui.hotkey(paste_mod, "v")
+            time.sleep(0.35)
 
-        # NOTE: File attachment upload via OS picker is only invoked when explicitly verified in an interactive session;
-        # never fabricate staged attachments if upload preview cannot be confirmed.
-        staged_ids = []
-        if resolved_evidence:
+            latest_win = self._get_ax_window() or ax_win
+            latest_comp, verified_text = self._inspect_composer(latest_win)
+            if not self._composer_text_matches(draft_request["body"], verified_text):
+                return ComposerStageObservation(
+                    status="needs_review",
+                    observed_actor=post_session.actor,
+                    destination=dest,
+                    observed_composer_text=verified_text,
+                    reason="composer_text_verification_mismatch",
+                )
+
+            for ev in resolved_evidence:
+                ev_id = ev["evidence_id"]
+                ev_name = ev["name"]
+                ev_path = Path(ev.get("resolved_path") or "")
+                if not ev_path.is_file():
+                    return ComposerStageObservation(
+                        status="needs_review",
+                        observed_actor=post_session.actor,
+                        destination=dest,
+                        observed_composer_text=verified_text,
+                        staged_evidence_ids=staged_ids,
+                        reason=f"missing_resolved_attachment:{ev_id}",
+                    )
+                cur_win = self._get_ax_window() or latest_win
+                cur_comp, _ = self._inspect_composer(cur_win)
+                ok = self._stage_single_attachment(cur_win, cur_comp or latest_comp or composer_elem, ev_path, ev_name)
+                if not ok:
+                    return ComposerStageObservation(
+                        status="needs_review",
+                        observed_actor=post_session.actor,
+                        destination=dest,
+                        observed_composer_text=verified_text,
+                        staged_evidence_ids=staged_ids,
+                        reason=f"attachment_preview_unverified:{ev_name}",
+                    )
+                staged_ids.append(ev_id)
+
+            # Re-verify composer text once more after attachments finish mounting
+            final_win = self._get_ax_window() or latest_win
+            _, verified_text = self._inspect_composer(final_win)
+            if not self._composer_text_matches(draft_request["body"], verified_text):
+                return ComposerStageObservation(
+                    status="needs_review",
+                    observed_actor=post_session.actor,
+                    destination=dest,
+                    observed_composer_text=verified_text,
+                    staged_evidence_ids=staged_ids,
+                    reason="composer_text_changed_after_attachments",
+                )
+
             return ComposerStageObservation(
-                status="needs_review",
-                observed_actor=session.actor,
+                status="staged",
+                observed_actor=post_session.actor,
                 destination=dest,
                 observed_composer_text=verified_text,
                 staged_evidence_ids=staged_ids,
-                reason="attachment_preview_verification_requires_interactive_upload",
             )
+        finally:
+            if prior_clipboard is not None:
+                try:
+                    pyperclip.copy(prior_clipboard)
+                except Exception:
+                    pass
 
-        return ComposerStageObservation(
-            status="staged",
-            observed_actor=session.actor,
-            destination=dest,
-            observed_composer_text=verified_text,
-            staged_evidence_ids=staged_ids,
-        )
+    @staticmethod
+    def _actors_compatible(actor_a: Optional[dict[str, Any]], actor_b: Optional[dict[str, Any]]) -> bool:
+        if not actor_a or not actor_b:
+            return True
+        uid_a = actor_a.get("user_id")
+        uid_b = actor_b.get("user_id")
+        if uid_a and uid_b:
+            return uid_a == uid_b
+        lbl_a = (actor_a.get("label") or "").strip().lower()
+        lbl_b = (actor_b.get("label") or "").strip().lower()
+        if not lbl_a or not lbl_b or lbl_a == "unverified desktop session" or lbl_b == "unverified desktop session":
+            return True
+        return lbl_a == lbl_b or lbl_a in lbl_b or lbl_b in lbl_a
+
+    @staticmethod
+    def _score_submission_match(
+        draft_body: str,
+        observed_body: str,
+        expected_filenames: list[str],
+        observed_attachments: list[dict[str, Any]],
+    ) -> float:
+        import difflib
+        from ..models import normalize_text_for_hash
+
+        norm_d = normalize_text_for_hash(draft_body or "")
+        norm_o = normalize_text_for_hash(observed_body or "")
+        if not norm_d and not expected_filenames:
+            return 0.0
+        if norm_d and norm_o == norm_d:
+            base = 1.0
+        else:
+            seq = difflib.SequenceMatcher(None, norm_d, norm_o).ratio() if (norm_d and norm_o) else 0.0
+            tokens_d = {w for w in re.findall(r"[A-Za-z0-9_]+", norm_d.lower()) if len(w) >= 2}
+            tokens_o = {w for w in re.findall(r"[A-Za-z0-9_]+", norm_o.lower()) if len(w) >= 2}
+            jac = (len(tokens_d & tokens_o) / len(tokens_d | tokens_o)) if (tokens_d and tokens_o) else 0.0
+            base = max(seq, 0.55 * seq + 0.45 * jac)
+
+        if expected_filenames:
+            obs_att_text = " ".join(
+                f"{a.get('name', '')} {a.get('url', '')}" for a in observed_attachments
+            ).lower()
+            matched_files = sum(
+                1 for fn in expected_filenames if fn.lower() in obs_att_text or Path(fn).stem.lower() in obs_att_text
+            )
+            file_score = matched_files / len(expected_filenames)
+            base = min(1.0, base + 0.25 * file_score)
+        return base
 
     def observe_submission(
         self,
         draft_request: dict[str, Any],
         receipt: dict[str, Any],
     ) -> SubmissionObservation:
+        """Read-only observation of whether a staged draft was submitted (possibly edited by user)."""
         session = self.describe_session()
+        if session.errors and not (
+            session.capabilities.get("can_read_semantic") or session.capabilities.get("can_read_ocr")
+        ):
+            return SubmissionObservation(
+                status="failed",
+                observed_actor=session.actor,
+                reason="; ".join(e["code"] for e in session.errors),
+            )
+
+        receipt_actor = receipt.get("actor")
+        if receipt_actor and not self._actors_compatible(receipt_actor, session.actor):
+            return SubmissionObservation(
+                status="unresolved",
+                observed_actor=session.actor,
+                reason="actor_mismatch",
+            )
+
+        dest = dict(draft_request.get("destination") or {})
+        guild_id = dest.get("guild_id")
+        forum_id = dest.get("forum_id")
+        thread_id = dest.get("thread_id")
+        action = draft_request.get("action")
+        draft_body = draft_request.get("body") or ""
+        expected_filenames = [
+            ev["name"] for ev in (draft_request.get("attachments") or draft_request.get("evidence") or [])
+            if isinstance(ev, dict) and ev.get("name")
+        ]
+        baseline_id = receipt.get("baseline_latest_message_id")
+
+        if action == "create_topic" and not thread_id and guild_id and forum_id:
+            tlist = self.list_topics(guild_id, forum_id)
+            title = (draft_request.get("title") or "").strip().lower()
+            candidates: list[tuple[float, str]] = []
+            for top in tlist.topics:
+                if not top.thread_id:
+                    continue
+                t_lower = (top.title or "").strip().lower()
+                if title and (t_lower == title or title in t_lower or t_lower in title):
+                    score = 1.0 if t_lower == title else 0.75
+                    candidates.append((score, top.thread_id))
+            candidates.sort(reverse=True)
+            if not candidates:
+                return SubmissionObservation(
+                    status="unresolved",
+                    observed_actor=session.actor,
+                    reason="created_topic_not_observed",
+                )
+            thread_id = candidates[0][1]
+
+        if not guild_id or not forum_id or not thread_id:
+            return SubmissionObservation(
+                status="unresolved",
+                observed_actor=session.actor,
+                reason="missing_destination_ids",
+            )
+
+        hist = self.read_topic(guild_id, forum_id, thread_id)
+        if hist.errors and not hist.messages:
+            return SubmissionObservation(
+                status="failed",
+                observed_actor=session.actor,
+                reason="; ".join(e["code"] for e in hist.errors),
+            )
+
+        target_mid_raw = dest.get("message_id") or dest.get("target_message_id")
+        if action == "edit_own_message" and target_mid_raw:
+            target_mid = str(target_mid_raw)
+            target_msg = next((m for m in hist.messages if m.message_id == target_mid), None)
+            if target_msg is None:
+                return SubmissionObservation(
+                    status="unresolved",
+                    observed_actor=session.actor,
+                    reason="target_message_not_visible",
+                )
+            score = self._score_submission_match(
+                draft_body, target_msg.body, expected_filenames, target_msg.attachments
+            )
+            from ..models import normalize_text_for_hash
+
+            is_exact_or_marked = bool(
+                target_msg.explicit_edited_marker
+                or target_msg.remote_edited_at
+                or normalize_text_for_hash(target_msg.body) == normalize_text_for_hash(draft_body)
+            )
+            if is_exact_or_marked and (score >= 0.42 or target_msg.explicit_edited_marker or target_msg.remote_edited_at):
+                return SubmissionObservation(
+                    status="submission_observed",
+                    observed_actor=session.actor,
+                    message_id=target_msg.message_id,
+                    message_url=target_msg.source_url or build_discord_channel_url(guild_id, thread_id),
+                    observed_body=target_msg.body,
+                    reason="edited_target_message_observed",
+                )
+            return SubmissionObservation(
+                status="unresolved",
+                observed_actor=session.actor,
+                reason="target_edit_not_observed",
+            )
+
+        scored: list[tuple[float, MessageObservation]] = []
+        for msg in hist.messages:
+            if not msg.message_id:
+                continue
+            if baseline_id and str(baseline_id).isdigit() and msg.message_id.isdigit():
+                if int(msg.message_id) <= int(str(baseline_id)):
+                    continue
+            if not self._actors_compatible(receipt_actor or session.actor, msg.author):
+                continue
+            score = self._score_submission_match(
+                draft_body, msg.body, expected_filenames, msg.attachments
+            )
+            if score >= 0.42:
+                scored.append((score, msg))
+
+        if scored:
+            scored.sort(key=lambda item: (item[0], int(item[1].message_id) if (item[1].message_id or "").isdigit() else 0), reverse=True)
+            top_score, top_msg = scored[0]
+            if len(scored) > 1 and abs(scored[1][0] - top_score) < 0.05 and top_score < 0.9:
+                return SubmissionObservation(
+                    status="unresolved",
+                    observed_actor=session.actor,
+                    reason="ambiguous_submission_candidates",
+                )
+            return SubmissionObservation(
+                status="submission_observed",
+                observed_actor=session.actor,
+                message_id=top_msg.message_id,
+                message_url=top_msg.source_url or build_discord_channel_url(guild_id, thread_id),
+                observed_body=top_msg.body,
+                reason="matched_posted_message",
+            )
+
+        # If not posted yet, inspect composer locally to report whether draft is still under human review
+        ax_win = self._get_ax_window()
+        if ax_win is not None:
+            comp_elem, comp_text = self._inspect_composer(ax_win)
+            comp_atts = self._inspect_staged_attachments(ax_win, comp_elem)
+            if comp_text.strip() or comp_atts:
+                return SubmissionObservation(
+                    status="in_discord_review",
+                    observed_actor=session.actor,
+                    reason="composer_still_contains_unsubmitted_draft",
+                )
+
         return SubmissionObservation(
             status="unresolved",
             observed_actor=session.actor,
-            reason="live_submission_not_yet_observed",
+            reason="matching_submission_not_observed_yet",
         )
