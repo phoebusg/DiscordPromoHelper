@@ -32,7 +32,7 @@ class ForumObservation:
     guild_id: str
     name: str
     source_url: str
-    tags: list[dict[str, Any]] = field(default_factory=list)
+    tags: Optional[list[dict[str, Any]]] = None
     guidelines_text: str = ""
     can_create_topic: Optional[bool] = None
     source_method: str = "semantic"
@@ -50,7 +50,7 @@ class TopicObservation:
     thread_id: Optional[str] = None
     observation_ref: Optional[str] = None
     source_url: Optional[str] = None
-    tags: list[dict[str, Any]] = field(default_factory=list)
+    tags: Optional[list[dict[str, Any]]] = None
     starter_message_id: Optional[str] = None
     archived: Optional[bool] = None
     locked: Optional[bool] = None
@@ -118,6 +118,8 @@ class RequirementObservation:
     source_entity_ref: Optional[str] = None
     source_url: Optional[str] = None
     parsed_checks: Optional[list[dict[str, Any]]] = None
+    complete: bool = True
+    errors: list[dict[str, Any]] = field(default_factory=list)
     source_method: str = "semantic"
     confidence: Optional[float] = 1.0
     observed_at: str = field(default_factory=utc_now_iso)

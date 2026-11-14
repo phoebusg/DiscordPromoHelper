@@ -5,13 +5,50 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
+import sqlite3
 from typing import Any, Optional
 
 from .models import optional_discord_id, require_discord_id
 
 DEFAULT_PROFILES_PATH = "data/forums/profiles.json"
+LEGACY_SHARED_DB_PATH = "data/forums/mirror.sqlite3"
 VALID_PURPOSES = {"promotion", "external_project"}
 VALID_ROUTING_MODES = {"reply_existing", "one_topic_per_streamer", "create_topic"}
+
+
+def _maybe_migrate_legacy_mirror_db(
+    legacy_path: Path,
+    target_path: Path,
+    guild_id: str,
+    forum_id: str,
+) -> None:
+    """Safely copy legacy shared mirror DB to an isolated profile DB if its scope matches."""
+    if not legacy_path.exists() or target_path.exists():
+        return
+    try:
+        src = sqlite3.connect(str(legacy_path))
+        src.row_factory = sqlite3.Row
+        try:
+            row = src.execute(
+                "SELECT scope_key FROM mirror_meta WHERE guild_id = ? AND forum_id = ? LIMIT 1",
+                (guild_id, forum_id),
+            ).fetchone()
+        finally:
+            src.close()
+        if row is None:
+            return
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
+        src_conn = sqlite3.connect(str(legacy_path))
+        dst_conn = sqlite3.connect(str(tmp_path))
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        os.replace(tmp_path, target_path)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -34,7 +71,7 @@ class ForumProfile:
     requirement_refs: list[dict[str, str]] = field(default_factory=list)
     seed_index_path: Optional[str] = None
     transfer_root: str = "data/forums/transfer"
-    db_path: str = "data/forums/mirror.sqlite3"
+    db_path: str = ""
     exchange_dir: str = "data/forums/exchange"
 
     def __post_init__(self) -> None:
@@ -53,6 +90,8 @@ class ForumProfile:
         optional_discord_id(self.default_thread_id, "default_thread_id")
         if not self.source_url:
             self.source_url = f"https://discord.com/channels/{self.guild_id}/{self.forum_id}"
+        if not self.db_path:
+            self.db_path = f"data/forums/{self.profile_id}.sqlite3"
         if self.purpose == "external_project" and self.promotion_enabled:
             raise ValueError("external_project profiles must never have promotion_enabled=True")
         if float(self.cooldown_hours) < 0:
@@ -79,11 +118,26 @@ class ForumProfile:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ForumProfile":
         """Construct and validate a ForumProfile from a dict."""
+        pid = raw["profile_id"]
+        gid = raw["guild_id"]
+        fid = raw["forum_id"]
+        raw_db = raw.get("db_path")
+        isolated_db = f"data/forums/{pid}.sqlite3"
+        if not raw_db or raw_db == LEGACY_SHARED_DB_PATH:
+            _maybe_migrate_legacy_mirror_db(
+                Path(LEGACY_SHARED_DB_PATH),
+                Path(isolated_db),
+                str(gid),
+                str(fid),
+            )
+            eff_db = isolated_db
+        else:
+            eff_db = str(raw_db)
         return cls(
-            profile_id=raw["profile_id"],
+            profile_id=pid,
             name=raw["name"],
-            guild_id=raw["guild_id"],
-            forum_id=raw["forum_id"],
+            guild_id=gid,
+            forum_id=fid,
             source_url=raw.get("source_url", ""),
             purpose=raw.get("purpose", "promotion"),
             catalog_enabled=bool(raw.get("catalog_enabled", False)),
@@ -96,7 +150,7 @@ class ForumProfile:
             requirement_refs=list(raw.get("requirement_refs", [])),
             seed_index_path=raw.get("seed_index_path"),
             transfer_root=raw.get("transfer_root", "data/forums/transfer"),
-            db_path=raw.get("db_path", "data/forums/mirror.sqlite3"),
+            db_path=eff_db,
             exchange_dir=raw.get("exchange_dir", "data/forums/exchange"),
         )
 

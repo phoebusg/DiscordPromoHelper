@@ -14,9 +14,15 @@ from .config import (
     get_forum_profile,
     upsert_forum_profile,
 )
-from .exchange import read_record, validate_exchange_record, write_record_atomic
-from .handoff import HandoffManager, SessionController
-from .providers.base import SeededDiscordProvider
+from .exchange import (
+    ContractValidationError,
+    RecordConflictError,
+    read_record,
+    validate_exchange_record,
+    write_record_atomic,
+)
+from .handoff import BundleValidationError, HandoffManager, SessionController, ingest_draft_bundle
+from .providers.base import SeededDiscordProvider, SessionDescription
 from .providers.desktop import DesktopDiscordProvider
 from .reader import ForumReader
 from .store import ForumStore
@@ -38,10 +44,28 @@ def _session_controller_for(prof: ForumProfile) -> SessionController:
     return SessionController(state_path=Path(prof.db_path).with_suffix(".session.json"))
 
 
+def _seed_session_description(prof: ForumProfile) -> SessionDescription:
+    return SessionDescription(
+        actor={"user_id": None, "label": "Seed Provider"},
+        app_name="SeedProvider",
+        window_title=prof.name,
+        window_bbox=None,
+        current_url=prof.source_url,
+        capabilities={
+            "accessibility_api": False,
+            "ocr_fallback": False,
+            "can_read_semantic": False,
+            "can_read_ocr": False,
+            "can_stage_composer": False,
+        },
+        errors=[],
+    )
+
+
 def _select_provider(
     provider_mode: str,
     prof: ForumProfile,
-    desktop: DesktopDiscordProvider,
+    desktop: Optional[DesktopDiscordProvider],
     session_desc: Any,
 ) -> tuple[Any, bool]:
     use_seed = provider_mode == "seed" or (
@@ -61,6 +85,8 @@ def _select_provider(
             ),
             True,
         )
+    if desktop is None:
+        desktop = DesktopDiscordProvider()
     return desktop, False
 
 
@@ -100,14 +126,24 @@ def cmd_seed_index(args: argparse.Namespace) -> int:
     if not seed_file:
         print("No --seed-file or profile.seed_index_path configured", file=sys.stderr)
         return 2
-    provider = SeededDiscordProvider(
-        guild_id=prof.guild_id,
-        forum_id=prof.forum_id,
-        forum_name=prof.name,
-        seed_path=seed_file,
-    )
     store = ForumStore(prof.db_path)
     try:
+        store.ensure_scope(prof.guild_id, prof.forum_id)
+        if not prof.catalog_enabled:
+            _print_json(
+                {
+                    "profile": prof.profile_id,
+                    "result": {"paused": True, "reason": "catalog_disabled", "coverage": store.get_coverage()},
+                    "status": store.get_forum_status(),
+                }
+            )
+            return 2
+        provider = SeededDiscordProvider(
+            guild_id=prof.guild_id,
+            forum_id=prof.forum_id,
+            forum_name=prof.name,
+            seed_path=seed_file,
+        )
         reader = ForumReader(prof, store, provider)
         res = reader.initial_backfill(max_topics_per_run=args.max_topics)
         _print_json({"profile": prof.profile_id, "result": res, "status": store.get_forum_status()})
@@ -118,8 +154,12 @@ def cmd_seed_index(args: argparse.Namespace) -> int:
 
 def cmd_refresh(args: argparse.Namespace) -> int:
     prof = _load_profile_or_exit(args.profile, args.profiles_path)
-    desktop = DesktopDiscordProvider()
-    session_desc = desktop.describe_session()
+    desktop: Optional[DesktopDiscordProvider] = None
+    if args.provider == "seed":
+        session_desc = _seed_session_description(prof)
+    else:
+        desktop = DesktopDiscordProvider()
+        session_desc = desktop.describe_session()
     store = ForumStore(prof.db_path)
     try:
         provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
@@ -140,7 +180,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             )
 
         exported: dict[str, Any] = {}
-        if args.export:
+        if args.export and not res.get("paused"):
             exported = store.export_exchange_dir(
                 prof.exchange_dir,
                 force_snapshot=getattr(args, "snapshot", False),
@@ -149,7 +189,11 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         _print_json(
             {
                 "profile": prof.profile_id,
-                "provider_used": "seed+desktop_probe" if use_seed else "desktop",
+                "provider_used": (
+                    "seed"
+                    if args.provider == "seed"
+                    else ("seed+desktop_probe" if use_seed else "desktop")
+                ),
                 "desktop_session": asdict(session_desc),
                 "result": res,
                 "status": store.get_forum_status(),
@@ -210,7 +254,11 @@ def cmd_changes(args: argparse.Namespace) -> int:
 
 def cmd_stage(args: argparse.Namespace) -> int:
     prof = _load_profile_or_exit(args.profile, args.profiles_path)
-    draft = read_record(args.draft_file)
+    bundle_dir = getattr(args, "bundle_dir", None)
+    draft_file = getattr(args, "draft_file", None)
+    if not bundle_dir and not draft_file:
+        print("Either --bundle-dir or --draft-file is required", file=sys.stderr)
+        return 2
     store = ForumStore(prof.db_path)
     try:
         mgr = HandoffManager(
@@ -219,10 +267,25 @@ def cmd_stage(args: argparse.Namespace) -> int:
             session_controller=_session_controller_for(prof),
             exchange_dir=prof.exchange_dir,
         )
-        receipt = mgr.stage_draft_request(draft, prof, source_kind=args.source_kind)
+        if bundle_dir:
+            receipt = mgr.stage_draft_bundle(bundle_dir, prof, source_kind=args.source_kind)
+        else:
+            df = Path(draft_file)
+            if df.is_dir():
+                receipt = mgr.stage_draft_bundle(df, prof, source_kind=args.source_kind)
+            elif df.name == "draft.request.json" and (
+                (df.parent / "transfer").exists() or len(df.parent.name) == 64
+            ):
+                receipt = mgr.stage_draft_bundle(df.parent, prof, source_kind=args.source_kind)
+            else:
+                draft = read_record(df)
+                receipt = mgr.stage_draft_request(draft, prof, source_kind=args.source_kind)
         if args.receipt_out:
             write_record_atomic(args.receipt_out, receipt)
         _print_json(receipt)
+    except (BundleValidationError, ContractValidationError, RecordConflictError) as exc:
+        print(f"Invalid draft bundle: {exc}", file=sys.stderr)
+        return 2
     finally:
         store.close()
     return 0
@@ -283,14 +346,20 @@ def cmd_release_review(args: argparse.Namespace) -> int:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     prof = _load_profile_or_exit(args.profile, args.profiles_path)
-    desktop = DesktopDiscordProvider()
-    session_desc = desktop.describe_session()
+    desktop: Optional[DesktopDiscordProvider] = None
+    if args.provider == "seed":
+        session_desc = _seed_session_description(prof)
+    else:
+        desktop = DesktopDiscordProvider()
+        session_desc = desktop.describe_session()
     store = ForumStore(prof.db_path)
     try:
         ctrl = _session_controller_for(prof)
         provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
         reconciled: list[dict[str, Any]] = []
         if args.reconcile:
+            if desktop is None:
+                desktop = DesktopDiscordProvider()
             mgr = HandoffManager(
                 store,
                 desktop,
@@ -323,47 +392,81 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
         staged: list[dict[str, Any]] = []
         if args.stage_pending:
+            if desktop is None:
+                desktop = DesktopDiscordProvider()
             mgr = HandoffManager(
                 store,
                 desktop,
                 session_controller=ctrl,
                 exchange_dir=prof.exchange_dir,
             )
-            drafts_dir = Path(prof.exchange_dir) / "drafts"
+            ex_dir = Path(prof.exchange_dir)
+            bundles_dir = ex_dir / "bundles"
+            drafts_dir = ex_dir / "drafts"
+            candidates: list[tuple[Path, bool]] = []
+            if bundles_dir.is_dir():
+                for b_entry in sorted(bundles_dir.iterdir()):
+                    if b_entry.is_dir():
+                        candidates.append((b_entry, True))
             if drafts_dir.is_dir():
-                for draft_path in sorted(drafts_dir.glob("*.json")):
-                    try:
-                        draft = read_record(draft_path)
-                    except Exception:
-                        continue
-                    if draft.get("schema") != "draft.request.v1":
-                        continue
-                    dest = draft.get("destination") or {}
-                    if dest.get("guild_id") != prof.guild_id or dest.get("forum_id") != prof.forum_id:
-                        continue
-                    row = store.get_draft_row(draft["draft_id"], int(draft["revision"]))
-                    if row is not None and row["status"] in (
-                        "staged",
-                        "in_discord_review",
-                        "submission_observed",
-                        "user_confirmed_submitted",
-                        "rejected",
-                        "needs_review",
-                    ):
-                        continue
-                    receipt = mgr.stage_draft_request(
-                        draft,
-                        prof,
-                        source_kind=args.source_kind,
+                for d_entry in sorted(drafts_dir.iterdir()):
+                    if d_entry.is_dir():
+                        candidates.append((d_entry, True))
+                    elif d_entry.is_file() and d_entry.suffix == ".json":
+                        candidates.append((d_entry, False))
+
+            for entry_path, is_bundle in candidates:
+                transfer_root: Optional[Path] = None
+                try:
+                    if is_bundle:
+                        draft, transfer_root = ingest_draft_bundle(entry_path)
+                    else:
+                        draft = read_record(entry_path)
+                except (BundleValidationError, ContractValidationError, RecordConflictError) as exc:
+                    staged.append(
+                        {
+                            "bundle": str(entry_path),
+                            "status": "failed",
+                            "reason": f"bundle_validation_failed: {exc}",
+                        }
                     )
-                    staged.append(receipt)
-                    if receipt["status"] in ("staged", "in_discord_review", "needs_review"):
-                        break
+                    continue
+                except Exception:
+                    continue
+
+                if draft.get("schema") != "draft.request.v1":
+                    continue
+                dest = draft.get("destination") or {}
+                if dest.get("guild_id") != prof.guild_id or dest.get("forum_id") != prof.forum_id:
+                    continue
+                row = store.get_draft_row(draft["draft_id"], int(draft["revision"]))
+                if row is not None and row["status"] in (
+                    "staged",
+                    "in_discord_review",
+                    "submission_observed",
+                    "user_confirmed_submitted",
+                    "rejected",
+                    "needs_review",
+                ):
+                    continue
+                receipt = mgr.stage_draft_request(
+                    draft,
+                    prof,
+                    source_kind=args.source_kind,
+                    transfer_root=transfer_root,
+                )
+                staged.append(receipt)
+                if receipt["status"] in ("staged", "in_discord_review", "needs_review"):
+                    break
 
         _print_json(
             {
                 "profile": prof.profile_id,
-                "provider_used": "seed+desktop_probe" if use_seed else "desktop",
+                "provider_used": (
+                    "seed"
+                    if args.provider == "seed"
+                    else ("seed+desktop_probe" if use_seed else "desktop")
+                ),
                 "reconciled": reconciled,
                 "refresh": refresh_res,
                 "exported": exported,
@@ -439,9 +542,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_chg.add_argument("--after-position")
     p_chg.add_argument("--out")
 
-    p_stg = sub.add_parser("stage", help="Stage a draft.request.v1 into the composer without Send")
+    p_stg = sub.add_parser("stage", help="Stage a draft.request.v1 or bundle into the composer without Send")
     p_stg.add_argument("--profile", required=True)
-    p_stg.add_argument("--draft-file", required=True)
+    p_stg.add_argument("--draft-file", help="Path to draft.request.v1 JSON or bundle dir/draft.request.json")
+    p_stg.add_argument("--bundle-dir", "--bundle", dest="bundle_dir", help="Path to <draft-record-hash>/ selected-file bundle directory")
     p_stg.add_argument("--source-kind", choices=["external", "promotion"], default="external")
     p_stg.add_argument("--receipt-out")
 

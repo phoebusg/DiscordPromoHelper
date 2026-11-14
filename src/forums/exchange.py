@@ -1,6 +1,7 @@
 """Shared v1 exchange contract validation and atomic JSON file I/O."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -45,6 +46,32 @@ VALID_RECEIPT_STATUSES = {
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+_CANONICAL_CHANNEL_URL_RE = re.compile(
+    r"^(?:https://(?:(?:ptb|canary)\.)?discord\.com|discord://-)/channels/(\d+)/(\d+)(?:/(\d+))?/?$"
+)
+
+
+def canonical_record_digest(record: Any) -> str:
+    """Return canonical lowercase SHA-256 hex digest of an exchange record."""
+    encoded = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _parse_canonical_discord_channel_url(url: str, context: str) -> tuple[str, str, Optional[str]]:
+    if not isinstance(url, str) or not url.strip():
+        raise ContractValidationError(f"{context} must be a canonical Discord channel URL, got {url!r}")
+    match = _CANONICAL_CHANNEL_URL_RE.fullmatch(url.strip())
+    if not match:
+        raise ContractValidationError(
+            f"{context} must be a canonical Discord channel URL (/channels/<guild_id>/<channel_id>), got {url!r}"
+        )
+    return match.group(1), match.group(2), match.group(3)
 
 
 class ContractValidationError(ValueError):
@@ -187,19 +214,62 @@ def _validate_destination(dest: Any, scope: dict[str, Any], context: str) -> dic
     try:
         gid = require_discord_id(d["guild_id"], f"{context}.guild_id")
         fid = require_discord_id(d["forum_id"], f"{context}.forum_id")
-        optional_discord_id(d["thread_id"], f"{context}.thread_id")
-        optional_discord_id(d["message_id"], f"{context}.message_id")
+        tid = optional_discord_id(d["thread_id"], f"{context}.thread_id")
+        mid = optional_discord_id(d["message_id"], f"{context}.message_id")
     except ValueError as exc:
         raise ContractValidationError(str(exc)) from exc
     if gid != scope["guild_id"] or fid != scope["forum_id"]:
         raise ContractValidationError(
             f"{context} guild_id/forum_id ({gid}/{fid}) must agree with scope ({scope['guild_id']}/{scope['forum_id']})"
         )
-    _optional_str(d["source_url"], f"{context}.source_url")
+    surl = _optional_str(d["source_url"], f"{context}.source_url")
+    if surl is not None:
+        url_gid, url_cid, url_mid = _parse_canonical_discord_channel_url(surl, f"{context}.source_url")
+        if url_gid != gid:
+            raise ContractValidationError(
+                f"{context}.source_url guild_id {url_gid!r} must match destination.guild_id {gid!r}"
+            )
+        expected_cid = tid if tid is not None else fid
+        if url_cid != expected_cid:
+            raise ContractValidationError(
+                f"{context}.source_url target id {url_cid!r} must match destination target {expected_cid!r}"
+            )
+        if url_mid is not None and (mid is None or url_mid != mid):
+            raise ContractValidationError(
+                f"{context}.source_url message_id {url_mid!r} must match destination.message_id {mid!r}"
+            )
     return d
 
 
-def _validate_topic(topic: Any, scope_forum_id: str, context: str) -> str:
+def _validate_forum(forum: Any, scope_guild_id: str, scope_forum_id: str, context: str) -> str:
+    d = _require_dict(forum, context)
+    _validate_keys_present(d, {"forum_id", "name", "source_url", "tags", "revision", "observed_at"}, context)
+    try:
+        fid = require_discord_id(d["forum_id"], f"{context}.forum_id")
+    except ValueError as exc:
+        raise ContractValidationError(str(exc)) from exc
+    if fid != scope_forum_id:
+        raise ContractValidationError(f"{context}.forum_id must match scope.forum_id")
+    _require_non_empty_str(d["name"], f"{context}.name")
+    furl = _require_non_empty_str(d["source_url"], f"{context}.source_url")
+    url_gid, url_cid, url_mid = _parse_canonical_discord_channel_url(furl, f"{context}.source_url")
+    if url_gid != scope_guild_id or url_cid != fid or url_mid is not None:
+        raise ContractValidationError(
+            f"{context}.source_url must identify forum {scope_guild_id}/{fid}, got {furl!r}"
+        )
+    for idx, t in enumerate(_require_list(d["tags"], f"{context}.tags")):
+        _validate_tag(t, f"{context}.tags[{idx}]")
+    _require_positive_int(d["revision"], f"{context}.revision")
+    _require_utc_timestamp(d["observed_at"], f"{context}.observed_at")
+    return fid
+
+
+def _validate_topic(
+    topic: Any,
+    scope_forum_id: str,
+    context: str,
+    scope_guild_id: Optional[str] = None,
+) -> str:
     d = _require_dict(topic, context)
     _validate_keys_present(
         d,
@@ -227,7 +297,8 @@ def _validate_topic(topic: Any, scope_forum_id: str, context: str) -> str:
         raise ContractValidationError(f"{context}.forum_id {fid!r} must match scope.forum_id {scope_forum_id!r}")
     _require_non_empty_str(d["title"], f"{context}.title")
     url = _require_non_empty_str(d["source_url"], f"{context}.source_url")
-    if tid not in url:
+    url_gid, url_cid, url_mid = _parse_canonical_discord_channel_url(url, f"{context}.source_url")
+    if (scope_guild_id is not None and url_gid != scope_guild_id) or url_cid != tid or url_mid is not None:
         raise ContractValidationError(f"{context}.source_url must identify thread_id {tid!r}")
     _require_positive_int(d["revision"], f"{context}.revision")
     _require_utc_timestamp(d["observed_at"], f"{context}.observed_at")
@@ -240,7 +311,12 @@ def _validate_topic(topic: Any, scope_forum_id: str, context: str) -> str:
     return tid
 
 
-def _validate_message(msg: Any, known_thread_ids: Optional[set[str]], context: str) -> None:
+def _validate_message(
+    msg: Any,
+    known_thread_ids: Optional[set[str]],
+    context: str,
+    scope_guild_id: Optional[str] = None,
+) -> dict[str, Any]:
     d = _require_dict(msg, context)
     _validate_keys_present(
         d,
@@ -263,7 +339,7 @@ def _validate_message(msg: Any, known_thread_ids: Optional[set[str]], context: s
     )
     _require_non_empty_str(d["entity_ref"], f"{context}.entity_ref")
     try:
-        optional_discord_id(d["message_id"], f"{context}.message_id")
+        mid = optional_discord_id(d["message_id"], f"{context}.message_id")
         tid = require_discord_id(d["thread_id"], f"{context}.thread_id")
     except ValueError as exc:
         raise ContractValidationError(str(exc)) from exc
@@ -281,13 +357,26 @@ def _validate_message(msg: Any, known_thread_ids: Optional[set[str]], context: s
     _require_utc_timestamp(d["observed_at"], f"{context}.observed_at")
     _optional_utc_timestamp(d["remote_created_at"], f"{context}.remote_created_at")
     _optional_utc_timestamp(d["remote_edited_at"], f"{context}.remote_edited_at")
-    _optional_str(d["source_url"], f"{context}.source_url")
+    surl = _optional_str(d["source_url"], f"{context}.source_url")
+    if surl is not None:
+        url_gid, url_cid, url_mid = _parse_canonical_discord_channel_url(surl, f"{context}.source_url")
+        if scope_guild_id is not None and url_gid != scope_guild_id:
+            raise ContractValidationError(f"{context}.source_url guild_id {url_gid!r} does not match scope")
+        if url_cid != tid:
+            raise ContractValidationError(f"{context}.source_url channel {url_cid!r} must match thread_id {tid!r}")
+        if url_mid is not None and mid is not None and url_mid != mid:
+            raise ContractValidationError(f"{context}.source_url message_id {url_mid!r} must match {mid!r}")
     _require_bool(d["identity_verified"], f"{context}.identity_verified")
     for idx, att in enumerate(_require_list(d["attachments"], f"{context}.attachments")):
         _validate_attachment(att, f"{context}.attachments[{idx}]")
+    return d
 
 
-def _validate_requirement(req: Any, context: str) -> None:
+def _validate_requirement(
+    req: Any,
+    context: str,
+    scope_guild_id: Optional[str] = None,
+) -> dict[str, Any]:
     d = _require_dict(req, context)
     _validate_keys_present(
         d,
@@ -304,7 +393,11 @@ def _validate_requirement(req: Any, context: str) -> None:
     )
     _require_non_empty_str(d["requirement_id"], f"{context}.requirement_id")
     _optional_str(d["source_entity_ref"], f"{context}.source_entity_ref")
-    _optional_str(d["source_url"], f"{context}.source_url")
+    surl = _optional_str(d["source_url"], f"{context}.source_url")
+    if surl is not None and scope_guild_id is not None:
+        url_gid, _, _ = _parse_canonical_discord_channel_url(surl, f"{context}.source_url")
+        if url_gid != scope_guild_id:
+            raise ContractValidationError(f"{context}.source_url guild_id {url_gid!r} does not match scope")
     body = _require_str(d["body"], f"{context}.body")
     chash = _require_sha256(d["content_hash"], f"{context}.content_hash")
     expected_hash = compute_content_hash(body)
@@ -314,6 +407,7 @@ def _validate_requirement(req: Any, context: str) -> None:
         )
     _require_positive_int(d["revision"], f"{context}.revision")
     _require_utc_timestamp(d["observed_at"], f"{context}.observed_at")
+    return d
 
 
 def _validate_snapshot(record: dict[str, Any]) -> None:
@@ -328,33 +422,20 @@ def _validate_snapshot(record: dict[str, Any]) -> None:
     _validate_cursor(record["cursor"], "cursor")
 
     scope = record["scope"]
-    forum = _require_dict(record["forum"], "forum")
-    _validate_keys_present(forum, {"forum_id", "name", "source_url", "tags", "revision", "observed_at"}, "forum")
-    try:
-        fid = require_discord_id(forum["forum_id"], "forum.forum_id")
-    except ValueError as exc:
-        raise ContractValidationError(str(exc)) from exc
-    if fid != scope["forum_id"]:
-        raise ContractValidationError("forum.forum_id must match scope.forum_id")
-    _require_non_empty_str(forum["name"], "forum.name")
-    _require_non_empty_str(forum["source_url"], "forum.source_url")
-    for idx, t in enumerate(_require_list(forum["tags"], "forum.tags")):
-        _validate_tag(t, f"forum.tags[{idx}]")
-    _require_positive_int(forum["revision"], "forum.revision")
-    _require_utc_timestamp(forum["observed_at"], "forum.observed_at")
+    _validate_forum(record["forum"], scope["guild_id"], scope["forum_id"], "forum")
 
     topic_ids: set[str] = set()
     for idx, topic in enumerate(_require_list(record["topics"], "topics")):
-        tid = _validate_topic(topic, scope["forum_id"], f"topics[{idx}]")
+        tid = _validate_topic(topic, scope["forum_id"], f"topics[{idx}]", scope_guild_id=scope["guild_id"])
         if tid in topic_ids:
             raise ContractValidationError(f"duplicate thread_id {tid!r} in snapshot.topics")
         topic_ids.add(tid)
 
     for idx, msg in enumerate(_require_list(record["messages"], "messages")):
-        _validate_message(msg, topic_ids, f"messages[{idx}]")
+        _validate_message(msg, topic_ids, f"messages[{idx}]", scope_guild_id=scope["guild_id"])
 
     for idx, req in enumerate(_require_list(record["requirements"], "requirements")):
-        _validate_requirement(req, f"requirements[{idx}]")
+        _validate_requirement(req, f"requirements[{idx}]", scope_guild_id=scope["guild_id"])
 
     cov = _require_dict(record["coverage"], "coverage")
     _validate_keys_present(cov, {"topics", "histories", "requirements", "pending", "errors", "last_success_at"}, "coverage")
@@ -409,6 +490,8 @@ def _validate_changes(record: dict[str, Any]) -> None:
         _validate_cursor(record["after_cursor"], "after_cursor")
     _validate_cursor(record["cursor"], "cursor")
 
+    scope = record["scope"]
+    seen_change_ids: set[str] = set()
     for idx, ch in enumerate(_require_list(record["changes"], "changes")):
         ctx = f"changes[{idx}]"
         cd = _require_dict(ch, ctx)
@@ -427,14 +510,25 @@ def _validate_changes(record: dict[str, Any]) -> None:
             },
             ctx,
         )
-        _require_non_empty_str(cd["change_id"], f"{ctx}.change_id")
-        if cd["entity_type"] not in VALID_ENTITY_TYPES:
-            raise ContractValidationError(f"{ctx}.entity_type invalid: {cd['entity_type']!r}")
-        _require_non_empty_str(cd["entity_ref"], f"{ctx}.entity_ref")
-        if cd["kind"] not in VALID_CHANGE_KINDS:
-            raise ContractValidationError(f"{ctx}.kind invalid: {cd['kind']!r}")
-        _optional_positive_int(cd["before_revision"], f"{ctx}.before_revision")
-        _optional_positive_int(cd["after_revision"], f"{ctx}.after_revision")
+        cid = _require_non_empty_str(cd["change_id"], f"{ctx}.change_id")
+        if cid in seen_change_ids:
+            raise ContractValidationError(f"{ctx}.change_id duplicate within batch: {cid!r}")
+        seen_change_ids.add(cid)
+
+        etype = cd["entity_type"]
+        if etype not in VALID_ENTITY_TYPES:
+            raise ContractValidationError(f"{ctx}.entity_type invalid: {etype!r}")
+        eref = _require_non_empty_str(cd["entity_ref"], f"{ctx}.entity_ref")
+        kind = cd["kind"]
+        if kind not in VALID_CHANGE_KINDS:
+            raise ContractValidationError(f"{ctx}.kind invalid: {kind!r}")
+        brev = _optional_positive_int(cd["before_revision"], f"{ctx}.before_revision")
+        arev = _optional_positive_int(cd["after_revision"], f"{ctx}.after_revision")
+        if brev is not None and arev is not None and arev <= brev:
+            raise ContractValidationError(
+                f"{ctx}.after_revision ({arev}) must be > before_revision ({brev})"
+            )
+
         _require_utc_timestamp(cd["observed_at"], f"{ctx}.observed_at")
         src = _require_dict(cd["source"], f"{ctx}.source")
         _validate_keys_present(src, {"method", "source_url", "confidence"}, f"{ctx}.source")
@@ -444,8 +538,56 @@ def _validate_changes(record: dict[str, Any]) -> None:
         if conf is not None:
             if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not (0.0 <= float(conf) <= 1.0):
                 raise ContractValidationError(f"{ctx}.source.confidence must be 0..1 or null, got {conf!r}")
-        if cd["after"] is not None:
-            _require_dict(cd["after"], f"{ctx}.after")
+
+        after = cd["after"]
+        if kind == "removal_observed":
+            if after is not None or arev is not None:
+                raise ContractValidationError(
+                    f"{ctx} with kind='removal_observed' must have null after and after_revision"
+                )
+            continue
+
+        if after is None:
+            raise ContractValidationError(f"{ctx}.after must be a full entity object for kind={kind!r}")
+        if arev is None:
+            raise ContractValidationError(f"{ctx}.after_revision must be a positive integer for kind={kind!r}")
+
+        after_dict = _require_dict(after, f"{ctx}.after")
+        if etype == "forum":
+            fid = _validate_forum(after_dict, scope["guild_id"], scope["forum_id"], f"{ctx}.after")
+            if fid != eref:
+                raise ContractValidationError(f"{ctx}.after.forum_id {fid!r} must match entity_ref {eref!r}")
+            actual_rev = int(after_dict["revision"])
+        elif etype == "topic":
+            tid = _validate_topic(
+                after_dict, scope["forum_id"], f"{ctx}.after", scope_guild_id=scope["guild_id"]
+            )
+            if tid != eref:
+                raise ContractValidationError(f"{ctx}.after.thread_id {tid!r} must match entity_ref {eref!r}")
+            actual_rev = int(after_dict["revision"])
+        elif etype == "message":
+            msg_d = _validate_message(
+                after_dict, None, f"{ctx}.after", scope_guild_id=scope["guild_id"]
+            )
+            if msg_d["entity_ref"] != eref:
+                raise ContractValidationError(
+                    f"{ctx}.after.entity_ref {msg_d['entity_ref']!r} must match entity_ref {eref!r}"
+                )
+            actual_rev = int(msg_d["revision"])
+        else:  # etype == "requirement"
+            req_d = _validate_requirement(
+                after_dict, f"{ctx}.after", scope_guild_id=scope["guild_id"]
+            )
+            if req_d["requirement_id"] != eref:
+                raise ContractValidationError(
+                    f"{ctx}.after.requirement_id {req_d['requirement_id']!r} must match entity_ref {eref!r}"
+                )
+            actual_rev = int(req_d["revision"])
+
+        if actual_rev != arev:
+            raise ContractValidationError(
+                f"{ctx}.after.revision ({actual_rev}) must match after_revision ({arev})"
+            )
 
 
 def validate_relative_local_ref(local_ref: str, context: str = "local_ref") -> PurePosixPath:

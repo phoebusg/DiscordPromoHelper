@@ -49,8 +49,24 @@ def compute_bytes_sha256(data: bytes) -> str:
 
 
 def utc_now_iso() -> str:
-    """Return current UTC timestamp in RFC 3339 format with Z suffix."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Return current UTC timestamp in RFC 3339 format with microsecond precision and Z suffix."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_rfc3339_utc(val: Any) -> Optional[datetime]:
+    """Parse an RFC 3339 UTC timestamp string (with or without microseconds) into an aware datetime."""
+    if not isinstance(val, str) or not val.strip():
+        return None
+    raw = val.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def is_valid_rfc3339_utc(val: Any) -> bool:

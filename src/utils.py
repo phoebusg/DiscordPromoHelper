@@ -945,36 +945,24 @@ def _clean_ocr_text(text: str) -> str:
     return text
 
 
-def _detect_tooltip_region(img):
-    """Detect the tooltip region within an image by analyzing brightness.
-    Crops both horizontally and vertically to the text content.
-    
-    Discord tooltips:
-    - Appear as dark gray boxes (~RGB 35-55) on dark backgrounds
-    - Text (white) appears on the tooltip
-    """
+def _detect_tooltip_region_with_offset(img) -> tuple[object, tuple[int, int]]:
+    """Detect the tooltip region within an image, returning `(cropped_img, (crop_x, crop_y))`."""
     try:
         w, h = img.size
         if w < 50 or h < 10:
-            return img
-            
-        # Convert to grayscale for analysis
+            return img, (0, 0)
+
         gray = img.convert('L')
         px = list(gray.getdata())
-        
-        # Threshold for text detection (Discord text is bright on dark)
-        # Use a relative threshold based on max brightness to handle dim text
         max_val = max(px)
-        if max_val < 50: # Image is too dark, probably no text
-            return img
-            
+        if max_val < 50:
+            return img, (0, 0)
+
         bright_thresh = max(80, max_val * 0.6)
-        
-        # 1. Vertical Crop (Find top/bottom of text)
+
         row_has_text = []
         for y in range(h):
             row = [px[y * w + x] for x in range(w)]
-            # Check for run of bright pixels
             has_text = False
             consecutive = 0
             for p in row:
@@ -986,130 +974,114 @@ def _detect_tooltip_region(img):
                 else:
                     consecutive = 0
             row_has_text.append(has_text)
-            
+
         if not any(row_has_text):
-            return img
-            
+            return img, (0, 0)
+
         first_row = next((i for i, has in enumerate(row_has_text) if has), 0)
         last_row = next((h - 1 - i for i, has in enumerate(reversed(row_has_text)) if has), h - 1)
-        
-        # 2. Horizontal Crop (Find left/right of text)
+
         col_has_text = []
         for x in range(w):
             col = [px[y * w + x] for y in range(h)]
-            # Only check within the vertical bounds we just found
-            col_segment = col[first_row:last_row+1]
+            col_segment = col[first_row:last_row + 1]
             has_text = any(p > bright_thresh for p in col_segment)
             col_has_text.append(has_text)
-            
+
         if not any(col_has_text):
-            return img
-            
+            return img, (0, 0)
+
         first_col = next((i for i, has in enumerate(col_has_text) if has), 0)
         last_col = next((w - 1 - i for i, has in enumerate(reversed(col_has_text)) if has), w - 1)
-        
-        # Add margin
+
         margin_x = 6
         margin_y = 4
-        
         crop_box = (
             max(0, first_col - margin_x),
             max(0, first_row - margin_y),
             min(w, last_col + margin_x + 1),
-            min(h, last_row + margin_y + 1)
+            min(h, last_row + margin_y + 1),
         )
-        
-        # Sanity check: don't crop if result is tiny
+
         if crop_box[2] - crop_box[0] < 20 or crop_box[3] - crop_box[1] < 10:
-            return img
-            
-        return img.crop(crop_box)
-        
+            return img, (0, 0)
+
+        return img.crop(crop_box), (crop_box[0], crop_box[1])
+
     except Exception:
-        return img
+        return img, (0, 0)
 
 
-def _preprocess_discord_tooltip(img) -> list:
-    """Preprocess a Discord tooltip image for optimal OCR.
+def _detect_tooltip_region(img):
+    """Detect the tooltip region within an image by analyzing brightness.
+    Crops both horizontally and vertically to the text content.
     
-    Returns a list of preprocessed image variants to try OCR on.
-    Based on testing across 29+ tooltip images, the best strategies are:
-    1. Discord-optimized: 4x scale + invert (for dark theme) + autocontrast + threshold cleanup
-    2. Simple 3x scale + autocontrast (v1_simple - good baseline)
-    3. Invert + scale + autocontrast (for dark theme)
-    4. Binary threshold after invert (for clean edges)
-    
-    Discord tooltips are typically:
-    - White/light text on dark gray background (#2C2F33 ≈ RGB 44,47,51)
-    - Font: Whitney Medium, ~13-14px
-    - May contain emoji (rendered as icons)
+    Discord tooltips:
+    - Appear as dark gray boxes (~RGB 35-55) on dark backgrounds
+    - Text (white) appears on the tooltip
     """
+    cropped, _ = _detect_tooltip_region_with_offset(img)
+    return cropped
+
+
+def _preprocess_discord_tooltip_with_meta(
+    img,
+) -> list[tuple[str, object, int, int, tuple[int, int]]]:
+    """Build ordered `(name, variant_img, scale, pad, crop_offset)` candidates for Discord tooltips."""
     from PIL import ImageOps, ImageFilter
-    
-    # First, try to detect and crop to just the tooltip region
-    # This removes adjacent channel list text that bleeds into the capture
-    img = _detect_tooltip_region(img)
-    
-    variants = []
-    
+
+    img, crop_offset = _detect_tooltip_region_with_offset(img)
+
+    variants: list[tuple[str, object, int, int, tuple[int, int]]] = []
     w, h = img.size
-    
-    # Detect if dark theme (most Discord tooltips)
+
     gray_check = img.convert('L')
     stat = ImageStat.Stat(gray_check)
     is_dark = stat.mean[0] < 120
-    
-    # Variant 1: Discord-optimized (Tuned)
-    # 4x scale + invert + autocontrast + partial threshold
+
+    # Variant 1: Discord-optimized (4x scale + 20px border padding)
     scaled4 = img.resize((w * 4, h * 4), Image.LANCZOS)
     gray4 = scaled4.convert('L')
-    
     if is_dark:
-        # Invert: white text becomes black on white
         gray4 = ImageOps.invert(gray4)
-        # Aggressive autocontrast
         gray4 = ImageOps.autocontrast(gray4, cutoff=0)
-        # Slight threshold to clean up while keeping anti-aliasing
-        # Tuned threshold from v5_discord_optimized (80/200)
         gray4 = gray4.point(lambda x: 0 if x < 80 else (255 if x > 200 else x))
-        # Sharpen slightly to help with blurry text
         gray4 = gray4.filter(ImageFilter.SHARPEN)
     else:
         gray4 = ImageOps.autocontrast(gray4, cutoff=2)
-    
-    # Add generous white padding (Tesseract needs margin)
-    # Tuned padding: 20px is sufficient
     discord_variant = ImageOps.expand(gray4, border=20, fill=255)
-    variants.append(('discord', discord_variant))
-    
-    # Variant 2: Simple scale 3x + autocontrast (good baseline)
+    variants.append(('discord', discord_variant, 4, 20, crop_offset))
+
+    # Variant 2: Simple scale 3x + 20px border padding
     scaled = img.resize((w * 3, h * 3), Image.LANCZOS)
     gray = scaled.convert('L')
     v1 = ImageOps.autocontrast(gray, cutoff=2)
-    # Add padding here too
     v1 = ImageOps.expand(v1, border=20, fill=255 if not is_dark else 0)
-    variants.append(('simple', v1))
-    
-    # Variant 3: Invert (for dark theme) + autocontrast
+    variants.append(('simple', v1, 3, 20, crop_offset))
+
+    # Variant 3: Invert 3x + autocontrast (no border padding)
     if is_dark:
         inverted = ImageOps.invert(gray)
         v2 = ImageOps.autocontrast(inverted, cutoff=2)
-        variants.append(('inverted', v2))
-    
-    # Variant 4: Binary threshold (clean edges, good for some fonts)
+        variants.append(('inverted', v2, 3, 0, crop_offset))
+
+    # Variant 4: Binary threshold 3x + 10px border padding
     if is_dark:
-        # Invert first, then threshold
         inv = ImageOps.invert(gray)
         v3 = inv.point(lambda x: 255 if x > 128 else 0)
-        # Add padding for Tesseract
         v3 = ImageOps.expand(v3, border=10, fill=255)
-        variants.append(('threshold', v3))
+        variants.append(('threshold', v3, 3, 10, crop_offset))
     else:
         v3 = gray.point(lambda x: 0 if x < 128 else 255)
         v3 = ImageOps.expand(v3, border=10, fill=255)
-        variants.append(('threshold', v3))
-    
+        variants.append(('threshold', v3, 3, 10, crop_offset))
+
     return variants
+
+
+def _preprocess_discord_tooltip(img) -> list:
+    """Preprocess a Discord tooltip image for optimal OCR."""
+    return [(name, var) for name, var, _, _, _ in _preprocess_discord_tooltip_with_meta(img)]
 
 
 @dataclass
@@ -1195,19 +1167,21 @@ def _image_content_digest(img) -> str:
     return h.hexdigest()
 
 
-def _preprocess_for_task(img, task: str) -> list[tuple[str, object, int]]:
-    """Build ordered (variant_name, pil_image, scale_factor) candidates for a given OCR task."""
+def _preprocess_for_task(
+    img, task: str
+) -> list[tuple[str, object, int, int, tuple[int, int]]]:
+    """Build ordered `(variant_name, pil_image, scale, pad, crop_offset)` candidates for an OCR task."""
     from PIL import ImageOps, ImageFilter
 
     if task in ("server_tooltip", "channel_name"):
-        return [(name, var, 4 if name == 'discord' else 3) for name, var in _preprocess_discord_tooltip(img)]
+        return _preprocess_discord_tooltip_with_meta(img)
 
     w, h = img.size
     gray_check = img.convert('L')
     is_dark = ImageStat.Stat(gray_check).mean[0] < 120
-    variants = []
+    variants: list[tuple[str, object, int, int, tuple[int, int]]] = []
 
-    # Cheap first pass: 2x-3x scale + invert if dark + gentle autocontrast + border padding
+    # Cheap first pass: 2x-3x scale + invert if dark + gentle autocontrast + 16px border padding
     scale = 3 if (w < 400 or h < 120) else 2
     resample = Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC
     scaled = img.resize((max(1, w * scale), max(1, h * scale)), resample).convert('L')
@@ -1215,9 +1189,9 @@ def _preprocess_for_task(img, task: str) -> list[tuple[str, object, int]]:
         scaled = ImageOps.invert(scaled)
     v_primary = ImageOps.autocontrast(scaled, cutoff=1)
     v_primary = ImageOps.expand(v_primary, border=16, fill=255)
-    variants.append(('primary', v_primary, scale))
+    variants.append(('primary', v_primary, scale, 16, (0, 0)))
 
-    # Fallback pass 2: CLAHE + sharpen + padding (for low-contrast/anti-aliased text)
+    # Fallback pass 2: CLAHE + sharpen + 16px padding (for low-contrast/anti-aliased text)
     clahe_img = _pil_clahe(scaled)
     if is_dark:
         v_clahe = ImageOps.autocontrast(clahe_img, cutoff=0)
@@ -1225,12 +1199,17 @@ def _preprocess_for_task(img, task: str) -> list[tuple[str, object, int]]:
         v_clahe = ImageOps.autocontrast(clahe_img, cutoff=2)
     v_clahe = v_clahe.filter(ImageFilter.SHARPEN)
     v_clahe = ImageOps.expand(v_clahe, border=16, fill=255)
-    variants.append(('clahe_fallback', v_clahe, scale))
+    variants.append(('clahe_fallback', v_clahe, scale, 16, (0, 0)))
 
     return variants
 
 
-def _extract_lines_and_boxes(data: dict, scale: int) -> tuple[str, list[str], list[OCRTokenBox], float]:
+def _extract_lines_and_boxes(
+    data: dict,
+    scale: int,
+    pad: int = 0,
+    crop_offset: tuple[int, int] = (0, 0),
+) -> tuple[str, list[str], list[OCRTokenBox], float]:
     """Reconstruct preserved lines, token boxes and 0..100 confidence from image_to_data dict."""
     texts = data.get('text', []) if isinstance(data, dict) else []
     confs = data.get('conf', []) if isinstance(data, dict) else []
@@ -1264,12 +1243,16 @@ def _extract_lines_and_boxes(data: dict, scale: int) -> tuple[str, list[str], li
         line_groups.setdefault(key, []).append(tok)
 
         s = max(1, scale)
+        raw_left = lefts[i] if i < len(lefts) else 0
+        raw_top = tops[i] if i < len(tops) else 0
+        raw_w = widths[i] if i < len(widths) else 0
+        raw_h = heights[i] if i < len(heights) else 0
         boxes.append(OCRTokenBox(
             text=tok,
-            left=int((lefts[i] if i < len(lefts) else 0) / s),
-            top=int((tops[i] if i < len(tops) else 0) / s),
-            width=int((widths[i] if i < len(widths) else 0) / s),
-            height=int((heights[i] if i < len(heights) else 0) / s),
+            left=max(0, int(round((raw_left - pad) / s)) + crop_offset[0]),
+            top=max(0, int(round((raw_top - pad) / s)) + crop_offset[1]),
+            width=max(0, int(round(raw_w / s))),
+            height=max(0, int(round(raw_h / s))),
             confidence=(c / 100.0) if c >= 0 else 0.0,
             line_num=ln,
         ))
@@ -1337,7 +1320,7 @@ def ocr_image_structured(
     try:
         variants = _preprocess_for_task(img, task)
     except Exception:
-        variants = [('raw', img, 1)]
+        variants = [('raw', img, 1, 0, (0, 0))]
 
     configs = ['--psm 6 --oem 3', '--psm 7 --oem 3'] if task in ('server_tooltip', 'channel_name', 'forum_title') else ['--psm 6 --oem 3', '--psm 4 --oem 3']
     if lang and lang != 'eng':
@@ -1347,7 +1330,7 @@ def ocr_image_structured(
     best_result: OCRResult | None = None
     best_score = -1.0
 
-    for var_idx, (var_name, variant, scale) in enumerate(variants):
+    for var_idx, (var_name, variant, scale, pad, crop_offset) in enumerate(variants):
         for cfg_idx, cfg in enumerate(configs):
             raw_text = ""
             lines: list[str] = []
@@ -1356,7 +1339,9 @@ def ocr_image_structured(
             try:
                 out_type = o_output.DICT if o_output else None
                 data = pytesseract.image_to_data(variant, output_type=out_type, config=cfg)
-                raw_text, lines, boxes, conf_pct = _extract_lines_and_boxes(data, scale)
+                raw_text, lines, boxes, conf_pct = _extract_lines_and_boxes(
+                    data, scale, pad=pad, crop_offset=crop_offset
+                )
             except Exception:
                 try:
                     raw_text = (pytesseract.image_to_string(variant, config=cfg) or '').strip()

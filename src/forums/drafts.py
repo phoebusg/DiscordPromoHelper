@@ -100,33 +100,126 @@ def render_forum_promo_draft(
 
 
 def check_draft_conflicts(draft_record: dict[str, Any], store: ForumStore) -> list[str]:
-    """Compare draft baseline against current mirror requirements and target message."""
+    """Compare draft baseline against current mirror requirements and target entities."""
     conflicts: list[str] = []
-    baseline = draft_record.get("baseline", {})
-    status = store.get_forum_status()
+    baseline = draft_record.get("baseline") or {}
+    scope = draft_record.get("scope") or {}
+    dest = draft_record.get("destination") or {}
 
-    # Check requirement revisions
-    snap = store.export_snapshot()
-    req_by_id = {r["requirement_id"]: r for r in snap["requirements"]}
+    try:
+        status = store.get_forum_status(
+            guild_id=scope.get("guild_id"),
+            forum_id=scope.get("forum_id"),
+        )
+        snap = store.export_snapshot(
+            guild_id=scope.get("guild_id"),
+            forum_id=scope.get("forum_id"),
+        )
+    except ValueError:
+        return ["local mirror scope is not initialized"]
+
+    if status.get("guild_id") != scope.get("guild_id") or status.get("forum_id") != scope.get("forum_id"):
+        conflicts.append(
+            f"mirror scope mismatch: draft=({scope.get('guild_id')}, {scope.get('forum_id')}), "
+            f"mirror=({status.get('guild_id')}, {status.get('forum_id')})"
+        )
+        return conflicts
+
+    counts = status.get("counts") or {}
+    cursor_pos = str((status.get("cursor") or {}).get("position") or "0")
+    if (
+        int(counts.get("topics") or 0) == 0
+        and int(counts.get("messages") or 0) == 0
+        and int(counts.get("requirements") or 0) == 0
+        and cursor_pos == "0"
+    ):
+        conflicts.append("local mirror has no established baseline state")
+
+    # Verify named snapshot identity and anchored snapshot revision.
+    base_snap_id = baseline.get("snapshot_id")
+    curr_snap_id = status.get("snapshot_id")
+    if not base_snap_id:
+        conflicts.append("draft baseline missing snapshot_id")
+    elif base_snap_id != curr_snap_id:
+        conflicts.append(
+            f"snapshot_id mismatch: baseline={base_snap_id!r}, current={curr_snap_id!r}"
+        )
+
+    base_snap_rev = baseline.get("snapshot_revision")
+    curr_snap_rev = int(status.get("snapshot_revision") or 0)
+    if base_snap_rev is None:
+        conflicts.append("draft baseline missing snapshot_revision")
+    else:
+        b_rev = int(base_snap_rev)
+        if b_rev < 1 or b_rev > curr_snap_rev:
+            conflicts.append(
+                f"snapshot_revision invalid or ahead of mirror: baseline={b_rev}, current={curr_snap_rev}"
+            )
+
+    # Every referenced requirement revision must exist in the mirror and match the baseline.
+    req_by_id = {r["requirement_id"]: r for r in snap.get("requirements", [])}
     for req_ref in baseline.get("requirements", []):
         rid = req_ref["requirement_id"]
         base_rev = int(req_ref["revision"])
+        base_req_hash = req_ref.get("content_hash")
         curr = req_by_id.get(rid)
-        if curr and int(curr["revision"]) > base_rev:
+        if curr is None:
             conflicts.append(
-                f"requirement {rid} changed from baseline r{base_rev} to r{curr['revision']}"
+                f"requirement {rid} missing from local mirror (expected baseline r{base_rev})"
+            )
+            continue
+        curr_rev = int(curr["revision"])
+        if curr_rev != base_rev:
+            conflicts.append(
+                f"requirement {rid} revision mismatch: baseline r{base_rev}, current r{curr_rev}"
+            )
+        elif base_req_hash is not None and curr.get("content_hash") != base_req_hash:
+            conflicts.append(
+                f"requirement {rid} content_hash mismatch at r{curr_rev}"
             )
 
-    # Check if edit_own_message target has changed since baseline
-    if draft_record["action"] == "edit_own_message":
-        target_mid = draft_record["destination"]["message_id"]
+    # Target topic availability check for reply_existing / edit_own_message.
+    action = draft_record.get("action")
+    target_tid = dest.get("thread_id")
+    topic_by_id = {t["thread_id"]: t for t in snap.get("topics", [])}
+    if action in {"reply_existing", "edit_own_message"}:
+        if not target_tid:
+            conflicts.append(f"{action} missing destination.thread_id")
+        else:
+            topic_obj = topic_by_id.get(target_tid)
+            if topic_obj is None:
+                conflicts.append(f"target topic {target_tid} missing from local mirror")
+            else:
+                if topic_obj.get("archived") is True:
+                    conflicts.append(f"target topic {target_tid} is archived")
+                if topic_obj.get("locked") is True:
+                    conflicts.append(f"target topic {target_tid} is locked")
+
+    # Exact target message verification for edit_own_message.
+    if action == "edit_own_message":
+        target_mid = dest.get("message_id")
         base_hash = baseline.get("message_content_hash")
-        for m in snap["messages"]:
-            if m.get("message_id") == target_mid and base_hash and m["content_hash"] != base_hash:
+        msg_by_id = {
+            m["message_id"]: m for m in snap.get("messages", []) if m.get("message_id") is not None
+        }
+        if not target_mid:
+            conflicts.append("edit_own_message missing destination.message_id")
+        elif target_mid not in msg_by_id:
+            conflicts.append(f"target message {target_mid} missing from local mirror")
+        else:
+            curr_msg = msg_by_id[target_mid]
+            if curr_msg.get("thread_id") != target_tid:
+                conflicts.append(
+                    f"target message {target_mid} belongs to thread {curr_msg.get('thread_id')}, expected {target_tid}"
+                )
+            if not base_hash:
+                conflicts.append(
+                    f"edit_own_message for {target_mid} missing baseline.message_content_hash"
+                )
+            elif curr_msg.get("content_hash") != base_hash:
                 conflicts.append(
                     f"target message {target_mid} content_hash changed since baseline"
                 )
-                break
 
     draft_row = store.get_draft_row(draft_record["draft_id"], draft_record["revision"])
     if draft_row and draft_row.get("needs_recheck"):
@@ -134,5 +227,4 @@ def check_draft_conflicts(draft_record: dict[str, Any], store: ForumStore) -> li
         if reason not in conflicts:
             conflicts.append(reason)
 
-    _ = status
     return conflicts

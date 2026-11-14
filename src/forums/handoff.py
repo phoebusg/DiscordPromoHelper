@@ -26,13 +26,101 @@ from .config import ForumProfile
 from .drafts import check_draft_conflicts
 from .exchange import (
     ContractValidationError,
+    canonical_record_digest,
     resolve_evidence_files,
     validate_exchange_record,
     write_record_atomic,
 )
-from .models import compute_content_hash, utc_now_iso
+from .models import compute_content_hash, parse_rfc3339_utc, utc_now_iso
 from .providers.base import DiscordViewProvider
 from .store import ForumStore
+
+
+class BundleValidationError(ContractValidationError):
+    """Raised when an incoming selected-file draft bundle fails integrity or layout checks."""
+
+
+def ingest_draft_bundle(
+    bundle_dir: str | Path,
+    *,
+    require_hash_dirname: bool = True,
+) -> tuple[dict[str, Any], Path]:
+    """Validate an immutable <draft-record-hash>/ bundle and its transfer/ evidence files."""
+    bdir = Path(bundle_dir)
+    if not bdir.exists() or bdir.is_symlink() or not bdir.is_dir():
+        raise BundleValidationError(f"Bundle directory missing or invalid: {bdir}")
+
+    for child in bdir.iterdir():
+        if child.is_symlink():
+            raise BundleValidationError(f"Bundle must not contain symlinks: {child}")
+        if child.name not in {"draft.request.json", "transfer"}:
+            raise BundleValidationError(
+                f"Unexpected entry in draft bundle {bdir.name!r}: {child.name!r}"
+            )
+
+    req_path = bdir / "draft.request.json"
+    if not req_path.exists() or req_path.is_symlink() or not req_path.is_file():
+        raise BundleValidationError(f"Bundle missing draft.request.json: {req_path}")
+
+    draft = json.loads(req_path.read_text(encoding="utf-8"))
+    validate_exchange_record(draft)
+    if draft.get("schema") != "draft.request.v1":
+        raise BundleValidationError(f"Expected draft.request.v1 inside bundle, got {draft.get('schema')!r}")
+
+    expected_digest = canonical_record_digest(draft)
+    if require_hash_dirname:
+        if bdir.name != expected_digest:
+            raise BundleValidationError(
+                f"Bundle directory name {bdir.name!r} does not match canonical draft digest {expected_digest!r}"
+            )
+
+    transfer_dir = bdir / "transfer"
+    evidence = draft.get("evidence") or []
+    if evidence and (not transfer_dir.exists() or transfer_dir.is_symlink() or not transfer_dir.is_dir()):
+        raise BundleValidationError(f"Bundle with evidence must include transfer/ directory: {transfer_dir}")
+
+    if transfer_dir.exists():
+        if transfer_dir.is_symlink() or not transfer_dir.is_dir():
+            raise BundleValidationError(f"Bundle transfer path must be a real directory: {transfer_dir}")
+        actual_files: set[Path] = set()
+        for entry in transfer_dir.rglob("*"):
+            if entry.is_symlink():
+                raise BundleValidationError(f"Bundle transfer/ must not contain symlinks: {entry}")
+            if entry.is_file():
+                actual_files.add(entry.resolve())
+        resolved = resolve_evidence_files(evidence, transfer_dir)
+        expected_files = {Path(item["resolved_path"]).resolve() for item in resolved}
+        if actual_files != expected_files:
+            raise BundleValidationError(
+                "Bundle transfer/ directory contains unexpected files not selected by draft.evidence"
+            )
+    elif evidence:
+        raise BundleValidationError("Bundle requires transfer/ directory for selected evidence")
+
+    return draft, transfer_dir
+
+
+def _requires_discord_review_hold(stage_obs: Any) -> bool:
+    if getattr(stage_obs, "status", None) == "staged":
+        return True
+    reason = str(getattr(stage_obs, "reason", None) or "")
+    if reason == "existing_human_draft_present":
+        return True
+    obs_text = getattr(stage_obs, "observed_composer_text", None)
+    if isinstance(obs_text, str) and obs_text.strip():
+        return True
+    if getattr(stage_obs, "staged_evidence_ids", None):
+        return True
+    return reason.startswith(
+        (
+            "composer_text_verification_mismatch",
+            "attachment_preview_unverified",
+            "missing_resolved_attachment",
+            "composer_text_changed_after_attachments",
+            "composer_unverified_after_attachments",
+            "composer_focus_failed",
+        )
+    )
 
 
 def _is_pid_alive(pid: Optional[int]) -> bool:
@@ -245,20 +333,41 @@ class SessionController:
             if self._mode == "staging" and self._owner_pid in (None, os.getpid()):
                 self._commit_state_unlocked("idle", None, None)
 
+    def transition_staging_to_review(
+        self,
+        draft_id: str,
+        draft_revision: int,
+        reason: str = "staged_for_review",
+        *,
+        baseline_latest_message_id: Optional[str] = None,
+        preexisting_message_ids: Optional[list[str]] = None,
+    ) -> None:
+        """Atomically transition staging ownership directly into durable in_discord_review."""
+        with self._locked_state_file():
+            if self._state_path is not None:
+                st = self._read_disk_state_unlocked()
+                self._mode = st["mode"]
+                self._owner_pid = st["owner_pid"]
+                self._review_draft = st["review_draft"]
+            info: dict[str, Any] = {
+                "draft_id": draft_id,
+                "draft_revision": int(draft_revision),
+                "entered_at": utc_now_iso(),
+                "reason": reason,
+            }
+            if baseline_latest_message_id is not None:
+                info["baseline_latest_message_id"] = baseline_latest_message_id
+            if preexisting_message_ids:
+                info["preexisting_message_ids"] = list(preexisting_message_ids)
+            self._commit_state_unlocked("in_discord_review", os.getpid(), info)
+
     def enter_discord_review(
         self,
         draft_id: str,
         draft_revision: int,
         reason: str = "staged_for_review",
     ) -> None:
-        with self._locked_state_file():
-            info = {
-                "draft_id": draft_id,
-                "draft_revision": int(draft_revision),
-                "entered_at": utc_now_iso(),
-                "reason": reason,
-            }
-            self._commit_state_unlocked("in_discord_review", os.getpid(), info)
+        self.transition_staging_to_review(draft_id, draft_revision, reason=reason)
 
     def release_review(self) -> None:
         with self._locked_state_file():
@@ -333,6 +442,44 @@ class HandoffManager:
             write_record_atomic(receipts_dir / fname, receipt)
         return receipt
 
+    def stage_draft_bundle(
+        self,
+        bundle_dir: str | Path,
+        profile: ForumProfile,
+        *,
+        source_kind: str = "external",
+        expected_actor: Optional[dict[str, Any]] = None,
+        require_hash_dirname: bool = True,
+    ) -> dict[str, Any]:
+        """Validate an immutable <draft-record-hash>/ selected-file bundle and stage it."""
+        draft, transfer_dir = ingest_draft_bundle(
+            bundle_dir,
+            require_hash_dirname=require_hash_dirname,
+        )
+        return self.stage_draft_request(
+            draft,
+            profile,
+            source_kind=source_kind,
+            expected_actor=expected_actor,
+            transfer_root=transfer_dir,
+        )
+
+    def _baseline_thread_messages(self, thread_id: Optional[str]) -> tuple[list[str], Optional[str]]:
+        if not thread_id:
+            return [], None
+        try:
+            snap = self.store.export_snapshot()
+        except Exception:
+            return [], None
+        thread_mids = [
+            str(m["message_id"])
+            for m in snap.get("messages", [])
+            if m.get("thread_id") == thread_id and m.get("message_id")
+        ]
+        numeric_mids = [int(mid) for mid in thread_mids if mid.isdecimal()]
+        latest = str(max(numeric_mids)) if numeric_mids else None
+        return thread_mids, latest
+
     def stage_draft_request(
         self,
         draft_record: dict[str, Any],
@@ -340,6 +487,7 @@ class HandoffManager:
         *,
         source_kind: str = "external",
         expected_actor: Optional[dict[str, Any]] = None,
+        transfer_root: Optional[str | Path] = None,
     ) -> dict[str, Any]:
         """Stage a validated draft.request.v1 into Discord without pressing Send."""
         validate_exchange_record(draft_record)
@@ -353,7 +501,7 @@ class HandoffManager:
             )
 
         self.store.ensure_scope(profile.guild_id, profile.forum_id)
-        self.store.save_draft(draft_record)
+        self.store.ingest_record(draft_record)
 
         session_desc = self.provider.describe_session()
         obs_actor = session_desc.actor
@@ -400,7 +548,7 @@ class HandoffManager:
         # Preserve human edits if composer review is already active (e.g. new draft revision arrives)
         if self.session.is_review_active():
             self.store.update_draft_status(
-                draft_id, draft_rev, "needs_review", needs_recheck=True, recheck_reason="composer_review_in_progress"
+                draft_id, draft_rev, "needs_review"
             )
             return self._make_receipt(
                 draft_record=draft_record,
@@ -439,9 +587,10 @@ class HandoffManager:
                 exchange_dir=profile.exchange_dir,
             )
 
-        # Resolve and SHA-256 verify evidence files inside transfer_root
+        # Resolve and SHA-256 verify evidence files inside effective transfer_root
+        effective_transfer_root = transfer_root if transfer_root is not None else profile.transfer_root
         try:
-            resolved_evidence = resolve_evidence_files(draft_record["evidence"], profile.transfer_root)
+            resolved_evidence = resolve_evidence_files(draft_record["evidence"], effective_transfer_root)
         except Exception as exc:
             self.store.update_draft_status(draft_id, draft_rev, "failed")
             return self._make_receipt(
@@ -452,6 +601,10 @@ class HandoffManager:
                 exchange_dir=profile.exchange_dir,
             )
 
+        preexisting_mids, baseline_latest_mid = self._baseline_thread_messages(
+            draft_record["destination"].get("thread_id")
+        )
+
         if not self.session.acquire_for_staging():
             cur_mode = self.session.status()["mode"]
             busy_reason = (
@@ -460,7 +613,7 @@ class HandoffManager:
                 else f"session_busy_{cur_mode}"
             )
             self.store.update_draft_status(
-                draft_id, draft_rev, "needs_review", needs_recheck=True, recheck_reason=busy_reason
+                draft_id, draft_rev, "needs_review"
             )
             return self._make_receipt(
                 draft_record=draft_record,
@@ -470,18 +623,40 @@ class HandoffManager:
                 exchange_dir=profile.exchange_dir,
             )
 
+        transitioned = False
         try:
             stage_obs = self.provider.stage_draft(
                 draft_record,
                 resolved_evidence,
                 expected_actor=expected_actor or scope.get("actor"),
             )
+            if _requires_discord_review_hold(stage_obs):
+                self.session.transition_staging_to_review(
+                    draft_id,
+                    draft_rev,
+                    reason=stage_obs.reason
+                    or ("staged_for_review" if stage_obs.status == "staged" else "partial_composer_state"),
+                    baseline_latest_message_id=baseline_latest_mid,
+                    preexisting_message_ids=preexisting_mids,
+                )
+            else:
+                self.session.release_staging()
+            transitioned = True
+        except Exception as exc:
+            self.session.transition_staging_to_review(
+                draft_id,
+                draft_rev,
+                reason=f"staging_exception:{type(exc).__name__}",
+                baseline_latest_message_id=baseline_latest_mid,
+                preexisting_message_ids=preexisting_mids,
+            )
+            transitioned = True
+            raise
         finally:
-            if self.session.status()["mode"] == "staging":
+            if not transitioned and self.session.status()["mode"] == "staging":
                 self.session.release_staging()
 
         if stage_obs.status == "staged":
-            self.session.enter_discord_review(draft_id, draft_rev, reason="staged_for_review")
             self.store.update_draft_status(draft_id, draft_rev, "staged", staged_at=utc_now_iso())
             obs_hash = (
                 compute_content_hash(stage_obs.observed_composer_text)
@@ -498,22 +673,10 @@ class HandoffManager:
                 exchange_dir=profile.exchange_dir,
             )
 
-        # Keep review pause engaged if human text or partially staged text is in the composer!
-        if stage_obs.reason == "existing_human_draft_present" or (
-            stage_obs.observed_composer_text and stage_obs.observed_composer_text.strip()
-        ):
-            self.session.enter_discord_review(
-                draft_id,
-                draft_rev,
-                reason=stage_obs.reason or "partial_composer_state",
-            )
-
         self.store.update_draft_status(
             draft_id,
             draft_rev,
             stage_obs.status,
-            needs_recheck=(stage_obs.status == "needs_review"),
-            recheck_reason=stage_obs.reason,
         )
         obs_hash = (
             compute_content_hash(stage_obs.observed_composer_text)
@@ -547,7 +710,38 @@ class HandoffManager:
         prior_receipts = [
             r for r in self.store.list_receipts(draft_id=draft_id) if int(r["draft_revision"]) == rev
         ]
-        latest_receipt = prior_receipts[-1] if prior_receipts else {}
+        latest_receipt = dict(prior_receipts[-1]) if prior_receipts else {}
+        review_info = self.session.active_review_info() or {}
+        if review_info.get("draft_id") == draft_id and int(review_info.get("draft_revision") or -1) == rev:
+            if review_info.get("baseline_latest_message_id") and not latest_receipt.get("baseline_latest_message_id"):
+                latest_receipt["baseline_latest_message_id"] = review_info["baseline_latest_message_id"]
+            if review_info.get("preexisting_message_ids") and not latest_receipt.get("_preexisting_message_ids"):
+                latest_receipt["_preexisting_message_ids"] = list(review_info["preexisting_message_ids"])
+        # Also exclude mirror messages recorded at or before draft creation/staging
+        try:
+            dest_tid = draft_record["destination"].get("thread_id")
+            if dest_tid:
+                snap = self.store.export_snapshot(
+                    guild_id=draft_record["scope"]["guild_id"],
+                    forum_id=draft_record["scope"]["forum_id"],
+                )
+                pre_ids = set(latest_receipt.get("_preexisting_message_ids") or [])
+                cutoff_dt = parse_rfc3339_utc(row.get("staged_at")) or parse_rfc3339_utc(draft_record.get("created_at"))
+                draft_created_dt = parse_rfc3339_utc(draft_record.get("created_at"))
+                for m in snap.get("messages", []):
+                    if m.get("thread_id") != dest_tid or not m.get("message_id"):
+                        continue
+                    r_created_dt = parse_rfc3339_utc(m.get("remote_created_at"))
+                    obs_dt = parse_rfc3339_utc(m.get("observed_at"))
+                    if (
+                        (r_created_dt and draft_created_dt and r_created_dt < draft_created_dt)
+                        or (obs_dt and cutoff_dt and obs_dt < cutoff_dt)
+                    ):
+                        pre_ids.add(str(m["message_id"]))
+                if pre_ids:
+                    latest_receipt["_preexisting_message_ids"] = sorted(pre_ids)
+        except Exception:
+            pass
         ex_dir = profile.exchange_dir if profile else None
 
         session_desc = self.provider.describe_session()
