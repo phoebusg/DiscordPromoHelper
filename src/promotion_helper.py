@@ -40,8 +40,34 @@ def post_update(title, link, channel_position, press_enter=True):
     if press_enter:
         pyautogui.press('enter')
 
-def queue_updates(title, link, interval_minutes=60, run_duration_hours=1):
+def _collect_allowed_channels(servers):
+    """Collect normalized channel names from filtered server configs."""
+    allowed = set()
+    has_unconfigured = False
+    for srv in servers:
+        channels = srv.get("promo_channels") or []
+        if channels:
+            for ch in channels:
+                norm = (ch or "").strip().lstrip("#").lower()
+                if norm:
+                    allowed.add(norm)
+        else:
+            has_unconfigured = True
+    return allowed, has_unconfigured
+
+
+def queue_updates(title, link, interval_minutes=60, run_duration_hours=1, servers=None):
     """Queue updates to manage posting frequency."""
+    if servers is not None and len(servers) == 0:
+        return
+
+    allowed_channels = None
+    allow_keyword_fallback = True
+    if servers is not None:
+        allowed_channels, allow_keyword_fallback = _collect_allowed_channels(servers)
+        if not allowed_channels and not allow_keyword_fallback:
+            return
+
     end_time = datetime.now() + timedelta(hours=run_duration_hours)
     while datetime.now() < end_time:
         found = find_channel_position(CHANNEL_KEYWORDS)
@@ -57,11 +83,22 @@ def queue_updates(title, link, interval_minutes=60, run_duration_hours=1):
                 channel_name = str(channel_position)
                 confidence = 0.0
 
+            if allowed_channels is not None:
+                norm_found = (channel_name or "").strip().lstrip("#").lower()
+                matched = norm_found in allowed_channels or any(c in norm_found for c in allowed_channels)
+                if not matched and not allow_keyword_fallback:
+                    print(f"Channel '{channel_name}' is not in filtered target server channels.")
+                    time.sleep(interval_minutes * 60)
+                    continue
+
             # Respect whitelist/blacklist
             try:
-                from storage import is_channel_allowed
+                from .storage import is_channel_allowed
             except Exception:
-                is_channel_allowed = lambda n: True
+                try:
+                    from storage import is_channel_allowed
+                except Exception:
+                    is_channel_allowed = lambda n: True
 
             if not is_channel_allowed(channel_name):
                 print(f"Channel '{channel_name}' is not allowed by whitelist/blacklist.")

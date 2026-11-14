@@ -10,6 +10,11 @@ from src import discord_nav
 
 class TestNavLogic(unittest.TestCase):
     def setUp(self):
+        # Save originals to avoid leaking mocks into other test modules
+        self._orig_utils = discord_nav.utils
+        self._orig_pyautogui = discord_nav.pyautogui
+        self._orig_pytesseract = discord_nav.pytesseract
+
         # Mock dependencies
         self.mock_utils = MagicMock()
         discord_nav.utils = self.mock_utils
@@ -23,6 +28,11 @@ class TestNavLogic(unittest.TestCase):
         # Viewport settings
         self.viewport_height = 10  # 10 icons visible at once
         self.scroll_pos = 0  # Current index of top visible icon
+
+    def tearDown(self):
+        discord_nav.utils = self._orig_utils
+        discord_nav.pyautogui = self._orig_pyautogui
+        discord_nav.pytesseract = self._orig_pytesseract
         
     def _mock_analyze_viewport(self, is_first_page=False):
         # Return centers for currently visible icons

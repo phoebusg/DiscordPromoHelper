@@ -117,10 +117,9 @@ def run_cli(args):
             print(f"\nMessage: {title}")
             print(f"Link: {link}")
         else:
-            # Note: Full posting logic would go here
-            # For now, use legacy queue_updates
+            # Pass computed filtered target servers into legacy promotion queue
             print("\nStarting promotion queue...")
-            queue_updates(title, link)
+            queue_updates(title, link, servers=servers)
     else:
         # Legacy mode without arguments
         print("CLI mode - no action specified.")

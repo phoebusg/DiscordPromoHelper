@@ -429,3 +429,28 @@ def clean_and_dedupe_servers(config_path: Optional[str] = None) -> Dict[str, int
     stats['total_remaining'] = len(cleaned_servers)
     
     return stats
+
+
+def get_forum_profiles(config: Optional[Dict] = None) -> Dict[str, Dict[str, Any]]:
+    """Return optional forum destination profiles stored in config without altering defaults."""
+    if config is None:
+        config = load_config()
+    return dict(config.get("forum_profiles", {}))
+
+
+def set_forum_profile(
+    profile_dict: Dict[str, Any],
+    config: Optional[Dict] = None,
+    save: bool = True,
+    config_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Store or update an optional forum profile in server_config.json."""
+    from .forums.config import ForumProfile
+
+    validated = ForumProfile.from_dict(profile_dict).to_dict()
+    if config is None:
+        config = load_config(config_path)
+    config.setdefault("forum_profiles", {})[validated["profile_id"]] = validated
+    if save:
+        save_config(config, config_path)
+    return validated
