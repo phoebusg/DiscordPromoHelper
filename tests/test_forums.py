@@ -1524,6 +1524,209 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             self.assertEqual(sub_no_ocr.status, "submission_observed")
             self.assertEqual(sub_no_ocr.message_id, "105")
 
+    def test_never_sends_enter_or_return_and_preflights_screen_capture(self) -> None:
+        import ast
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from src.forums.providers import desktop as desktop_mod
+        from src.forums.providers.base import SessionDescription
+        from src.forums.providers.desktop import DesktopDiscordProvider
+
+        # 1. Static AST audit across all files in src/forums/
+        forums_root = Path(__file__).resolve().parents[1] / "src" / "forums"
+        forbidden_keys = {"return", "enter", "numpadenter", "kp_enter", "\r", "\n"}
+        key_calls = {"press", "hotkey", "keyDown", "keyUp", "typewrite", "write", "_safe_key_press"}
+
+        def _is_forbidden_key_literal(node: ast.AST) -> bool:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                raw = node.value
+                low = raw.lower()
+                return low in forbidden_keys or low.strip() in forbidden_keys
+            return False
+
+        py_files = sorted(forums_root.rglob("*.py"))
+        self.assertGreater(len(py_files), 0)
+        for py_file in py_files:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertNotIn("promotion_helper", alias.name, msg=str(py_file))
+                elif isinstance(node, ast.ImportFrom):
+                    mod = node.module or ""
+                    self.assertNotIn("promotion_helper", mod, msg=str(py_file))
+                    for alias in node.names:
+                        self.assertNotEqual(alias.name, "post_update", msg=str(py_file))
+                elif isinstance(node, ast.Call):
+                    fn_name = None
+                    if isinstance(node.func, ast.Name):
+                        fn_name = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        fn_name = node.func.attr
+                    self.assertNotEqual(fn_name, "post_update", msg=str(py_file))
+                    if fn_name in key_calls:
+                        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                            self.assertFalse(
+                                _is_forbidden_key_literal(arg),
+                                msg=f"Forbidden send key literal in {py_file}:{getattr(node, 'lineno', '?')}",
+                            )
+
+        # 2. Runtime _safe_key_press guard
+        provider = DesktopDiscordProvider(expected_actor={"user_id": ACTOR_USER_ID, "label": "Tester"})
+        for bad_key in ("return", "Return", "enter", "ENTER", "numpadenter", "kp_enter", "\n", "\r"):
+            with self.assertRaises(RuntimeError):
+                provider._safe_key_press(bad_key)
+
+        # 3. Spy pyautogui trace during stage_draft (text + attachment) + clear_staged_composer
+        with tempfile.TemporaryDirectory() as tmp:
+            ev_file = Path(tmp) / "shot.png"
+            ev_file.write_bytes(b"PNGDATA")
+
+            composer_state: dict[str, Any] = {"text": "", "attachments": []}
+            clipboard_state: dict[str, Any] = {"text": "", "file": None}
+            recorded_events: list[tuple[str, list[str]]] = []
+            comp_elem = object()
+            ax_win = object()
+
+            def _record(kind: str, args: tuple[Any, ...]) -> None:
+                recorded_events.append((kind, [str(a) for a in args]))
+
+            def spy_hotkey(*args: Any, **kwargs: Any) -> None:
+                _record("hotkey", args)
+                lows = [str(a).lower() for a in args]
+                if "v" in lows:
+                    if clipboard_state["file"]:
+                        composer_state["attachments"].append(
+                            {
+                                "role": "AXButton",
+                                "text": "Remove attachment shot.png",
+                                "dom_id": "upload-1",
+                                "bounds": (10, 20, 24, 24),
+                                "element": object(),
+                                "is_remove_button": True,
+                            }
+                        )
+                    else:
+                        composer_state["text"] = clipboard_state["text"]
+                elif "a" in lows:
+                    composer_state["selected_all"] = True
+
+            def spy_press(key: Any, *args: Any, **kwargs: Any) -> None:
+                _record("press", (key, *args))
+                if str(key).lower() == "backspace":
+                    composer_state["text"] = ""
+
+            def spy_click(*args: Any, **kwargs: Any) -> None:
+                _record("click", args)
+                if len(args) >= 2 and int(args[0]) == 22 and int(args[1]) == 32 and composer_state["attachments"]:
+                    composer_state["attachments"].pop(0)
+
+            spy_gui = SimpleNamespace(
+                hotkey=spy_hotkey,
+                press=spy_press,
+                keyDown=lambda k, *a, **kw: _record("keyDown", (k, *a)),
+                keyUp=lambda k, *a, **kw: _record("keyUp", (k, *a)),
+                typewrite=lambda *a, **kw: _record("typewrite", a),
+                write=lambda *a, **kw: _record("write", a),
+                click=spy_click,
+            )
+
+            def spy_subproc_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+                if cmd and cmd[0] == "osascript" and len(cmd) >= 3 and "POSIX file" in cmd[2]:
+                    clipboard_state["file"] = "shot.png"
+                return SimpleNamespace(returncode=0)
+
+            spy_pyperclip = SimpleNamespace(
+                paste=lambda: clipboard_state["text"],
+                copy=lambda val: clipboard_state.update({"text": str(val), "file": None}),
+            )
+
+            ok_session = SessionDescription(
+                actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                app_name="Discord",
+                window_title="Discord",
+                window_bbox=(0, 0, 1280, 800),
+                current_url=f"https://discord.com/channels/{GUILD_ID}/{THREAD_1}",
+                capabilities={"can_read_ax": True, "can_stage_composer": True, "can_read_ocr": False},
+            )
+            draft_req = {
+                "draft_id": "draft-safe-1",
+                "action": "reply_topic",
+                "destination": {
+                    "guild_id": GUILD_ID,
+                    "forum_id": FORUM_ID,
+                    "thread_id": THREAD_1,
+                    "source_url": f"https://discord.com/channels/{GUILD_ID}/{THREAD_1}",
+                },
+                "body": "Hello!\nLine 2",
+            }
+            resolved_ev = [{"evidence_id": "ev1", "name": "shot.png", "resolved_path": str(ev_file)}]
+
+            with patch.object(desktop_mod.sys, "platform", "darwin"), \
+                 patch.object(desktop_mod, "pyautogui", spy_gui), \
+                 patch.object(desktop_mod, "pyperclip", spy_pyperclip), \
+                 patch.object(desktop_mod.subprocess, "run", side_effect=spy_subproc_run), \
+                 patch.object(desktop_mod.time, "sleep", return_value=None), \
+                 patch.object(provider, "describe_session", return_value=ok_session), \
+                 patch.object(provider, "navigate_to_url", return_value=True), \
+                 patch.object(provider, "_activate_discord_window", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=ax_win), \
+                 patch.object(provider, "_inspect_composer", side_effect=lambda _w: (comp_elem, composer_state["text"])), \
+                 patch.object(
+                     provider,
+                     "_inspect_staged_attachments",
+                     side_effect=lambda _w, _c=None: list(composer_state["attachments"]),
+                 ):
+                stage_res = provider.stage_draft(
+                    draft_req,
+                    resolved_ev,
+                    expected_actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                )
+                self.assertEqual(stage_res.status, "staged")
+                self.assertEqual(stage_res.staged_evidence_ids, ["ev1"])
+                self.assertTrue(provider.clear_staged_composer())
+
+            self.assertTrue(any(kind == "hotkey" for kind, _ in recorded_events))
+            self.assertTrue(any(kind == "press" and "backspace" in args for kind, args in recorded_events))
+            self.assertTrue(any(kind == "click" for kind, _ in recorded_events))
+            for kind, args in recorded_events:
+                if kind in {"press", "hotkey", "keyDown", "keyUp", "typewrite", "write"}:
+                    for arg in args:
+                        self.assertNotIn(arg.lower(), forbidden_keys)
+                        self.assertNotIn(arg.lower().strip(), forbidden_keys)
+
+        # 4. describe_session() preflights Screen Recording without calling _safe_grab & caches 2.0s
+        probe_provider = DesktopDiscordProvider()
+        grab_mock = MagicMock()
+        fake_quartz = SimpleNamespace(CGPreflightScreenCaptureAccess=MagicMock(return_value=False))
+        fake_utils = SimpleNamespace(_safe_grab=grab_mock)
+
+        with patch.object(desktop_mod.sys, "platform", "darwin"), \
+             patch.object(desktop_mod, "Quartz", fake_quartz), \
+             patch.object(desktop_mod, "utils", fake_utils), \
+             patch.object(desktop_mod, "_find_discord_pid", return_value=12345) as pid_mock, \
+             patch.object(
+                 desktop_mod,
+                 "_get_discord_window_quartz",
+                 return_value=("Discord", (0, 0, 1280, 800)),
+             ):
+            s1 = probe_provider.describe_session()
+            self.assertFalse(s1.capabilities.get("can_read_ocr"))
+            self.assertIn("screen_capture_unavailable", [e.get("code") for e in s1.errors])
+            grab_mock.assert_not_called()
+            self.assertEqual(pid_mock.call_count, 1)
+
+            s2 = probe_provider.describe_session()
+            self.assertEqual(pid_mock.call_count, 1)
+            self.assertEqual(s2.capabilities, s1.capabilities)
+
+            s3 = probe_provider.describe_session(force_refresh=True)
+            self.assertEqual(pid_mock.call_count, 2)
+            self.assertFalse(s3.capabilities.get("can_read_ocr"))
+
 
 if __name__ == "__main__":
     unittest.main()

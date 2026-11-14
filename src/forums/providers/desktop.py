@@ -52,6 +52,11 @@ try:
 except Exception:
     utils = None
 
+try:
+    import Quartz  # type: ignore
+except Exception:
+    Quartz = None
+
 _DISCORD_URL_IN_TEXT_RE = re.compile(
     r"(?:https://(?:(?:ptb|canary)\.)?discord\.com|discord://-)/channels/(\d+)/(\d+)(?:/(\d+))?"
 )
@@ -206,10 +211,28 @@ def _capture_settled_region(bbox: tuple[int, int, int, int], settle_ms: int = 15
 class DesktopDiscordProvider(DiscordViewProvider):
     """Runtime adapter reading and staging via the installed Discord desktop client."""
 
+    _FORBIDDEN_SEND_KEYS = frozenset({"return", "enter", "numpadenter", "kp_enter", "\r", "\n"})
+
     def __init__(self, expected_actor: Optional[dict[str, Any]] = None) -> None:
         self.expected_actor = expected_actor
+        self._session_cache: Optional[tuple[float, SessionDescription]] = None
+        self._ocr_probe_cache: Optional[tuple[float, bool]] = None
 
-    def describe_session(self) -> SessionDescription:
+    def _safe_key_press(self, key: str) -> None:
+        if key.lower() in self._FORBIDDEN_SEND_KEYS:
+            raise RuntimeError(f"Refusing to press forbidden send-triggering key {key!r}")
+        if pyautogui is not None:
+            pyautogui.press(key)
+
+    def describe_session(self, force_refresh: bool = False) -> SessionDescription:
+        now_mono = time.monotonic()
+        if (
+            not force_refresh
+            and self._session_cache is not None
+            and (now_mono - self._session_cache[0]) < 2.0
+        ):
+            return self._session_cache[1]
+
         pid = _find_discord_pid()
         errors: list[dict[str, Any]] = []
         win_title, win_bbox = _get_discord_window_quartz()
@@ -294,22 +317,52 @@ class DesktopDiscordProvider(DiscordViewProvider):
 
         can_read_ocr = False
         if win_bbox and utils is not None and hasattr(utils, "_safe_grab"):
-            probe_box = (win_bbox[0], win_bbox[1], win_bbox[0] + 32, win_bbox[1] + 32)
-            if utils._safe_grab(probe_box) is not None:
-                can_read_ocr = True
-            else:
+            preflight_blocked = False
+            if (
+                sys.platform.startswith("darwin")
+                and Quartz is not None
+                and hasattr(Quartz, "CGPreflightScreenCaptureAccess")
+            ):
+                try:
+                    if not bool(Quartz.CGPreflightScreenCaptureAccess()):
+                        preflight_blocked = True
+                except Exception:
+                    preflight_blocked = False
+
+            if preflight_blocked:
+                self._ocr_probe_cache = (time.monotonic(), False)
                 errors.append(
                     {
                         "code": "screen_capture_unavailable",
-                        "message": "Screen Recording permission or display capture unavailable for this process",
+                        "message": "Screen Recording permission unavailable for this process (CGPreflightScreenCaptureAccess=False)",
                         "thread_id": None,
                     }
                 )
+            else:
+                cache_hit: Optional[bool] = None
+                if not force_refresh and self._ocr_probe_cache is not None:
+                    cached_at, cached_val = self._ocr_probe_cache
+                    if (time.monotonic() - cached_at) < 30.0:
+                        cache_hit = cached_val
+                if cache_hit is not None:
+                    can_read_ocr = cache_hit
+                else:
+                    probe_box = (win_bbox[0], win_bbox[1], win_bbox[0] + 32, win_bbox[1] + 32)
+                    can_read_ocr = utils._safe_grab(probe_box) is not None
+                    self._ocr_probe_cache = (time.monotonic(), can_read_ocr)
+                if not can_read_ocr:
+                    errors.append(
+                        {
+                            "code": "screen_capture_unavailable",
+                            "message": "Screen Recording permission or display capture unavailable for this process",
+                            "thread_id": None,
+                        }
+                    )
 
         can_navigate = sys.platform.startswith(("darwin", "win32", "linux")) and pid is not None
         can_stage = bool(pid is not None and win_bbox is not None and (can_read_semantic or can_read_ocr) and pyautogui is not None)
 
-        return SessionDescription(
+        desc = SessionDescription(
             actor=actor,
             app_name="Discord",
             window_title=win_title,
@@ -323,6 +376,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
             },
             errors=errors,
         )
+        self._session_cache = (time.monotonic(), desc)
+        return desc
 
     def _get_ax_window(self) -> Optional[Any]:
         if not sys.platform.startswith("darwin"):
@@ -1225,13 +1280,6 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 pass
         return focused
 
-    def _find_ax_sheet_open(self, ax_win: Any) -> Optional[Any]:
-        nodes = _walk_ax_tree(ax_win, max_nodes=800, max_depth=12)
-        for n in nodes:
-            if n["role"] == "AXSheet":
-                return n["element"]
-        return None
-
     def _stage_single_attachment(
         self,
         ax_win: Any,
@@ -1239,9 +1287,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         file_path: Path,
         filename: str,
     ) -> bool:
-        """Stage a single local file into the composer without ever pressing Send."""
-        import subprocess
-
+        """Stage a single local file into the composer via POSIX clipboard paste without ever pressing Send."""
         resolved_str = str(file_path.resolve())
         paste_mod = "command" if sys.platform.startswith("darwin") else "ctrl"
         baseline_win = self._get_ax_window() or ax_win
@@ -1250,7 +1296,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
             self._inspect_staged_attachments(baseline_win, baseline_comp or composer_elem)
         )
 
-        # Primary macOS strategy: POSIX file reference on clipboard + Cmd+V into focused composer
+        # Strictly non-sending attachment staging: POSIX file reference on clipboard + paste into focused composer
         if sys.platform.startswith("darwin") and pyautogui is not None:
             try:
                 escaped = resolved_str.replace("\\", "\\\\").replace('"', '\\"')
@@ -1269,85 +1315,6 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         or self._count_staged_attachment_slots(items) > baseline_slots
                     ):
                         return True
-            except Exception:
-                pass
-
-        # Fallback strategy: open "More message options" -> "Upload a File" -> macOS AXSheet Go-To-Folder
-        if sys.platform.startswith("darwin") and pyautogui is not None and pyperclip is not None:
-            try:
-                cur_win = self._get_ax_window() or ax_win
-                nodes = _walk_ax_tree(cur_win, max_nodes=2500, max_depth=24)
-                more_btn = next(
-                    (
-                        n["element"]
-                        for n in nodes
-                        if n["role"] in ("AXPopUpButton", "AXButton")
-                        and "more message options" in (n["description"] + " " + n["title"]).lower()
-                    ),
-                    None,
-                )
-                if more_btn is not None:
-                    self._focus_element(more_btn)
-                    time.sleep(0.35)
-                    menu_win = self._get_ax_window() or cur_win
-                    menu_nodes = _walk_ax_tree(menu_win, max_nodes=1200, max_depth=16)
-                    upload_btn = next(
-                        (
-                            n["element"]
-                            for n in menu_nodes
-                            if n["role"] in ("AXMenuItem", "AXButton")
-                            and "upload a file" in (n["description"] + " " + n["title"]).lower()
-                        ),
-                        None,
-                    )
-                    if upload_btn is not None:
-                        self._focus_element(upload_btn)
-                        time.sleep(0.5)
-                        sheet = None
-                        for _ in range(6):
-                            sheet = self._find_ax_sheet_open(self._get_ax_window() or cur_win)
-                            if sheet is not None:
-                                break
-                            time.sleep(0.25)
-                        if sheet is not None:
-                            pyautogui.hotkey("command", "shift", "g")
-                            time.sleep(0.45)
-                            pyperclip.copy(resolved_str)
-                            pyautogui.hotkey("command", "v")
-                            time.sleep(0.25)
-                            # Confirm ONLY the Go-To-Folder dialog sheet (never Discord Send)
-                            pyautogui.press("return")
-                            time.sleep(0.45)
-                            sheet_nodes = _walk_ax_tree(sheet, max_nodes=400, max_depth=12)
-                            open_btn = next(
-                                (
-                                    n["element"]
-                                    for n in sheet_nodes
-                                    if n["role"] == "AXButton"
-                                    and (n["title"] or n["description"]).strip().lower() == "open"
-                                ),
-                                None,
-                            )
-                            if open_btn is not None:
-                                try:
-                                    from ApplicationServices import AXUIElementPerformAction, kAXPressAction  # type: ignore
-
-                                    AXUIElementPerformAction(open_btn, kAXPressAction)
-                                except Exception:
-                                    b = _ax_bounds(open_btn)
-                                    if b is not None:
-                                        pyautogui.click(b[0] + b[2] * 0.5, b[1] + b[3] * 0.5)
-                            deadline = time.monotonic() + 3.0
-                            while time.monotonic() < deadline:
-                                time.sleep(0.35)
-                                latest_win = self._get_ax_window() or cur_win
-                                latest_comp, _ = self._inspect_composer(latest_win)
-                                items = self._inspect_staged_attachments(latest_win, latest_comp or composer_elem)
-                                if (
-                                    self._attachment_preview_contains(items, filename)
-                                    or self._count_staged_attachment_slots(items) > baseline_slots
-                                ):
-                                    return True
             except Exception:
                 pass
         return False
@@ -1386,7 +1353,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
             self._focus_element(comp_elem)
             pyautogui.hotkey(mod, "a")
             time.sleep(0.1)
-            pyautogui.press("backspace")
+            self._safe_key_press("backspace")
             time.sleep(0.2)
 
         final_win = self._get_ax_window() or ax_win
@@ -1460,7 +1427,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 if composer_elem is not None:
                     break
 
-        post_session = self.describe_session()
+        post_session = self.describe_session(force_refresh=True)
         post_actor_err = self._actor_mismatch_reason(expected_actor, post_session.actor)
         if post_actor_err:
             return ComposerStageObservation(
