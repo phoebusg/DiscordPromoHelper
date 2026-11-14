@@ -14,6 +14,7 @@ from .config import (
     get_forum_profile,
     upsert_forum_profile,
 )
+from .drafts import check_draft_conflicts
 from .exchange import (
     ContractValidationError,
     RecordConflictError,
@@ -446,9 +447,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
                     "submission_observed",
                     "user_confirmed_submitted",
                     "rejected",
-                    "needs_review",
                 ):
                     continue
+                if row is not None and row["status"] == "needs_review":
+                    if (
+                        int(row.get("needs_recheck") or 0) == 1
+                        or ctrl.is_review_active()
+                        or bool(check_draft_conflicts(draft, store))
+                    ):
+                        continue
                 receipt = mgr.stage_draft_request(
                     draft,
                     prof,

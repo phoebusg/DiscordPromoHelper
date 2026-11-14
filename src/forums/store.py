@@ -20,11 +20,22 @@ from .models import (
     compute_bytes_sha256,
     compute_content_hash,
     optional_discord_id,
+    parse_rfc3339_utc,
     require_discord_id,
     utc_now_iso,
 )
 
 DEFAULT_PRODUCER_ID = "discord-promo-helper"
+
+
+def _sqlite_ts_sort_key(value: Optional[str]) -> str:
+    """Normalize whole-second and fractional-second RFC 3339 UTC strings for SQLite sorting."""
+    if not value:
+        return ""
+    try:
+        return parse_rfc3339_utc(value).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return str(value)
 
 
 class ForumStore:
@@ -35,6 +46,7 @@ class ForumStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function("ts_sort_key", 1, _sqlite_ts_sort_key)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._active_scope_key: Optional[str] = None
@@ -315,7 +327,7 @@ class ForumStore:
             ).fetchone()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM mirror_meta ORDER BY updated_at DESC LIMIT 2"
+                "SELECT * FROM mirror_meta ORDER BY ts_sort_key(updated_at) DESC LIMIT 2"
             ).fetchall()
             if len(rows) > 1:
                 raise ValueError("Multiple mirror scopes present in store; call ensure_scope() first")
@@ -333,7 +345,7 @@ class ForumStore:
         meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
         cov = json.loads(meta["coverage_json"])
         unresolved = self._conn.execute(
-            "SELECT * FROM unresolved_topics WHERE forum_id = ? AND resolved_thread_id IS NULL ORDER BY observed_at, observation_ref",
+            "SELECT * FROM unresolved_topics WHERE forum_id = ? AND resolved_thread_id IS NULL ORDER BY ts_sort_key(observed_at), observation_ref",
             (meta["forum_id"],),
         ).fetchall()
         pending = [p for p in cov.get("pending", []) if p.get("thread_id") is not None]
@@ -950,16 +962,21 @@ class ForumStore:
         mid = optional_discord_id(message_id, "message_id")
         now = observed_at or utc_now_iso()
         chash = compute_content_hash(body)
-        atts_norm = [
-            {
-                "attachment_id": a.get("attachment_id"),
-                "name": a["name"],
-                "source_url": a.get("source_url"),
-                "sha256": a.get("sha256"),
-                "local_ref": a.get("local_ref"),
-            }
-            for a in (attachments or [])
-        ]
+        atts_norm: Optional[list[dict[str, Any]]] = (
+            [
+                {
+                    "attachment_id": a.get("attachment_id"),
+                    "name": a["name"],
+                    "source_url": a.get("source_url"),
+                    "sha256": a.get("sha256"),
+                    "local_ref": a.get("local_ref"),
+                }
+                for a in attachments
+            ]
+            if attachments is not None
+            else None
+        )
+        init_atts = atts_norm if atts_norm is not None else []
 
         # Resolve existing ref via provisional alias or message_id
         candidate_ref = entity_ref or (f"msg:{mid}" if mid else None)
@@ -991,7 +1008,7 @@ class ForumStore:
             "remote_edited_at": remote_edited_at,
             "source_url": eff_url,
             "identity_verified": bool(identity_verified),
-            "attachments": atts_norm,
+            "attachments": init_atts,
             **(extra or {}),
         }
         if recognition is not None:
@@ -1022,7 +1039,7 @@ class ForumStore:
                         remote_edited_at,
                         eff_url,
                         int(bool(identity_verified)),
-                        json.dumps(atts_norm),
+                        json.dumps(init_atts),
                         json.dumps(recognition) if recognition is not None else None,
                         json.dumps(extra or {}),
                     ),
@@ -1068,8 +1085,10 @@ class ForumStore:
 
             old_hash = row["content_hash"]
             old_atts = json.loads(row["attachments_json"])
+            next_atts = old_atts if atts_norm is None else atts_norm
+            entity["attachments"] = next_atts
             body_changed = old_hash != chash
-            atts_changed = old_atts != atts_norm
+            atts_changed = atts_norm is not None and old_atts != atts_norm
 
             if not body_changed and not atts_changed:
                 if eff_mid and not row["message_id"]:
@@ -1118,7 +1137,7 @@ class ForumStore:
                     remote_edited_at or row["remote_edited_at"],
                     entity["source_url"],
                     int(bool(identity_verified)),
-                    json.dumps(atts_norm),
+                    json.dumps(next_atts),
                     json.dumps(recognition) if recognition is not None else None,
                     json.dumps(extra or {}),
                     resolved_ref,
@@ -1165,7 +1184,7 @@ class ForumStore:
             """
             SELECT thread_id FROM topics
             WHERE forum_id = ?
-            ORDER BY COALESCE(last_deep_read_at, '') ASC, observed_at ASC, thread_id ASC
+            ORDER BY ts_sort_key(COALESCE(last_deep_read_at, '')) ASC, ts_sort_key(observed_at) ASC, thread_id ASC
             LIMIT ?
             """,
             (fid, int(limit)),
@@ -1513,12 +1532,12 @@ class ForumStore:
     def list_receipts(self, draft_id: Optional[str] = None) -> list[dict[str, Any]]:
         if draft_id:
             rows = self._conn.execute(
-                "SELECT record_json FROM receipts WHERE draft_id = ? ORDER BY observed_at, rowid",
+                "SELECT record_json FROM receipts WHERE draft_id = ? ORDER BY ts_sort_key(observed_at), rowid",
                 (draft_id,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT record_json FROM receipts ORDER BY observed_at, rowid"
+                "SELECT record_json FROM receipts ORDER BY ts_sort_key(observed_at), rowid"
             ).fetchall()
         return [json.loads(r["record_json"]) for r in rows]
 
@@ -1630,7 +1649,7 @@ class ForumStore:
             topics_list.append(t_obj)
 
         messages_rows = self._conn.execute(
-            "SELECT * FROM messages ORDER BY observed_at, entity_ref"
+            "SELECT * FROM messages ORDER BY ts_sort_key(observed_at), entity_ref"
         ).fetchall()
         messages_list = []
         for m in messages_rows:
@@ -1900,7 +1919,7 @@ class ForumStore:
         if forum_id:
             t_sql += " AND forum_id = ?"
             t_params.append(forum_id)
-        t_sql += " ORDER BY observed_at DESC"
+        t_sql += " ORDER BY ts_sort_key(observed_at) DESC"
         topics = [
             {
                 "thread_id": r["thread_id"],
@@ -1923,7 +1942,7 @@ class ForumStore:
         if forum_id:
             m_sql += " AND t.forum_id = ?"
             m_params.append(forum_id)
-        m_sql += " ORDER BY m.observed_at DESC"
+        m_sql += " ORDER BY ts_sort_key(m.observed_at) DESC"
         messages = [
             {
                 "entity_ref": r["entity_ref"],
@@ -1990,7 +2009,7 @@ class ForumStore:
             return None
 
         msgs = self._conn.execute(
-            "SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(remote_created_at, observed_at), entity_ref",
+            "SELECT * FROM messages WHERE thread_id = ? ORDER BY ts_sort_key(COALESCE(remote_created_at, observed_at)), entity_ref",
             (tid,),
         ).fetchall()
         starter = None
