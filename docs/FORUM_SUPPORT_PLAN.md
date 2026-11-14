@@ -6,6 +6,8 @@ Design updated 14 November 2026. This document specifies work to implement; it d
 
 Preserve Discord Promo Helper's established promotion purpose and UI, and support communities whose promotion areas are forums. The generic forum module must also serve external tools that need a usable local representation of a community project.
 
+The long-term product use is placing promotion content in owner-designated self-promotion **forum areas**, alongside the existing self-promotion text channels. Project-testing is an immediate, separately configured adaptation of the same reader, mirror and composer logic; it is not a replacement product direction. A proposed per-profile `purpose` selects `promotion` or `external_project`, with the existing independent enable flags controlling read/stage behavior. Existing defaults remain unchanged; private domain templates/data stay outside the public app.
+
 The priorities are:
 
 1. **GET current forum state from the logged-in Discord view**: topics, messages, starter summaries, guidelines, requirements, tags and available state. Initial retrieval and subsequent refresh are core features, not a manual-paste-only import workflow.
@@ -33,8 +35,11 @@ Private producers must not become dependencies of this repository. Implement sel
 - `src/ui.py`: keep the Tkinter server-settings interface; add an optional forum/status window and draft-review flow using its existing conventions.
 - `src/stream_info.py`: reuse stream metadata for public promotion drafts.
 - `src/server_config.py`: retain existing settings; add optional canonical forum destinations and separate catalog/promotion/external-draft flags with backward-compatible defaults.
-- `src/channel_nav.py`: current channel scan returns an empty list; single-server scan is a stub. Its title OCR calls a missing `utils._safe_grab`. It is not a forum reader yet.
-- `src/discord_nav.py`: reuse useful window/navigation helpers, not broad all-server clicking as a substitute for a configured forum target. Callback errors currently do not establish successful per-server completion.
+- `src/utils.py::find_channel_position`: the tracked channel lookup OCRs the visible left sidebar and returns a best matching position/name/confidence or no result. It does not enumerate forum topics or histories.
+- `src/discord_nav.py::_safe_grab`: already tries an available utility helper and falls back to PIL ImageGrab. Preserve this fallback; there is no missing-helper defect in this tracked function.
+- `src/discord_nav.py::iterate_all_servers`: tracked code has no callback interface, returns the collected server list and can stop at safety/staleness limits without a structured coverage manifest. Reuse appropriate helpers, but do not treat a returned list as proof of complete forum traversal.
+
+The earlier reference to a stub `channel_nav.py` and callback errors described uncommitted local work, not code in this PR. That local work is excluded from the review baseline and should be evaluated separately before it is adopted. It is not an implementation dependency for the new module.
 - `src/promotion_helper.py`: fixed promotional wording and default Enter behavior must not be inherited by the reviewed forum staging path.
 - `src/main.py`: filtered CLI targets currently are not passed into the legacy posting queue. Keep the forum module separate; handle that issue in a focused promotion fix.
 - `src/utils.py`: already has tooltip cropping, scaling, polarity, contrast/threshold variants, padding, PSM fallbacks and confidence ranking. Build on these rather than re-adding them.
@@ -164,7 +169,15 @@ This is a proposed layout, not created code. Generic fixture/schema files accomp
 2. **Full catalogue and status:** complete accessible topic/history traversal with resumable coverage, requirements refresh and rotating deep rereads. Demonstrate local status/change queries without opening Discord manually for every topic.
 3. **Composer staging:** one request stages multiline text and evidence in the correct existing topic, leaving the person to edit and Send. Verify the later message/receipt without duplicate staging.
 4. **Generic promotion integration and exchange:** optional forum UI, existing-topic routing, stream templates, independent flags/cooldowns and cross-project contracts. Preserve legacy settings/defaults.
-5. **Targeted OCR and correctness work:** fix the missing screenshot helper and test isolation, then measure structured/task-specific OCR. Do not replace polished UI or transplant private code.
+5. **Targeted OCR and correctness work:** preserve the existing screenshot fallback, add structured traversal coverage and restore test isolation, then measure structured/task-specific OCR. Do not replace polished UI or transplant private code.
+
+## Immediate usability gate
+
+This PR is documentation only. The forum module/adapter is not implemented by it, and no live read/change/staging acceptance run has been completed. Do not report the project-testing feature as usable from these documents or from passing unrelated OCR tests.
+
+The immediate configured workflow must pass: read actual topic messages and guidance into the local mirror, refresh to identify additions/edits, query status locally, stage one evidence-backed update in the verified correct composer, and leave final edits/Send to the person. Record the tested platform/provider, snapshot coverage, detected changes and staging evidence in project notes. Do not create community test posts just to manufacture a successful test; observe existing changes or use a controlled test fixture for mutation scenarios.
+
+After that vertical slice works, broaden accessible history coverage and apply the same generic logic to designated self-promotion forums. Keep this gate ahead of optional OCR-engine work or a visual redesign.
 
 Acceptance scenarios:
 

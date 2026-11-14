@@ -2,6 +2,13 @@
 
 Updated 14 November 2026. Requirements below are planned work unless checked. Preserve the existing promotion product and UI.
 
+Long term: support promotion in owner-designated self-promotion forums as well as text channels. Immediate priority: make the same generic reader/mirror/composer logic usable for a separately configured project-testing workflow. Proposed profile `purpose`: `promotion` or `external_project`; private domain data/templates remain separate. This documentation PR does not implement the runtime feature.
+
+## P0 — Demonstrate the immediate configured workflow
+
+- [ ] Run the real read -> mirror -> refresh/diff -> local status -> correct-composer staging path with selected evidence, leaving final editing and Send to the person. Record platform/provider, coverage and actual observed results.
+- [ ] Keep the project-testing profile opt-in and independent of promotion enablement; preserve existing product defaults. Do not call the feature usable until this gate passes.
+
 ## P0 — GET forum state and keep a local mirror
 
 - [ ] Implement a configured-forum reader against the installed Discord view; semantic/accessibility text first, OCR fallback. Verify the adapter in the shipped Python/runtime, not just developer tools.
@@ -41,9 +48,9 @@ Updated 14 November 2026. Requirements below are planned work unless checked. Pr
 
 ## P1 — Focused existing correctness fixes
 
-- [ ] Fix `channel_nav`'s missing screenshot helper reference and test the actual helper boundary rather than mocking away its existence.
+- [ ] Preserve/test the tracked `_safe_grab` utility-to-PIL fallback and the existing sidebar OCR lookup while adding the forum adapter. Evaluate any uncommitted scanner work separately; it is not part of this PR's baseline.
 - [ ] Restore module globals mocked by `tests/test_nav_logic.py`; verify OCR tests independently and in the full suite.
-- [ ] Report partial channel/callback scan failures accurately rather than always declaring completion.
+- [ ] Add structured coverage and stop/error reasons around traversal; a collected server list or visible sidebar match does not establish complete forum/history coverage. The tracked server iterator has no callback API.
 - [ ] Fix the legacy live CLI queue ignoring its computed filtered targets in a separate scoped change.
 
 ## P2 — Measured public OCR improvements

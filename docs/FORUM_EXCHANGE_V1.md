@@ -16,7 +16,7 @@ Every record requires these keys:
 | `created_at` | RFC 3339 UTC string with `Z` |
 | `scope` | Object with `guild_id`, `forum_id`, `actor` |
 
-All Discord IDs are decimal **strings**. Actor shape: `{ "user_id": null, "label": "Selected account" }`; `user_id` is an observed ID string or null. A label alone does not verify identity. Staging checks the current account/target, not just these fields.
+All Discord IDs are decimal **strings**; null is allowed only where a field explicitly says so. Scope guild/forum IDs and exchanged topic thread IDs must be resolved non-null IDs. Actor shape: `{ "user_id": null, "label": "Selected account" }`; `user_id` is an observed ID string or null. A label alone does not verify identity. Staging checks the current account/target, not just these fields.
 
 Revision fields are positive integers local to the named entity. Hashes are lowercase SHA-256 hex of UTF-8 text with CRLF converted to LF, preserving other whitespace, punctuation and Unicode. Unknown IDs/remote times are null, never invented. Source observations are preserved separately.
 
@@ -29,6 +29,10 @@ Additional required keys: `snapshot_id` (stable mirror-scope string), `revision`
 `forum` required keys: `forum_id`, `name`, `source_url`, `tags` (array), `revision`, `observed_at`.
 
 Topic required keys: `thread_id`, `forum_id`, `title`, `source_url`, `revision`, `observed_at`, `tags`, `starter_message_id` (string/null), `archived` (boolean/null), `locked` (boolean/null). Optional `remote_last_activity_at` is string/null, distinct from local capture time.
+
+**Unresolved topics are not exchanged as topics.** `thread_id` and `forum_id` must be verified non-null decimal strings; a topic `source_url` must identify that thread. Keep unresolved observations locally under distinct stable `observation_ref` keys, never a shared null key or a title-derived identity. Report them in `coverage.pending` with `observation_ref`, null `thread_id`, a reason and a resume token. Do not emit their messages or topic changes into the exchange until the parent thread is resolved. This keeps every exchanged message associated with a known topic.
+
+When resolved, retain the local observation-to-thread mapping, reconcile repeated observations without merging distinct topics by name, and emit one `added` topic event under its verified thread ID. Then export associated messages using that ID. Repeated refreshes must not emit another addition. Two unresolved topics with identical titles remain distinct local observations and pending entries; neither is stageable until resolved. A previously verified ID is never reassigned merely because OCR/title text changes.
 
 Message required keys: `entity_ref` (stable opaque string), `message_id` (string/null), `thread_id`, `author` (actor shape), `body` (string), `content_hash`, `revision`, `observed_at`, `remote_created_at` (string/null), `remote_edited_at` (string/null), `source_url` (string/null), `identity_verified` (boolean), `attachments` (array). With no remote ID, use an explicitly provisional `entity_ref`; do not merge messages just by author/time. Later reconciliation retains an alias. Optional `recognition` supplies method/confidence without rewriting source text.
 
@@ -49,7 +53,7 @@ Coverage required shape:
 }
 ```
 
-Coverage status values: `not_started`, `partial`, `complete`, each for the configured accessible scope/checkpoint. Resume tokens are opaque provider strings/null. Errors are objects with `code`, `message` and nullable `thread_id`. Topic coverage does not imply history coverage. Merge partial snapshots without deleting unseen prior records.
+Coverage status values: `not_started`, `partial`, `complete`, each for the configured accessible scope/checkpoint. Resume tokens are opaque provider strings/null. A pending entry with null `thread_id` requires a unique stable `observation_ref`; pending known topics retain their verified ID. Unresolved observations keep topic coverage partial. Errors are objects with `code`, `message` and nullable `thread_id`. Topic coverage does not imply history coverage. Merge partial snapshots without deleting unseen prior records.
 
 ## forum.changes.v1
 
@@ -114,4 +118,4 @@ Submission observation needs a later correlated message and actor/target evidenc
 
 Readers tolerate additive unknown fields, reject missing required keys/unsupported schemas, and preserve unrecognized metadata when round-tripping. Breaking type/semantic changes require a new version. Private producers remain optional.
 
-Both implementations must validate the same fictional fixture set: partial snapshot, new reply, silent edit, requirements change, draft with one small attachment, staged receipt and human-edited submission receipt. Live community content and private evidence never enter public fixtures.
+Both implementations must validate the same fictional fixture set: partial snapshot, two distinct unresolved same-title topics, their later verified resolution with correctly associated messages and no duplicate additions, new reply, silent edit, requirements change, draft with one small attachment, staged receipt and human-edited submission receipt. Live community content and private evidence never enter public fixtures.
