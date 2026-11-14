@@ -645,6 +645,40 @@ class TestForumReaderAndChangeDetection(unittest.TestCase):
                 store.close()
 
 
+def _seed_mirror_for_draft(store: ForumStore, draft: dict[str, Any]) -> None:
+    scope = draft["scope"]
+    baseline = draft.get("baseline") or {}
+    dest = draft["destination"]
+    gid = scope["guild_id"]
+    fid = scope["forum_id"]
+    store.ensure_scope(gid, fid, actor=scope.get("actor"), snapshot_id=baseline.get("snapshot_id"))
+    if dest.get("thread_id"):
+        store.upsert_topic(
+            thread_id=dest["thread_id"],
+            forum_id=fid,
+            title="North Ridge Depot",
+            source_url=dest.get("source_url"),
+        )
+    for req_ref in baseline.get("requirements", []):
+        rid = req_ref["requirement_id"]
+        target_rev = max(1, int(req_ref["revision"]))
+        for r_i in range(1, target_rev + 1):
+            store.upsert_requirement(
+                requirement_id=rid,
+                forum_id=fid,
+                body=f"Rule text rev {r_i}",
+                source_entity_ref=f"forum:{fid}",
+                source_url=build_discord_channel_url(gid, fid),
+            )
+    target_snap_rev = int(baseline.get("snapshot_revision") or 1)
+    if target_snap_rev > 1:
+        with store._conn:
+            store._conn.execute(
+                "UPDATE mirror_meta SET snapshot_revision = ? WHERE guild_id = ? AND forum_id = ?",
+                (target_snap_rev, gid, fid),
+            )
+
+
 class TestComposerStagingAndEnablement(unittest.TestCase):
     def test_preserves_existing_human_draft_and_pauses_on_account_mismatch(self):
         with tempfile.TemporaryDirectory() as td:
@@ -654,6 +688,7 @@ class TestComposerStagingAndEnablement(unittest.TestCase):
             store = ForumStore(profile.db_path)
             try:
                 draft = read_record(FIXTURE_DIR / "draft_with_attachment.v1.json")
+                _seed_mirror_for_draft(store, draft)
                 profile.transfer_root = str(FIXTURE_DIR)
                 handoff = HandoffManager(store, provider)
 
@@ -694,14 +729,33 @@ class TestComposerStagingAndEnablement(unittest.TestCase):
             )
             provider.topic_pages = [TopicListObservation(topics=[t1], complete=True)]
             provider.histories[THREAD_1] = TopicHistoryObservation(topic=t1, messages=[], complete=True)
+            provider.requirements = [
+                RequirementObservation(
+                    requirement_id="guidelines-fixture",
+                    forum_id=FORUM_ID,
+                    body="Include UTC timestamp and synthetic evidence.",
+                    source_entity_ref=f"forum:{FORUM_ID}",
+                    source_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                )
+            ]
 
             store = ForumStore(profile.db_path)
             try:
                 session_ctrl = SessionController()
                 reader = ForumReader(profile, store, provider, session_controller=session_ctrl)
                 reader.initial_backfill()
+                snap = store.export_snapshot()
 
                 draft = read_record(FIXTURE_DIR / "draft_with_attachment.v1.json")
+                draft["baseline"] = {
+                    "snapshot_id": snap["snapshot_id"],
+                    "snapshot_revision": snap["revision"],
+                    "requirements": [
+                        {"requirement_id": r["requirement_id"], "revision": r["revision"]}
+                        for r in snap["requirements"]
+                    ],
+                    "message_content_hash": None,
+                }
                 handoff = HandoffManager(store, provider, session_controller=session_ctrl)
                 receipt = handoff.stage_draft_request(draft, profile, source_kind="external")
                 self.assertEqual(receipt["status"], "staged")
@@ -851,26 +905,38 @@ class TestOCRAndLegacyTargets(unittest.TestCase):
             promotion_helper.queue_updates("Live Title", "https://example.invalid/live", servers=[])
             mock_find.assert_not_called()
 
-        # Non-matching channel is skipped while matching channel calls post_update
+        # Non-matching channel is skipped while matching channel + active server calls post_update
         found_seq = iter([((100, 200), "other-promo", 0.9), ((120, 220), "allowed-promo", 0.9)])
-        with patch.object(promotion_helper, "find_channel_position", side_effect=lambda *_: next(found_seq)):
-            with patch.object(promotion_helper, "can_post", return_value=True):
-                with patch.object(promotion_helper, "update_timestamp"):
-                    with patch.object(promotion_helper, "post_update") as mock_post:
-                        with patch.object(
-                            promotion_helper.time,
-                            "sleep",
-                            side_effect=[None, StopIteration("stop_loop")],
-                        ):
-                            with self.assertRaises(StopIteration):
-                                promotion_helper.queue_updates(
-                                    "Live Title",
-                                    "https://example.invalid/live",
-                                    interval_minutes=1,
-                                    run_duration_hours=1,
-                                    servers=filtered_servers,
-                                )
+        with patch.object(promotion_helper, "_get_active_server_name", return_value="FilteredSrv"):
+            with patch.object(promotion_helper, "find_channel_position", side_effect=lambda *_: next(found_seq)):
+                with patch.object(promotion_helper, "can_post", return_value=True):
+                    with patch.object(promotion_helper, "update_timestamp"):
+                        with patch.object(promotion_helper, "post_update") as mock_post:
+                            with patch.object(
+                                promotion_helper.time,
+                                "sleep",
+                                side_effect=[None, StopIteration("stop_loop")],
+                            ):
+                                with self.assertRaises(StopIteration):
+                                    promotion_helper.queue_updates(
+                                        "Live Title",
+                                        "https://example.invalid/live",
+                                        interval_minutes=1,
+                                        run_duration_hours=1,
+                                        servers=filtered_servers,
+                                    )
         mock_post.assert_called_once_with("Live Title", "https://example.invalid/live", (120, 220))
+
+        # Excluded active server (even with matching channel name) or unconfigured sibling server does not allow send
+        self.assertFalse(promotion_helper._is_channel_allowed_for_active_server("allowed-promo", filtered_servers, "OtherServer"))
+        self.assertFalse(promotion_helper._is_channel_allowed_for_active_server("allowed-promo", filtered_servers, None))
+        mixed_servers = [
+            {"name": "SrvA", "promo_channels": ["#a-only"]},
+            {"name": "SrvB", "promo_channels": []},
+        ]
+        self.assertFalse(promotion_helper._is_channel_allowed_for_active_server("general", mixed_servers, "SrvA"))
+        self.assertTrue(promotion_helper._is_channel_allowed_for_active_server("a-only", mixed_servers, "SrvA"))
+        self.assertTrue(promotion_helper._is_channel_allowed_for_active_server("general", mixed_servers, "SrvB"))
 
 
 class TestCompletionHandoffPriorities(unittest.TestCase):
@@ -1180,7 +1246,6 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             )
             store = ForumStore(profile.db_path)
             try:
-                store.ensure_scope(GUILD_ID, FORUM_ID, actor={"user_id": ACTOR_USER_ID, "label": "Tester"})
                 mgr = HandoffManager(store, fake_stage_provider, session_controller=ctrl_stager, exchange_dir=profile.exchange_dir)
                 req = {
                     "schema": "draft.request.v1",
@@ -1213,6 +1278,10 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
                         "message_content_hash": None,
                     },
                 }
+                _seed_mirror_for_draft(store, req)
+                snap_req = store.export_snapshot(guild_id=GUILD_ID, forum_id=FORUM_ID)
+                req["baseline"]["snapshot_id"] = snap_req["snapshot_id"]
+                req["baseline"]["snapshot_revision"] = snap_req["revision"]
                 with patch.object(fake_stage_provider, "stage_draft", return_value=partial_obs):
                     rec = mgr.stage_draft_request(req, profile)
                 self.assertEqual(rec["status"], "needs_review")
@@ -1249,10 +1318,28 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             )
             upsert_forum_profile(cli_prof, profiles_path)
             scenario = json.loads((FIXTURE_DIR / "shared_scenario.json").read_text(encoding="utf-8"))
+            with redirect_stdout(io.StringIO()):
+                cli_main(
+                    [
+                        "--profiles-path",
+                        str(profiles_path),
+                        "refresh",
+                        "--profile",
+                        "cli-sync-test",
+                        "--provider",
+                        "seed",
+                        "--export",
+                    ]
+                )
+            cli_store_init = ForumStore(cli_prof.db_path)
+            try:
+                cli_snap = cli_store_init.export_snapshot(guild_id=GUILD_ID, forum_id=FORUM_ID)
+            finally:
+                cli_store_init.close()
             cli_draft = copy.deepcopy(scenario["draft_request"])
             cli_draft["baseline"] = {
-                "snapshot_id": None,
-                "snapshot_revision": None,
+                "snapshot_id": cli_snap["snapshot_id"],
+                "snapshot_revision": cli_snap["revision"],
                 "requirements": [],
                 "message_content_hash": None,
             }
@@ -1654,7 +1741,7 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             )
             draft_req = {
                 "draft_id": "draft-safe-1",
-                "action": "reply_topic",
+                "action": "reply_existing",
                 "destination": {
                     "guild_id": GUILD_ID,
                     "forum_id": FORUM_ID,
@@ -1726,6 +1813,720 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             s3 = probe_provider.describe_session(force_refresh=True)
             self.assertEqual(pid_mock.call_count, 2)
             self.assertFalse(s3.capabilities.get("can_read_ocr"))
+
+
+class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
+    def test_baseline_conflict_checks_and_target_constraints(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            store = ForumStore(td_path / "baseline.sqlite3")
+            try:
+                base_draft = read_record(FIXTURE_DIR / "draft_with_attachment.v1.json")
+
+                # Uninitialized store -> conflict
+                self.assertIn("not initialized", "; ".join(check_draft_conflicts(base_draft, store)))
+
+                # Initialized empty store -> baseline not established + missing entities
+                store.ensure_scope(GUILD_ID, FORUM_ID, snapshot_id="mirror-fixture-main")
+                c_empty = "; ".join(check_draft_conflicts(base_draft, store))
+                self.assertIn("no established baseline state", c_empty)
+
+                # Populate matching baseline
+                store.upsert_forum(forum_id=FORUM_ID, name="Fixture", source_url=build_discord_channel_url(GUILD_ID, FORUM_ID))
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="North Ridge Depot", archived=False, locked=False)
+                store.upsert_requirement(requirement_id="guidelines-fixture", forum_id=FORUM_ID, body="v1")
+                store.upsert_requirement(requirement_id="guidelines-fixture", forum_id=FORUM_ID, body="v2")
+                with store._conn:
+                    store._conn.execute("UPDATE mirror_meta SET snapshot_revision = 4")
+
+                self.assertEqual(check_draft_conflicts(base_draft, store), [])
+
+                # Null / mismatched snapshot_id
+                d_null_snap = copy.deepcopy(base_draft)
+                d_null_snap["baseline"]["snapshot_id"] = None
+                self.assertTrue(any("missing snapshot_id" in c for c in check_draft_conflicts(d_null_snap, store)))
+
+                d_bad_snap = copy.deepcopy(base_draft)
+                d_bad_snap["baseline"]["snapshot_id"] = "mirror-other"
+                self.assertTrue(any("snapshot_id mismatch" in c for c in check_draft_conflicts(d_bad_snap, store)))
+
+                # Invalid / future snapshot_revision
+                d_future_rev = copy.deepcopy(base_draft)
+                d_future_rev["baseline"]["snapshot_revision"] = 99
+                self.assertTrue(any("ahead of mirror" in c for c in check_draft_conflicts(d_future_rev, store)))
+
+                # Missing / stale requirement revision
+                d_bad_req = copy.deepcopy(base_draft)
+                d_bad_req["baseline"]["requirements"] = [{"requirement_id": "missing-req", "revision": 1}]
+                self.assertTrue(any("missing-req missing" in c for c in check_draft_conflicts(d_bad_req, store)))
+
+                d_stale_req = copy.deepcopy(base_draft)
+                d_stale_req["baseline"]["requirements"] = [{"requirement_id": "guidelines-fixture", "revision": 1}]
+                self.assertTrue(any("revision mismatch" in c for c in check_draft_conflicts(d_stale_req, store)))
+
+                # Archived / locked target topic
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="North Ridge Depot", archived=True, locked=True)
+                c_state = "; ".join(check_draft_conflicts(base_draft, store))
+                self.assertIn("archived", c_state)
+                self.assertIn("locked", c_state)
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="North Ridge Depot", archived=False, locked=False)
+
+                # edit_own_message target message / hash verification
+                mid = "100000000000000501"
+                msg_body = "Original reported line"
+                store.upsert_message(
+                    entity_ref=f"msg:{mid}",
+                    message_id=mid,
+                    thread_id=THREAD_1,
+                    author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                    body=msg_body,
+                    observed_at="2026-11-14T10:05:00Z",
+                )
+                d_edit = copy.deepcopy(base_draft)
+                d_edit["action"] = "edit_own_message"
+                d_edit["destination"]["message_id"] = mid
+                d_edit["baseline"]["message_content_hash"] = compute_content_hash(msg_body)
+                self.assertEqual(check_draft_conflicts(d_edit, store), [])
+
+                d_edit_bad_hash = copy.deepcopy(d_edit)
+                d_edit_bad_hash["baseline"]["message_content_hash"] = compute_content_hash("stale text")
+                self.assertTrue(any("content_hash changed" in c for c in check_draft_conflicts(d_edit_bad_hash, store)))
+            finally:
+                store.close()
+
+    def test_change_validation_and_canonical_discord_urls(self):
+        chg = copy.deepcopy(read_record(FIXTURE_DIR / "changes_batch.v1.json"))
+        # Canonical check accepts good batch
+        self.assertEqual(validate_exchange_record(chg)["schema"], "forum.changes.v1")
+
+        # Duplicate change_id rejected
+        dup_chg = copy.deepcopy(chg)
+        dup_chg["changes"].append(copy.deepcopy(dup_chg["changes"][0]))
+        with self.assertRaises(ContractValidationError):
+            validate_exchange_record(dup_chg)
+
+        # Non-increasing revision rejected
+        bad_rev = copy.deepcopy(chg)
+        bad_rev["changes"][0]["before_revision"] = 2
+        bad_rev["changes"][0]["after_revision"] = 2
+        with self.assertRaises(ContractValidationError):
+            validate_exchange_record(bad_rev)
+
+        # removal_observed with non-null after / after_revision rejected
+        bad_rem = copy.deepcopy(chg)
+        bad_rem["changes"][0]["kind"] = "removal_observed"
+        with self.assertRaises(ContractValidationError):
+            validate_exchange_record(bad_rem)
+
+        # Non-canonical URL rejected
+        bad_url = copy.deepcopy(chg)
+        bad_url["changes"][0]["after"]["source_url"] = "https://evil.example/channels/1/2"
+        with self.assertRaises(ContractValidationError):
+            validate_exchange_record(bad_url)
+
+    def test_portable_bundle_intake_validation_and_atomic_review_hold(self):
+        from src.forums.exchange import canonical_record_digest
+        from src.forums.handoff import BundleValidationError, ingest_draft_bundle
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            profile = _make_profile(td_path)
+            provider = FakeForumProvider()
+            store = ForumStore(profile.db_path)
+            try:
+                base_draft = copy.deepcopy(read_record(FIXTURE_DIR / "draft_with_attachment.v1.json"))
+                ev_bytes = b"synthetic-fictional-image"
+                ev_sha = compute_bytes_sha256(ev_bytes)
+                base_draft["evidence"] = [
+                    {
+                        "evidence_id": "ev-bundle-1",
+                        "name": "probe.png",
+                        "local_ref": "probe.png",
+                        "sha256": ev_sha,
+                        "media_type": "image/png",
+                    }
+                ]
+                digest = canonical_record_digest(base_draft)
+                bundle_dir = td_path / digest
+                (bundle_dir / "transfer").mkdir(parents=True)
+                (bundle_dir / "transfer" / "probe.png").write_bytes(ev_bytes)
+                write_record_atomic(bundle_dir / "draft.request.json", base_draft)
+
+                parsed_draft, xfer_root = ingest_draft_bundle(bundle_dir)
+                self.assertEqual(parsed_draft["draft_id"], base_draft["draft_id"])
+                self.assertEqual(xfer_root.resolve(), (bundle_dir / "transfer").resolve())
+
+                # Stage full bundle cleanly after seeding matching mirror state
+                _seed_mirror_for_draft(store, base_draft)
+                handoff = HandoffManager(store, provider)
+                receipt = handoff.stage_draft_bundle(bundle_dir, profile, source_kind="external")
+                self.assertEqual(receipt["status"], "staged")
+                self.assertTrue(handoff.session.is_review_active())
+
+                # Reject unexpected extra top-level files (e.g. private leakage)
+                leak_bundle = td_path / "bad_extra" / digest
+                (leak_bundle / "transfer").mkdir(parents=True)
+                (leak_bundle / "transfer" / "probe.png").write_bytes(ev_bytes)
+                write_record_atomic(leak_bundle / "draft.request.json", base_draft)
+                (leak_bundle / "observation.private.json").write_text("{}", encoding="utf-8")
+                with self.assertRaises(BundleValidationError):
+                    ingest_draft_bundle(leak_bundle)
+
+                # Reject unselected file inside transfer/
+                extra_xfer = td_path / "bad_xfer" / digest
+                (extra_xfer / "transfer").mkdir(parents=True)
+                (extra_xfer / "transfer" / "probe.png").write_bytes(ev_bytes)
+                (extra_xfer / "transfer" / "unselected.png").write_bytes(b"other")
+                write_record_atomic(extra_xfer / "draft.request.json", base_draft)
+                with self.assertRaises(BundleValidationError):
+                    ingest_draft_bundle(extra_xfer)
+
+                # Reject wrong hash dirname
+                bad_dir = td_path / "wronghash"
+                (bad_dir / "transfer").mkdir(parents=True)
+                (bad_dir / "transfer" / "probe.png").write_bytes(ev_bytes)
+                write_record_atomic(bad_dir / "draft.request.json", base_draft)
+                with self.assertRaises(BundleValidationError):
+                    ingest_draft_bundle(bad_dir)
+
+                # Reject symlink in transfer/
+                sym_dir = td_path / "sym_wrap" / digest
+                (sym_dir / "transfer").mkdir(parents=True)
+                outside = td_path / "outside.png"
+                outside.write_bytes(ev_bytes)
+                (sym_dir / "transfer" / "probe.png").symlink_to(outside)
+                write_record_atomic(sym_dir / "draft.request.json", base_draft)
+                with self.assertRaises(BundleValidationError):
+                    ingest_draft_bundle(sym_dir)
+            finally:
+                store.close()
+
+    def test_catalog_enabled_profile_isolation_and_partial_preservation(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            p1 = ForumProfile(
+                profile_id="prof_alpha",
+                name="Alpha",
+                guild_id=GUILD_ID,
+                forum_id=FORUM_ID,
+                source_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                purpose="external_project",
+                catalog_enabled=False,
+            )
+            p2 = ForumProfile(
+                profile_id="prof_beta",
+                name="Beta",
+                guild_id=GUILD_ID,
+                forum_id="200000000000000002",
+                source_url=build_discord_channel_url(GUILD_ID, "200000000000000002"),
+                purpose="external_project",
+                catalog_enabled=True,
+            )
+            # Per-profile DB isolation by default
+            self.assertNotEqual(p1.db_path, p2.db_path)
+            self.assertTrue(p1.db_path.endswith("prof_alpha.sqlite3"))
+
+            store = ForumStore(td_path / "isolated.sqlite3")
+            try:
+                provider = FakeForumProvider()
+                reader = ForumReader(p1, store, provider)
+                # catalog_enabled=False pauses before touching provider
+                with patch.object(provider, "describe_session", side_effect=AssertionError("should not probe")):
+                    res_backfill = reader.initial_backfill()
+                    res_refresh = reader.incremental_refresh()
+                self.assertEqual(res_backfill["reason"], "catalog_disabled")
+                self.assertEqual(res_refresh["reason"], "catalog_disabled")
+
+                # Partial topic update preserves existing tags/archived/locked/starter_message_id
+                store.upsert_topic(
+                    thread_id=THREAD_1,
+                    forum_id=FORUM_ID,
+                    title="Initial Title",
+                    tags=[{"tag_id": "1", "name": "POI"}],
+                    starter_message_id=THREAD_1,
+                    archived=False,
+                    locked=False,
+                )
+                chg_partial = store.upsert_topic(
+                    thread_id=THREAD_1,
+                    forum_id=FORUM_ID,
+                    title="Updated Title",
+                    tags=None,
+                    archived=None,
+                    locked=None,
+                    starter_message_id=None,
+                )
+                self.assertIsNotNone(chg_partial)
+                snap = store.export_snapshot(guild_id=GUILD_ID, forum_id=FORUM_ID)
+                t_after = next(t for t in snap["topics"] if t["thread_id"] == THREAD_1)
+                self.assertEqual(t_after["tags"], [{"tag_id": "1", "name": "POI"}])
+                self.assertEqual(t_after["starter_message_id"], THREAD_1)
+                self.assertFalse(t_after["archived"])
+
+                # Incomplete requirement read must not clobber complete requirement
+                store.upsert_requirement(
+                    requirement_id="guide-1",
+                    forum_id=FORUM_ID,
+                    body="Complete multi-section rules",
+                    complete=True,
+                )
+                self.assertIsNone(
+                    store.upsert_requirement(
+                        requirement_id="guide-1",
+                        forum_id=FORUM_ID,
+                        body="Truncated prefix only",
+                        complete=False,
+                    )
+                )
+                snap2 = store.export_snapshot(guild_id=GUILD_ID, forum_id=FORUM_ID)
+                self.assertEqual(snap2["requirements"][0]["body"], "Complete multi-section rules")
+                self.assertEqual(snap2["requirements"][0]["revision"], 1)
+
+                # Multi-page >50 topics completion latching
+                p_multi = _make_profile(td_path)
+                p_multi.db_path = str(td_path / "multi.sqlite3")
+                multi_store = ForumStore(p_multi.db_path)
+                try:
+                    topics_55 = [
+                        TopicObservation(
+                            forum_id=FORUM_ID,
+                            thread_id=str(400000000000000000 + i),
+                            title=f"Topic {i}",
+                            source_url=build_discord_channel_url(GUILD_ID, str(400000000000000000 + i)),
+                        )
+                        for i in range(55)
+                    ]
+                    multi_prov = FakeForumProvider()
+                    multi_prov.topic_pages = [
+                        TopicListObservation(topics=topics_55[:50], next_cursor="1", complete=False),
+                        TopicListObservation(topics=topics_55[50:], next_cursor=None, complete=True),
+                    ]
+                    multi_prov.requirements = [
+                        RequirementObservation(requirement_id="req-m", forum_id=FORUM_ID, body="Rules")
+                    ]
+                    for t in topics_55:
+                        multi_prov.histories[t.thread_id] = TopicHistoryObservation(topic=t, messages=[], complete=True)
+                    multi_reader = ForumReader(p_multi, multi_store, multi_prov)
+                    res_multi = multi_reader.initial_backfill()
+                    self.assertEqual(res_multi["coverage"]["topics"], "complete")
+                    self.assertEqual(res_multi["coverage"]["histories"], "complete")
+                    self.assertEqual(
+                        multi_store.get_forum_status(guild_id=GUILD_ID, forum_id=FORUM_ID)["counts"]["topics"],
+                        55,
+                    )
+                finally:
+                    multi_store.close()
+            finally:
+                store.close()
+
+    def test_desktop_guards_submission_exclusions_and_ocr_box_inverse(self):
+        from src.forums.providers import desktop as desktop_mod
+        from src.forums.providers.desktop import DesktopDiscordProvider
+
+        # 1. _find_discord_pid handles psutil.process_iter outer errors gracefully
+        with patch.object(desktop_mod, "psutil", SimpleNamespace(process_iter=lambda *_a, **_k: (_ for _ in ()).throw(PermissionError("denied")))):
+            self.assertIsNone(desktop_mod._find_discord_pid())
+
+        # 2. _actor_mismatch_reason fails closed on unverified user_id or label
+        self.assertIn(
+            "account_unverified",
+            DesktopDiscordProvider._actor_mismatch_reason(
+                {"user_id": ACTOR_USER_ID, "label": "Tester"},
+                {"user_id": None, "label": "Unverified desktop session"},
+            )
+            or "",
+        )
+        self.assertIn(
+            "account_unverified",
+            DesktopDiscordProvider._actor_mismatch_reason(
+                {"user_id": None, "label": "Tester"},
+                {"user_id": None, "label": "Unverified desktop session"},
+            )
+            or "",
+        )
+
+        # 3. stage_draft rejects non-reply_existing action and mismatched destination.source_url before navigation
+        provider = DesktopDiscordProvider()
+        good_session = SessionDescription(
+            actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            app_name="Discord",
+            window_title="Discord",
+            window_bbox=(0, 0, 1280, 800),
+            current_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+            capabilities={"can_read_semantic": True, "can_read_ocr": True, "can_stage_composer": True},
+        )
+        with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "navigate_to_url") as nav_mock:
+            bad_action = provider.stage_draft(
+                {
+                    "draft_id": "d-edit",
+                    "action": "edit_own_message",
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1},
+                    "body": "Edited",
+                },
+                [],
+                expected_actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            )
+            self.assertEqual(bad_action.status, "needs_review")
+            self.assertIn("unsupported_stage_action", bad_action.reason or "")
+            nav_mock.assert_not_called()
+
+            bad_url = provider.stage_draft(
+                {
+                    "draft_id": "d-url",
+                    "action": "reply_existing",
+                    "destination": {
+                        "guild_id": GUILD_ID,
+                        "forum_id": FORUM_ID,
+                        "thread_id": THREAD_1,
+                        "source_url": build_discord_channel_url(GUILD_ID, THREAD_2),
+                    },
+                    "body": "Hello",
+                },
+                [],
+                expected_actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            )
+            self.assertEqual(bad_url.status, "needs_review")
+            self.assertIn("invalid_destination_source_url", bad_url.reason or "")
+            nav_mock.assert_not_called()
+
+        # Unverified post-nav current_url=None fails closed
+        unverified_post_session = copy.deepcopy(good_session)
+        unverified_post_session.current_url = None
+        with patch.object(provider, "describe_session", return_value=unverified_post_session), \
+             patch.object(provider, "navigate_to_url", return_value=True), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(provider, "_inspect_composer", return_value=(object(), "")), \
+             patch.object(desktop_mod.time, "sleep"):
+            res_unver = provider.stage_draft(
+                {
+                    "draft_id": "d-unver",
+                    "action": "reply_existing",
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1},
+                    "body": "Hello",
+                },
+                [],
+            )
+            self.assertEqual(res_unver.status, "needs_review")
+            self.assertEqual(res_unver.reason, "destination_url_unverified")
+
+        # 4. Slot-count-only attachment staging records honest verification limitation in reason
+        with tempfile.TemporaryDirectory() as td:
+            att_f = Path(td) / "probe.txt"
+            att_f.write_text("ok", encoding="utf-8")
+            clip = {"val": "", "pasted": False}
+            fake_clip = SimpleNamespace(paste=lambda: clip["val"], copy=lambda v: clip.__setitem__("val", v))
+
+            def slot_hotkey(*args, **_k):
+                if args and args[-1] == "v" and clip["val"] == "Line 1":
+                    clip["pasted"] = True
+
+            fake_gui = SimpleNamespace(hotkey=slot_hotkey, click=lambda *_a, **_k: None)
+            with patch.object(desktop_mod.sys, "platform", "darwin"), \
+                 patch.object(desktop_mod, "pyperclip", fake_clip), \
+                 patch.object(desktop_mod, "pyautogui", fake_gui), \
+                 patch.object(desktop_mod.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(desktop_mod.time, "sleep"), \
+                 patch.object(provider, "describe_session", return_value=good_session), \
+                 patch.object(provider, "navigate_to_url", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_focus_element", return_value=True), \
+                 patch.object(provider, "_inspect_composer", side_effect=lambda _ax: (object(), "Line 1\n" if clip["pasted"] else "")), \
+                 patch.object(
+                     provider,
+                     "_inspect_staged_attachments",
+                     side_effect=[
+                         [],  # initial baseline_attachments in stage_draft
+                         [],  # baseline_slots in _stage_single_attachment
+                         [{"role": "AXButton", "text": "Remove Attachment", "dom_id": "upload-1", "element": object(), "is_remove_button": True}],
+                     ],
+                 ):
+                slot_res = provider.stage_draft(
+                    {
+                        "draft_id": "d-slot",
+                        "action": "reply_existing",
+                        "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1},
+                        "body": "Line 1",
+                    },
+                    [{"evidence_id": "ev-slot", "name": "probe.txt", "resolved_path": str(att_f)}],
+                )
+                self.assertEqual(slot_res.status, "staged")
+                self.assertEqual(slot_res.reason, "attachment_slot_count_observed_filename_unverified")
+
+        # 5. observe_submission excludes _preexisting_message_ids and remote_created_at < created_at
+        old_pre = MessageObservation(
+            thread_id=THREAD_1,
+            entity_ref="msg:200",
+            message_id="200",
+            author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            body="Line 1\nLine 2 ✓",
+            remote_created_at="2026-11-14T11:59:00Z",
+            source_url=build_discord_channel_url(GUILD_ID, THREAD_1, "200"),
+        )
+        old_time = MessageObservation(
+            thread_id=THREAD_1,
+            entity_ref="msg:999",
+            message_id="999",
+            author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            body="Line 1\nLine 2 ✓",
+            remote_created_at="2026-11-14T11:00:00Z",
+            source_url=build_discord_channel_url(GUILD_ID, THREAD_1, "999"),
+        )
+        hist_old = TopicHistoryObservation(
+            topic=TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_1, title="North Ridge"),
+            messages=[old_pre, old_time],
+            complete=True,
+        )
+        with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "read_topic", return_value=hist_old), \
+             patch.object(provider, "_get_ax_window", return_value=None):
+            sub_res = provider.observe_submission(
+                {
+                    "draft_id": "d-sub-excl",
+                    "action": "reply_existing",
+                    "created_at": "2026-11-14T12:00:00Z",
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1},
+                    "body": "Line 1\nLine 2 ✓",
+                },
+                {"_preexisting_message_ids": ["200"], "baseline_latest_message_id": None},
+            )
+            self.assertEqual(sub_res.status, "unresolved")
+
+        # 6. OCR box inverse transform accounts for preprocessing pad and tooltip crop offset
+        fake_data = {
+            "text": ["North"],
+            "conf": ["95"],
+            "left": [46],   # e.g., at scale=3, pad=16 -> (46 - 16) / 3 = 10
+            "top": [46],
+            "width": [30],
+            "height": [18],
+            "block_num": [1],
+            "par_num": [1],
+            "line_num": [1],
+        }
+        _raw, _lines, boxes, _conf = utils._extract_lines_and_boxes(
+            fake_data, scale=3, pad=16, crop_offset=(25, 12)
+        )
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].left, 35)
+        self.assertEqual(boxes[0].top, 22)
+        self.assertEqual(boxes[0].width, 10)
+        self.assertEqual(boxes[0].height, 6)
+
+        # 7. _extract_post_cards_and_links excludes AXLink outside forum post cards
+        fake_links_nodes = [
+            {
+                "role": "AXLink",
+                "description": "Arbitrary same-guild channel link",
+                "title": "general",
+                "value": "",
+                "url": build_discord_channel_url(GUILD_ID, "999999999999999999"),
+                "dom_id": "",
+                "depth": 25,
+                "element": object(),
+            }
+        ]
+        with patch.object(desktop_mod, "_ax_attr", return_value=None):
+            cards, links, _ = provider._extract_post_cards_and_links(fake_links_nodes, GUILD_ID, FORUM_ID)
+        self.assertEqual(cards, [])
+        self.assertEqual(links, [])
+
+        # 8. read_requirements propagates partial completeness and errors
+        req_topic = TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_2, title="Read Me First")
+        req_hist = TopicHistoryObservation(
+            topic=req_topic,
+            messages=[MessageObservation(thread_id=THREAD_2, author={"user_id": None, "label": "Mod"}, body="Rule slice")],
+            complete=False,
+            errors=[{"code": "scroll_stagnant", "message": "Truncated", "thread_id": THREAD_2}],
+        )
+        with patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(provider, "read_topic", return_value=req_hist):
+            reqs_out = provider.read_requirements(
+                GUILD_ID,
+                FORUM_ID,
+                references=[{"requirement_id": "req-pin", "thread_id": THREAD_2}],
+            )
+        self.assertEqual(len(reqs_out), 1)
+        self.assertFalse(reqs_out[0].complete)
+        self.assertEqual(reqs_out[0].errors[0]["code"], "scroll_stagnant")
+
+        # 9. read_topic sets starter_message_id=None when top not reached and starter not visible
+        reply_only_msg = MessageObservation(
+            thread_id=THREAD_1,
+            entity_ref="msg:500000000000000099",
+            message_id="500000000000000099",
+            author={"user_id": None, "label": "Tester"},
+            body="Later reply only",
+            source_url=build_discord_channel_url(GUILD_ID, THREAD_1, "500000000000000099"),
+        )
+        msg_list_elem = object()
+        fake_msg_win_nodes = [
+            {
+                "role": "AXList",
+                "description": "Messages in North Ridge Depot",
+                "title": "",
+                "value": "",
+                "url": "",
+                "dom_id": f"chat-messages-{THREAD_1}-500000000000000099",
+                "depth": 4,
+                "element": msg_list_elem,
+            }
+        ]
+        with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_msg_win_nodes), \
+             patch.object(desktop_mod, "_ax_bounds", return_value=(0.0, 0.0, 500.0, 400.0)), \
+             patch.object(desktop_mod, "_scroll_at_point", return_value=False), \
+             patch.object(
+                 provider,
+                 "_parse_messages_from_ax_list",
+                 return_value=("North Ridge Depot", [], {"500000000000000099": reply_only_msg}),
+             ):
+            trunc_hist = provider.read_topic(GUILD_ID, FORUM_ID, THREAD_1)
+        self.assertFalse(trunc_hist.complete)
+        self.assertIsNone(trunc_hist.topic.starter_message_id)
+        self.assertIsNone(trunc_hist.topic.tags)
+
+    def test_retry_transient_needs_review_and_cli_bundle_stage_with_microsecond_ts(self) -> None:
+        from contextlib import redirect_stderr, redirect_stdout
+        import io
+        from src.forums import __main__ as forums_cli
+        from src.forums.exchange import canonical_record_digest
+        from src.forums.models import compute_bytes_sha256, parse_rfc3339_utc, utc_now_iso
+
+        ts = utc_now_iso()
+        self.assertIn(".", ts)
+        self.assertTrue(ts.endswith("Z"))
+        self.assertLess(
+            parse_rfc3339_utc("2026-11-14T22:23:07Z"),
+            parse_rfc3339_utc("2026-11-14T22:23:07.500000Z"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "mirror.sqlite3"
+            ex_dir = root / "exchange"
+            profiles_path = root / "profiles.json"
+
+            fixture_path = Path("tests/fixtures/forum_exchange_v1/draft_with_attachment.v1.json")
+            draft = copy.deepcopy(read_record(fixture_path))
+            scope = draft["scope"]
+            gid, fid, tid = scope["guild_id"], scope["forum_id"], draft["destination"]["thread_id"]
+            prof = ForumProfile(
+                profile_id="cli-bundle-prof",
+                name="CLI Bundle Forum",
+                guild_id=gid,
+                forum_id=fid,
+                purpose="external_project",
+                catalog_enabled=True,
+                external_drafts_enabled=True,
+                stage_enabled=True,
+                db_path=str(db_path),
+                transfer_root=str(root / "unused_transfer"),
+                exchange_dir=str(ex_dir),
+            )
+            upsert_forum_profile(prof, profiles_path)
+
+            store = ForumStore(db_path)
+            try:
+                _seed_mirror_for_draft(store, draft)
+            finally:
+                store.close()
+
+            ev_bytes = b"SYNTHETIC-PNG-PROBE-BYTES"
+            draft["evidence"][0]["sha256"] = compute_bytes_sha256(ev_bytes)
+            bundle_digest = canonical_record_digest(draft)
+            bundle_dir = root / "bundles" / bundle_digest
+            ev_path = bundle_dir / "transfer" / draft["evidence"][0]["local_ref"]
+            ev_path.parent.mkdir(parents=True, exist_ok=True)
+            ev_path.write_bytes(ev_bytes)
+            write_record_atomic(bundle_dir / "draft.request.json", draft)
+
+            receipt_out = root / "cli_receipt.json"
+            fail_obs = ComposerStageObservation(
+                status="needs_review",
+                observed_actor={"user_id": scope["actor"]["user_id"], "label": "DemoUser"},
+                destination=dict(draft["destination"]),
+                observed_composer_text=draft["body"],
+                staged_evidence_ids=[],
+                reason="attachment_upload_interrupted",
+            )
+            ok_obs = ComposerStageObservation(
+                status="staged",
+                observed_actor={"user_id": scope["actor"]["user_id"], "label": "DemoUser"},
+                destination=dict(draft["destination"]),
+                observed_composer_text=draft["body"],
+                staged_evidence_ids=[ev["evidence_id"] for ev in draft["evidence"]],
+                reason="staged_verified",
+            )
+
+            class FakeDesktopProvider:
+                calls = 0
+
+                def describe_session(self) -> SessionDescription:
+                    return SessionDescription(
+                        actor={"user_id": scope["actor"]["user_id"], "label": "DemoUser"},
+                        app_name="Discord",
+                        window_title="Discord",
+                        window_bbox=(0, 0, 1000, 700),
+                        current_url=draft["destination"]["source_url"],
+                        capabilities={"can_read_semantic": True, "can_stage_composer": True},
+                    )
+
+                def stage_draft(self, *_args: Any, **_kwargs: Any) -> ComposerStageObservation:
+                    FakeDesktopProvider.calls += 1
+                    return fail_obs if FakeDesktopProvider.calls == 1 else ok_obs
+
+            with patch.object(forums_cli, "DesktopDiscordProvider", FakeDesktopProvider):
+                buf1 = io.StringIO()
+                with redirect_stdout(buf1):
+                    rc1 = forums_cli.main([
+                        "--profiles-path", str(profiles_path),
+                        "stage", "--profile", prof.profile_id,
+                        "--bundle-dir", str(bundle_dir),
+                        "--receipt-out", str(receipt_out),
+                    ])
+                self.assertEqual(rc1, 0)
+                r1 = json.loads(buf1.getvalue())
+                self.assertEqual(r1["status"], "needs_review")
+                self.assertEqual(r1["reason"], "attachment_upload_interrupted")
+
+                # Review lock holds across processes, and transient failure did not poison needs_recheck
+                ctrl = SessionController(Path(db_path).with_suffix(".session.json"))
+                self.assertTrue(ctrl.is_review_active())
+                store_chk = ForumStore(db_path)
+                try:
+                    drow = store_chk.get_draft_row(draft["draft_id"], int(draft["revision"]))
+                    self.assertIsNotNone(drow)
+                    self.assertEqual(drow["needs_recheck"], 0)
+                finally:
+                    store_chk.close()
+
+                # Releasing review allows clean retry of the same bundle via CLI
+                ctrl.release_review()
+                buf2 = io.StringIO()
+                with redirect_stdout(buf2):
+                    rc2 = forums_cli.main([
+                        "--profiles-path", str(profiles_path),
+                        "stage", "--profile", prof.profile_id,
+                        "--bundle-dir", str(bundle_dir),
+                        "--receipt-out", str(receipt_out),
+                    ])
+                self.assertEqual(rc2, 0)
+                r2 = json.loads(buf2.getvalue())
+                self.assertEqual(r2["status"], "staged")
+                self.assertEqual(r2["observed_body_hash"], compute_content_hash(draft["body"]))
+                self.assertTrue(receipt_out.exists())
+
+            # CLI rejects a corrupted bundle without staging
+            (ev_path).write_text("tampered", encoding="utf-8")
+            with redirect_stderr(io.StringIO()):
+                rc_bad = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "stage", "--profile", prof.profile_id,
+                    "--bundle-dir", str(bundle_dir),
+                ])
+            self.assertEqual(rc_bad, 2)
 
 
 if __name__ == "__main__":

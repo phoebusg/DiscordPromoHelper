@@ -37,6 +37,7 @@ class ForumStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._active_scope_key: Optional[str] = None
         self._init_schema()
 
     def close(self) -> None:
@@ -142,6 +143,7 @@ class ForumStore:
                     revision INTEGER NOT NULL,
                     observed_at TEXT NOT NULL,
                     parsed_checks_json TEXT,
+                    is_complete INTEGER NOT NULL DEFAULT 1,
                     extra_json TEXT NOT NULL
                 );
 
@@ -221,6 +223,13 @@ class ForumStore:
             }
             if "observation_ref" not in topic_cols:
                 self._conn.execute("ALTER TABLE topics ADD COLUMN observation_ref TEXT")
+            req_cols = {
+                r["name"] for r in self._conn.execute("PRAGMA table_info(requirements)").fetchall()
+            }
+            if "is_complete" not in req_cols:
+                self._conn.execute(
+                    "ALTER TABLE requirements ADD COLUMN is_complete INTEGER NOT NULL DEFAULT 1"
+                )
 
     def ensure_scope(
         self,
@@ -234,6 +243,7 @@ class ForumStore:
         gid = require_discord_id(guild_id, "guild_id")
         fid = require_discord_id(forum_id, "forum_id")
         scope_key = f"{gid}:{fid}"
+        self._active_scope_key = scope_key
         row = self._conn.execute(
             "SELECT * FROM mirror_meta WHERE scope_key = ?", (scope_key,)
         ).fetchone()
@@ -286,22 +296,45 @@ class ForumStore:
             ).fetchone()
         )
 
+    def _scope_key_from(
+        self,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if guild_id is not None and forum_id is not None:
+            gid = require_discord_id(guild_id, "guild_id")
+            fid = require_discord_id(forum_id, "forum_id")
+            return f"{gid}:{fid}"
+        return None
+
     def _get_meta(self, scope_key: Optional[str] = None) -> sqlite3.Row:
-        if scope_key:
+        eff_key = scope_key or self._active_scope_key
+        if eff_key:
             row = self._conn.execute(
-                "SELECT * FROM mirror_meta WHERE scope_key = ?", (scope_key,)
+                "SELECT * FROM mirror_meta WHERE scope_key = ?", (eff_key,)
             ).fetchone()
         else:
-            row = self._conn.execute("SELECT * FROM mirror_meta LIMIT 1").fetchone()
+            rows = self._conn.execute(
+                "SELECT * FROM mirror_meta ORDER BY updated_at DESC LIMIT 2"
+            ).fetchall()
+            if len(rows) > 1:
+                raise ValueError("Multiple mirror scopes present in store; call ensure_scope() first")
+            row = rows[0] if rows else None
         if row is None:
             raise ValueError("Mirror scope not initialized; call ensure_scope() first")
         return row
 
-    def get_coverage(self) -> dict[str, Any]:
-        meta = self._get_meta()
+    def get_coverage(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
         cov = json.loads(meta["coverage_json"])
         unresolved = self._conn.execute(
-            "SELECT * FROM unresolved_topics WHERE resolved_thread_id IS NULL ORDER BY observed_at, observation_ref"
+            "SELECT * FROM unresolved_topics WHERE forum_id = ? AND resolved_thread_id IS NULL ORDER BY observed_at, observation_ref",
+            (meta["forum_id"],),
         ).fetchall()
         pending = [p for p in cov.get("pending", []) if p.get("thread_id") is not None]
         for u in unresolved:
@@ -534,25 +567,48 @@ class ForumStore:
         fid = require_discord_id(forum_id, "forum_id")
         optional_discord_id(starter_message_id, "starter_message_id")
         now = observed_at or utc_now_iso()
-        url = source_url or build_discord_channel_url(meta["guild_id"], tid)
-        tags_norm = [{"tag_id": t.get("tag_id"), "name": t["name"]} for t in (tags or [])]
-        archived_db = None if archived is None else int(bool(archived))
-        locked_db = None if locked is None else int(bool(locked))
 
         row = self._conn.execute("SELECT * FROM topics WHERE thread_id = ?", (tid,)).fetchone()
         eff_obs_ref = observation_ref or (row["observation_ref"] if row is not None else None)
+        url = source_url or (
+            row["source_url"] if row is not None else build_discord_channel_url(meta["guild_id"], tid)
+        )
+
+        old_tags = json.loads(row["tags_json"]) if row is not None else []
+        old_archived = None if (row is None or row["archived"] is None) else bool(row["archived"])
+        old_locked = None if (row is None or row["locked"] is None) else bool(row["locked"])
+        old_starter = row["starter_message_id"] if row is not None else None
+        old_extra = json.loads(row["extra_json"]) if row is not None else {}
+
+        eff_tags = (
+            old_tags
+            if (row is not None and tags is None)
+            else [{"tag_id": t.get("tag_id"), "name": t["name"]} for t in (tags or [])]
+        )
+        eff_archived = old_archived if (row is not None and archived is None) else archived
+        eff_locked = old_locked if (row is not None and locked is None) else locked
+        eff_starter = starter_message_id if starter_message_id is not None else old_starter
+        eff_archived_db = None if eff_archived is None else int(bool(eff_archived))
+        eff_locked_db = None if eff_locked is None else int(bool(eff_locked))
+        eff_extra = old_extra if (row is not None and extra is None) else (extra or {})
+        eff_remote_activity = (
+            remote_last_activity_at
+            if remote_last_activity_at is not None
+            else (row["remote_last_activity_at"] if row is not None else None)
+        )
+
         entity = {
             "thread_id": tid,
             "forum_id": fid,
             "title": title,
             "source_url": url,
-            "tags": tags_norm,
-            "starter_message_id": starter_message_id,
-            "archived": archived,
-            "locked": locked,
-            "remote_last_activity_at": remote_last_activity_at,
+            "tags": eff_tags,
+            "starter_message_id": eff_starter,
+            "archived": eff_archived,
+            "locked": eff_locked,
+            "remote_last_activity_at": eff_remote_activity,
             "observed_at": now,
-            **(extra or {}),
+            **eff_extra,
         }
         if eff_obs_ref is not None:
             entity["observation_ref"] = eff_obs_ref
@@ -560,10 +616,10 @@ class ForumStore:
             json.dumps(
                 {
                     "title": title,
-                    "tags": tags_norm,
-                    "archived": archived,
-                    "locked": locked,
-                    "starter_message_id": starter_message_id,
+                    "tags": eff_tags,
+                    "archived": eff_archived,
+                    "locked": eff_locked,
+                    "starter_message_id": eff_starter,
                 },
                 sort_keys=True,
             )
@@ -586,15 +642,15 @@ class ForumStore:
                         fid,
                         title,
                         url,
-                        json.dumps(tags_norm),
-                        starter_message_id,
-                        archived_db,
-                        locked_db,
-                        remote_last_activity_at,
+                        json.dumps(eff_tags),
+                        eff_starter,
+                        eff_archived_db,
+                        eff_locked_db,
+                        eff_remote_activity,
                         rev,
                         now,
                         eff_obs_ref,
-                        json.dumps(extra or {}),
+                        json.dumps(eff_extra),
                     ),
                 )
                 self._record_revision(
@@ -606,14 +662,11 @@ class ForumStore:
                 self._bump_snapshot_revision_and_append_change(meta, chg)
                 return chg
 
-            old_tags = json.loads(row["tags_json"])
-            old_archived = None if row["archived"] is None else bool(row["archived"])
-            old_locked = None if row["locked"] is None else bool(row["locked"])
-            changed_tags = old_tags != tags_norm
-            changed_state = (old_archived != archived) or (old_locked != locked)
+            changed_tags = old_tags != eff_tags
+            changed_state = (old_archived != eff_archived) or (old_locked != eff_locked)
             changed_title = row["title"] != title
             changed_starter = (
-                starter_message_id is not None and row["starter_message_id"] != starter_message_id
+                starter_message_id is not None and old_starter != eff_starter
             )
             changed_obs_ref = (
                 observation_ref is not None and row["observation_ref"] != observation_ref
@@ -629,8 +682,6 @@ class ForumStore:
             before_rev = int(row["revision"])
             rev = before_rev + 1
             entity["revision"] = rev
-            eff_starter = starter_message_id or row["starter_message_id"]
-            entity["starter_message_id"] = eff_starter
             self._conn.execute(
                 """
                 UPDATE topics
@@ -642,15 +693,15 @@ class ForumStore:
                 (
                     title,
                     url,
-                    json.dumps(tags_norm),
+                    json.dumps(eff_tags),
                     eff_starter,
-                    archived_db,
-                    locked_db,
-                    remote_last_activity_at or row["remote_last_activity_at"],
+                    eff_archived_db,
+                    eff_locked_db,
+                    eff_remote_activity,
                     rev,
                     now,
                     eff_obs_ref,
-                    json.dumps(extra or {}),
+                    json.dumps(eff_extra),
                     tid,
                 ),
             )
@@ -1133,6 +1184,7 @@ class ForumStore:
         parsed_checks: Optional[list[dict[str, Any]]] = None,
         source_method: str = "semantic",
         confidence: Optional[float] = 1.0,
+        complete: bool = True,
         raw_observation: Optional[dict[str, Any]] = None,
         extra: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
@@ -1140,6 +1192,7 @@ class ForumStore:
         fid = require_discord_id(forum_id, "forum_id")
         now = observed_at or utc_now_iso()
         chash = compute_content_hash(body)
+        complete_db = int(bool(complete))
         row = self._conn.execute(
             "SELECT * FROM requirements WHERE requirement_id = ?", (requirement_id,)
         ).fetchone()
@@ -1163,8 +1216,8 @@ class ForumStore:
                     """
                     INSERT INTO requirements (
                         requirement_id, forum_id, source_entity_ref, source_url, body,
-                        content_hash, revision, observed_at, parsed_checks_json, extra_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        content_hash, revision, observed_at, parsed_checks_json, is_complete, extra_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         requirement_id,
@@ -1176,6 +1229,7 @@ class ForumStore:
                         rev,
                         now,
                         json.dumps(parsed_checks) if parsed_checks is not None else None,
+                        complete_db,
                         json.dumps(extra or {}),
                     ),
                 )
@@ -1197,7 +1251,17 @@ class ForumStore:
                 self._bump_snapshot_revision_and_append_change(meta, chg)
                 return chg
 
+            was_complete = bool(row["is_complete"]) if "is_complete" in row.keys() else True
+            # Never clobber an established complete requirement with an interrupted partial read.
+            if was_complete and not complete:
+                return None
+
             if row["content_hash"] == chash:
+                if not was_complete and complete:
+                    self._conn.execute(
+                        "UPDATE requirements SET is_complete = 1, observed_at = ? WHERE requirement_id = ?",
+                        (now, requirement_id),
+                    )
                 return None
 
             before_rev = int(row["revision"])
@@ -1207,7 +1271,7 @@ class ForumStore:
                 """
                 UPDATE requirements
                 SET source_entity_ref = ?, source_url = ?, body = ?, content_hash = ?,
-                    revision = ?, observed_at = ?, parsed_checks_json = ?, extra_json = ?
+                    revision = ?, observed_at = ?, parsed_checks_json = ?, is_complete = ?, extra_json = ?
                 WHERE requirement_id = ?
                 """,
                 (
@@ -1218,6 +1282,7 @@ class ForumStore:
                     rev,
                     now,
                     json.dumps(parsed_checks) if parsed_checks is not None else row["parsed_checks_json"],
+                    complete_db,
                     json.dumps(extra or {}),
                     requirement_id,
                 ),
@@ -1238,15 +1303,30 @@ class ForumStore:
                 observed_at=now,
             )
             self._bump_snapshot_revision_and_append_change(meta, chg)
-            self._flag_dependent_drafts(requirement_id, rev, now)
+            self._flag_dependent_drafts(
+                requirement_id, rev, now, guild_id=meta["guild_id"], forum_id=fid
+            )
             return chg
 
-    def _flag_dependent_drafts(self, requirement_id: str, new_revision: int, now: str) -> None:
+    def _flag_dependent_drafts(
+        self,
+        requirement_id: str,
+        new_revision: int,
+        now: str,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> None:
         rows = self._conn.execute(
             "SELECT * FROM drafts WHERE status IN ('pending', 'staged', 'needs_review')"
         ).fetchall()
         for r in rows:
             rec = json.loads(r["record_json"])
+            rec_scope = rec.get("scope") or {}
+            if guild_id and rec_scope.get("guild_id") != guild_id:
+                continue
+            if forum_id and rec_scope.get("forum_id") != forum_id:
+                continue
             reqs = rec.get("baseline", {}).get("requirements", [])
             for req_ref in reqs:
                 if req_ref.get("requirement_id") == requirement_id and int(req_ref.get("revision", 0)) < new_revision:
@@ -1485,9 +1565,11 @@ class ForumStore:
         record_id: Optional[str] = None,
         cutover: bool = False,
         advance_export_cursor: bool = False,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Export a validated forum.snapshot.v1 record from current mirror state."""
-        meta = self._get_meta()
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
         if cutover and int(meta["exported_snapshot_revision"]) > 0:
             next_rev = int(meta["snapshot_revision"]) + 1
             with self._conn:
@@ -1617,7 +1699,7 @@ class ForumStore:
             "topics": topics_list,
             "messages": messages_list,
             "requirements": req_list,
-            "coverage": self.get_coverage(),
+            "coverage": self.get_coverage(guild_id=meta["guild_id"], forum_id=meta["forum_id"]),
         }
         validated = validate_exchange_record(snap)
         if advance_export_cursor:
@@ -1655,9 +1737,11 @@ class ForumStore:
         producer_id: Optional[str] = None,
         record_id: Optional[str] = None,
         advance_export_cursor: bool = False,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Export validated forum.changes.v1 batch after the given or last-exported cursor."""
-        meta = self._get_meta()
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
         stream_id = meta["stream_id"]
         if after_cursor is not None:
             if after_cursor.get("stream_id") != stream_id:
@@ -1984,24 +2068,43 @@ class ForumStore:
             "coverage": self.get_coverage(),
         }
 
-    def get_forum_status(self) -> dict[str, Any]:
+    def get_forum_status(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Return high-level summary of the local mirror."""
-        meta = self._get_meta()
-        topics_cnt = self._conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
-        msgs_cnt = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        reqs_cnt = self._conn.execute("SELECT COUNT(*) FROM requirements").fetchone()[0]
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        gid = meta["guild_id"]
+        fid = meta["forum_id"]
+        topics_cnt = self._conn.execute(
+            "SELECT COUNT(*) FROM topics WHERE forum_id = ?", (fid,)
+        ).fetchone()[0]
+        msgs_cnt = self._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE thread_id IN (SELECT thread_id FROM topics WHERE forum_id = ?)",
+            (fid,),
+        ).fetchone()[0]
+        reqs_cnt = self._conn.execute(
+            "SELECT COUNT(*) FROM requirements WHERE forum_id = ?", (fid,)
+        ).fetchone()[0]
         unres_cnt = self._conn.execute(
-            "SELECT COUNT(*) FROM unresolved_topics WHERE resolved_thread_id IS NULL"
+            "SELECT COUNT(*) FROM unresolved_topics WHERE forum_id = ? AND resolved_thread_id IS NULL",
+            (fid,),
         ).fetchone()[0]
-        drafts_cnt = self._conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0]
-        pending_recheck = self._conn.execute(
-            "SELECT COUNT(*) FROM drafts WHERE needs_recheck = 1"
-        ).fetchone()[0]
+        drafts_cnt = 0
+        pending_recheck = 0
+        for dr in self._conn.execute("SELECT needs_recheck, record_json FROM drafts").fetchall():
+            rec_scope = json.loads(dr["record_json"]).get("scope") or {}
+            if rec_scope.get("guild_id") == gid and rec_scope.get("forum_id") == fid:
+                drafts_cnt += 1
+                if int(dr["needs_recheck"] or 0) == 1:
+                    pending_recheck += 1
         return {
             "snapshot_id": meta["snapshot_id"],
             "snapshot_revision": int(meta["snapshot_revision"]),
-            "guild_id": meta["guild_id"],
-            "forum_id": meta["forum_id"],
+            "guild_id": gid,
+            "forum_id": fid,
             "actor": json.loads(meta["actor_json"]),
             "cursor": {"stream_id": meta["stream_id"], "position": str(meta["cursor_seq"])},
             "counts": {
@@ -2012,6 +2115,6 @@ class ForumStore:
                 "drafts": int(drafts_cnt),
                 "drafts_needing_review": int(pending_recheck),
             },
-            "coverage": self.get_coverage(),
+            "coverage": self.get_coverage(guild_id=gid, forum_id=fid),
             "updated_at": meta["updated_at"],
         }

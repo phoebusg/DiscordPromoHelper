@@ -1,6 +1,7 @@
 """Installed-runtime Discord desktop adapter using OS accessibility + OCR fallback."""
 from __future__ import annotations
 
+from datetime import datetime
 import difflib
 import json
 import logging
@@ -65,13 +66,16 @@ _DISCORD_URL_IN_TEXT_RE = re.compile(
 def _find_discord_pid() -> Optional[int]:
     if psutil is None:
         return None
-    for proc in psutil.process_iter(["pid", "name", "exe"]):
-        try:
-            name = (proc.info.get("name") or "").strip().lower()
-            if name == "discord" or name == "discord.exe":
-                return int(proc.info["pid"])
-        except Exception:
-            continue
+    try:
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                name = (proc.info.get("name") or "").strip().lower()
+                if name == "discord" or name == "discord.exe":
+                    return int(proc.info["pid"])
+            except Exception:
+                continue
+    except Exception:
+        return None
     return None
 
 
@@ -217,6 +221,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         self.expected_actor = expected_actor
         self._session_cache: Optional[tuple[float, SessionDescription]] = None
         self._ocr_probe_cache: Optional[tuple[float, bool]] = None
+        self._unverified_attachment_filenames: list[str] = []
 
     def _safe_key_press(self, key: str) -> None:
         if key.lower() in self._FORBIDDEN_SEND_KEYS:
@@ -571,11 +576,32 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         )
                     )
 
+        def _in_forum_post_card(elem: Any) -> bool:
+            cur = elem
+            for _ in range(6):
+                cur = _ax_attr(cur, "AXParent")
+                if cur is None:
+                    break
+                c_role = str(_ax_attr(cur, "AXRole") or "")
+                c_desc = str(_ax_attr(cur, "AXDescription") or "")
+                if c_role == "AXList":
+                    break
+                if c_role == "AXButton" and c_desc.startswith("Post ") and c_desc != "Post Guidelines":
+                    return True
+                for sib in (_ax_attr(cur, "AXChildren") or [])[:10]:
+                    s_role = str(_ax_attr(sib, "AXRole") or "")
+                    s_desc = str(_ax_attr(sib, "AXDescription") or "")
+                    if s_role == "AXButton" and s_desc.startswith("Post ") and s_desc != "Post Guidelines":
+                        return True
+            return False
+
         for n in nodes:
             if n["role"] != "AXLink":
                 continue
             desc_lower = (n["description"] or "").lower()
-            if n["depth"] <= 21 and ("channel)" in desc_lower or "private channel" in desc_lower):
+            if "channel)" in desc_lower or "private channel" in desc_lower:
+                continue
+            if not _in_forum_post_card(n["element"]):
                 continue
             for cand in (n["url"], n["value"], n["description"]):
                 parsed = parse_discord_channel_url(cand)
@@ -756,7 +782,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
             list_box = (l + 300, t + 110, l + min(w - 20, 950), t + h - 40)
             img = _capture_settled_region(list_box)
             if img is not None:
-                res = utils.ocr_image_structured(img, task="forum_title")
+                res = utils.ocr_image_structured(img, task="message_body")
                 topics: list[TopicObservation] = []
                 for idx, line in enumerate(res.lines[:limit]):
                     topics.append(
@@ -1043,9 +1069,11 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     thread_id=thread_id,
                     title=list_title or f"Topic {thread_id}",
                     source_url=url,
-                    tags=all_tags,
+                    tags=all_tags if all_tags else None,
                     starter_message_id=(
-                        thread_id if thread_id in merged_msgs else (ordered_mids[0] if ordered_mids else None)
+                        thread_id
+                        if thread_id in merged_msgs
+                        else (ordered_mids[0] if (top_reached and ordered_mids) else None)
                     ),
                     locked=locked,
                     source_method="accessibility",
@@ -1108,21 +1136,23 @@ class DesktopDiscordProvider(DiscordViewProvider):
 
         for rid, tid in ref_tids:
             hist = self.read_topic(guild_id, forum_id, tid)
-            if hist.messages:
-                combined_body = "\n\n".join(m.body for m in hist.messages if m.body).strip()
-                if combined_body:
-                    reqs.append(
-                        RequirementObservation(
-                            requirement_id=rid,
-                            forum_id=forum_id,
-                            body=combined_body,
-                            source_entity_ref=f"thread:{tid}",
-                            source_url=build_discord_channel_url(guild_id, tid),
-                            source_method="accessibility",
-                            confidence=0.98,
-                            raw={"message_count": len(hist.messages), "title": hist.topic.title},
-                        )
+            combined_body = "\n\n".join(m.body for m in hist.messages if m.body).strip()
+            req_complete = bool(hist.complete and not hist.errors)
+            if combined_body or hist.errors:
+                reqs.append(
+                    RequirementObservation(
+                        requirement_id=rid,
+                        forum_id=forum_id,
+                        body=combined_body,
+                        source_entity_ref=f"thread:{tid}",
+                        source_url=build_discord_channel_url(guild_id, tid),
+                        complete=req_complete,
+                        errors=list(hist.errors),
+                        source_method="accessibility",
+                        confidence=0.98 if req_complete else 0.7,
+                        raw={"message_count": len(hist.messages), "title": hist.topic.title},
                     )
+                )
         return reqs
 
     @staticmethod
@@ -1310,10 +1340,11 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     cur_win = self._get_ax_window() or ax_win
                     cur_comp, _ = self._inspect_composer(cur_win)
                     items = self._inspect_staged_attachments(cur_win, cur_comp or composer_elem)
-                    if (
-                        self._attachment_preview_contains(items, filename)
-                        or self._count_staged_attachment_slots(items) > baseline_slots
-                    ):
+                    if self._attachment_preview_contains(items, filename):
+                        return True
+                    if self._count_staged_attachment_slots(items) > baseline_slots:
+                        if filename not in self._unverified_attachment_filenames:
+                            self._unverified_attachment_filenames.append(filename)
                         return True
             except Exception:
                 pass
@@ -1372,10 +1403,24 @@ class DesktopDiscordProvider(DiscordViewProvider):
         obs_uid = observed_actor.get("user_id")
         exp_lbl = (expected_actor.get("label") or "").strip().lower()
         obs_lbl = (observed_actor.get("label") or "").strip().lower()
-        if exp_uid and obs_uid and exp_uid != obs_uid:
-            return f"account_mismatch: expected user_id={exp_uid}, observed={obs_uid}"
-        if exp_lbl and obs_lbl and obs_lbl != "unverified desktop session" and exp_lbl != obs_lbl:
-            return f"account_mismatch: expected label={expected_actor.get('label')!r}, observed={observed_actor.get('label')!r}"
+        unverified_labels = {"", "unverified desktop session", "unknown session", "unknown"}
+        if exp_uid:
+            if not obs_uid:
+                return f"account_unverified: expected user_id={exp_uid}, observed={obs_uid!r}"
+            if obs_uid != exp_uid:
+                return f"account_mismatch: expected user_id={exp_uid}, observed={obs_uid}"
+        if exp_lbl and exp_lbl not in unverified_labels:
+            if obs_lbl in unverified_labels:
+                if not (exp_uid and obs_uid and exp_uid == obs_uid):
+                    return (
+                        f"account_unverified: expected label={expected_actor.get('label')!r}, "
+                        f"observed={observed_actor.get('label')!r}"
+                    )
+            elif exp_lbl != obs_lbl and not (exp_uid and obs_uid and exp_uid == obs_uid):
+                return (
+                    f"account_mismatch: expected label={expected_actor.get('label')!r}, "
+                    f"observed={observed_actor.get('label')!r}"
+                )
         return None
 
     def stage_draft(
@@ -1385,8 +1430,10 @@ class DesktopDiscordProvider(DiscordViewProvider):
         expected_actor: Optional[dict[str, Any]] = None,
     ) -> ComposerStageObservation:
         """Stage multiline Unicode text and evidence into Discord without ever pressing Send."""
+        self._unverified_attachment_filenames = []
         session = self.describe_session()
         dest = dict(draft_request["destination"])
+        action = draft_request.get("action")
 
         if session.errors and not session.capabilities.get("can_stage_composer"):
             return ComposerStageObservation(
@@ -1396,7 +1443,16 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason="; ".join(e["code"] for e in session.errors),
             )
 
-        actor_err = self._actor_mismatch_reason(expected_actor, session.actor)
+        if action != "reply_existing":
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=session.actor,
+                destination=dest,
+                reason=f"unsupported_stage_action:{action}",
+            )
+
+        eff_expected_actor = expected_actor or self.expected_actor
+        actor_err = self._actor_mismatch_reason(eff_expected_actor, session.actor)
         if actor_err:
             return ComposerStageObservation(
                 status="needs_review",
@@ -1405,8 +1461,31 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason=actor_err,
             )
 
-        target_id = dest.get("thread_id") or dest["forum_id"]
-        target_url = dest.get("source_url") or build_discord_channel_url(dest["guild_id"], target_id)
+        expected_guild = dest.get("guild_id")
+        target_id = dest.get("thread_id")
+        if not expected_guild or not target_id:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=session.actor,
+                destination=dest,
+                reason="missing_destination_ids",
+            )
+        raw_dest_url = dest.get("source_url")
+        if raw_dest_url:
+            parsed_dest = parse_discord_channel_url(raw_dest_url)
+            if (
+                parsed_dest is None
+                or parsed_dest[0] != str(expected_guild)
+                or parsed_dest[1] != str(target_id)
+                or parsed_dest[2] is not None
+            ):
+                return ComposerStageObservation(
+                    status="needs_review",
+                    observed_actor=session.actor,
+                    destination=dest,
+                    reason=f"invalid_destination_source_url:{raw_dest_url}",
+                )
+        target_url = raw_dest_url or build_discord_channel_url(str(expected_guild), str(target_id))
         if not self.navigate_to_url(target_url):
             return ComposerStageObservation(
                 status="failed",
@@ -1428,7 +1507,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     break
 
         post_session = self.describe_session(force_refresh=True)
-        post_actor_err = self._actor_mismatch_reason(expected_actor, post_session.actor)
+        post_actor_err = self._actor_mismatch_reason(eff_expected_actor, post_session.actor)
         if post_actor_err:
             return ComposerStageObservation(
                 status="needs_review",
@@ -1437,17 +1516,22 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason=post_actor_err,
             )
 
-        if post_session.current_url:
-            parsed_url = re.search(r"/channels/(\d+)/(\d+)", post_session.current_url)
-            if parsed_url:
-                obs_guild, obs_chan = parsed_url.group(1), parsed_url.group(2)
-                if obs_guild != dest["guild_id"] or obs_chan != target_id:
-                    return ComposerStageObservation(
-                        status="needs_review",
-                        observed_actor=post_session.actor,
-                        destination=dest,
-                        reason=f"destination_url_mismatch: expected={target_url}, observed={post_session.current_url}",
-                    )
+        parsed_url = parse_discord_channel_url(post_session.current_url)
+        if parsed_url is None:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=post_session.actor,
+                destination=dest,
+                reason="destination_url_unverified",
+            )
+        obs_guild, obs_chan, _ = parsed_url
+        if obs_guild != str(expected_guild) or obs_chan != str(target_id):
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=post_session.actor,
+                destination=dest,
+                reason=f"destination_url_mismatch: expected={target_url}, observed={post_session.current_url}",
+            )
 
         if ax_win is None:
             return ComposerStageObservation(
@@ -1457,22 +1541,19 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason="ax_untrusted_cannot_verify_composer",
             )
 
-        if draft_request.get("action") == "create_topic" and composer_elem is None:
-            nodes = _walk_ax_tree(ax_win, max_nodes=2500, max_depth=24)
-            new_post_btn = next(
-                (
-                    n["element"]
-                    for n in nodes
-                    if n["role"] == "AXButton"
-                    and "new post" in (n["title"] + " " + n["description"]).lower()
-                ),
-                None,
+        win_nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+        msg_thread_ids: set[str] = set()
+        for n in win_nodes:
+            m = re.match(r"^chat-messages-(\d+)-", n["dom_id"] or "")
+            if m:
+                msg_thread_ids.add(m.group(1))
+        if msg_thread_ids and str(target_id) not in msg_thread_ids:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=post_session.actor,
+                destination=dest,
+                reason="destination_thread_dom_mismatch",
             )
-            if new_post_btn is not None:
-                self._focus_element(new_post_btn)
-                time.sleep(0.4)
-                ax_win = self._get_ax_window() or ax_win
-                composer_elem, existing_text = self._inspect_composer(ax_win)
 
         if composer_elem is None:
             return ComposerStageObservation(
@@ -1581,6 +1662,11 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 destination=dest,
                 observed_composer_text=verified_text,
                 staged_evidence_ids=staged_ids,
+                reason=(
+                    "attachment_slot_count_observed_filename_unverified"
+                    if self._unverified_attachment_filenames
+                    else None
+                ),
             )
         finally:
             if prior_clipboard is not None:
@@ -1743,12 +1829,33 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason="target_edit_not_observed",
             )
 
+        def _parse_iso_ts(raw: Optional[str]) -> Optional[datetime]:
+            if not raw or not isinstance(raw, str):
+                return None
+            try:
+                return datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        preexisting_ids = {
+            str(x)
+            for x in (receipt.get("_preexisting_message_ids") or receipt.get("preexisting_message_ids") or [])
+            if x is not None
+        }
+        draft_created_dt = _parse_iso_ts(draft_request.get("created_at"))
+
         scored: list[tuple[float, MessageObservation]] = []
         for msg in hist.messages:
             if not msg.message_id:
                 continue
+            if str(msg.message_id) in preexisting_ids:
+                continue
             if baseline_id and str(baseline_id).isdigit() and msg.message_id.isdigit():
                 if int(msg.message_id) <= int(str(baseline_id)):
+                    continue
+            msg_dt = _parse_iso_ts(msg.remote_created_at)
+            if msg_dt is not None and draft_created_dt is not None:
+                if msg_dt.tzinfo is not None and draft_created_dt.tzinfo is not None and msg_dt < draft_created_dt:
                     continue
             if not self._actors_compatible(receipt_actor or session.actor, msg.author):
                 continue
