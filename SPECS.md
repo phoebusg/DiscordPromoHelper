@@ -2,6 +2,10 @@
 
 > Developer reference for Discord Promo Helper internals.
 
+## Forum retrieval and reviewed updates
+
+The next forum extension includes direct Discord-view retrieval, a local versioned mirror and change feed, and staging complete updates in the correct composer for final human review and Send. It is not limited to importing pasted topic lists. See [forum design](docs/FORUM_SUPPORT_PLAN.md) and [development tasks](TODO.md) for the current scope, contracts and acceptance criteria. Existing promotion behavior and UI remain the base product.
+
 ## Architecture
 
 ```
@@ -898,6 +902,6 @@ python -m src.stream_info https://kick.com/xqc
 
 - Type hints where practical
 - Docstrings for public functions
-- JSON for persistence (no database)
+- Legacy promotion settings/timestamps use JSON. The optional forum mirror uses a separate SQLite store plus JSON exchange; see the linked forum design.
 
 

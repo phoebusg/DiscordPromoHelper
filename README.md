@@ -120,6 +120,10 @@ See [SETUP.md](SETUP.md) for detailed setup instructions.
 
 > **Note**: `servers.json` and `*.png` files are gitignored (contain private data). They are generated when you run the app.
 
+## Development
+
+See [TODO.md](TODO.md) and the [forum support design](docs/FORUM_SUPPORT_PLAN.md) for planned forum retrieval, local change tracking and composer staging. These are implementation plans; the existing promotion workflow remains the default.
+
 ## ⚠️ Disclaimer
 
 This tool is for **respectful** self-promotion only. Built-in safeguards:
