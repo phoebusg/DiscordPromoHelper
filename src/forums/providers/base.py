@@ -86,7 +86,7 @@ class MessageObservation:
     remote_edited_at: Optional[str] = None
     source_url: Optional[str] = None
     identity_verified: bool = True
-    attachments: list[dict[str, Any]] = field(default_factory=list)
+    attachments: Optional[list[dict[str, Any]]] = None
     recognition: Optional[dict[str, Any]] = None
     explicit_edited_marker: bool = False
     provisional_alias: Optional[str] = None

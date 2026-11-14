@@ -70,3 +70,23 @@
   - Live macOS Screen Recording (`can_read_ocr=False`) / live attachment filename visual inspection remains unverified here.
   - Real human-initiated Discord `Send` followed by live post-send `reconcile_submission` was not executed on the community server to avoid manufacturing test posts.
   - Uncorroborated live desktop message observations (where Discord UI does not expose verified `author.user_id` or `remote_created_at`) intentionally remain `submission_unresolved` privately until mirror corroboration or explicit `user_confirmed_submitted`.
+
+## Post-review hardening & regression fixes (after `7e23d03`) — 15 November 2026
+
+- **Attachment verification vs unverified preservation (`src/forums/providers/base.py`, `src/forums/providers/desktop.py`, `src/forums/store.py`)**:
+  - Changed `MessageObservation.attachments` default to `None` so missing/unverified observations do not imply verified empty attachments.
+  - Updated `DesktopDiscordProvider._parse_messages_from_ax_list` to track `has_content_node`, `has_accessories_node`, and `accessories_unparsed` (non-empty `message-accessories-*` subtrees yielding zero CDN attachment URLs), returning `attachments=None` when unverified vs `[]` when verified empty; updated `_score_submitted_message` to accept `Optional[list]`.
+  - Updated `ForumStore.upsert_message` so `attachments=None` preserves existing `attachments_json` on update (even when body text changes) and inserts `[]` only for new messages, while verified `[]` records `attachment_changed`.
+- **Post-card `AXLink` scoping (`src/forums/providers/desktop.py`)**:
+  - Replaced `_in_forum_post_card` in `_extract_post_cards_and_links` with `_card_thread_id` and `_enclosing_forum_post_card_tid(elem)`, rejecting `Messages in ...` and `Channels` `AXList` subtrees, rejecting message-permalink URLs (`parsed[2] is not None`), and rejecting inline cross-channel links whose channel ID differs from the enclosing card's `card_tid`.
+- **Mixed-precision RFC 3339 SQLite chronological ordering (`src/forums/store.py`, `docs/FORUM_EXCHANGE_V1.md`)**:
+  - Registered `_sqlite_ts_sort_key` (`ts_sort_key` UDF normalizing parsed timestamps via `parse_rfc3339_utc` to `%Y-%m-%dT%H:%M:%S.%fZ`) on `ForumStore` SQLite connections and updated timestamp `ORDER BY` queries (`mirror_meta`, `unresolved_topics`, `pick_topics_for_deep_reread`, `list_receipts`, `export_snapshot`, `search`, `get_topic_status`) so whole-second `...Z` and fractional-second `....ffffffZ` timestamps sort chronologically rather than by raw ASCII (`'.' < 'Z'`).
+  - Documented whole-second/fractional-second UTC `Z` chronological comparison in `docs/FORUM_EXCHANGE_V1.md`.
+- **`sync --stage-pending` transient retry (`src/forums/__main__.py`)**:
+  - Updated `cmd_sync` so `status == "needs_review"` drafts are skipped only when `needs_recheck == 1`, `ctrl.is_review_active()`, or `check_draft_conflicts(draft, store)` returns conflicts, allowing transient runtime/composer `needs_review` drafts to retry after `release_review()`.
+- **Offline verification (after final code/test edits; live Discord UI tests deferred while Discord is in active use)**:
+  - `.venv/bin/python -m pytest tests/ --ignore=tests/test_channel_nav.py -q` -> `44 passed in 8.50s` (`tests/test_channel_nav.py` ignored as unrelated uncommitted work).
+  - `.venv/bin/python -m unittest tests.test_forums -q` -> `Ran 30 tests in 2.390s` (`OK`).
+  - `PYTHONPATH=<LOCAL_HELPER_REPO>:<LOCAL_EXT_REPO>/src:<LOCAL_TMP_DEPS_01> .venv/bin/python <LOCAL_SCRATCH_01>` -> exit code `0`, all 6 cross-repo scenarios passed against unmodified `<EXT_APP_01>` (`<EXT_REV_01>`).
+- **Deferred live verification**:
+  - Live `DesktopDiscordProvider` checks on installed Discord for post-`7e23d03` fixes (message attachment AX extraction/preservation, live post-card inline-link filtering, and live `sync --stage-pending` retry) remain deferred because Discord is currently in active use (tracked in `TODO.md`).

@@ -2528,6 +2528,464 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                 ])
             self.assertEqual(rc_bad, 2)
 
+    def test_unverified_attachments_preserve_prior_mirror_while_verified_empty_clears(self) -> None:
+        from src.forums.providers import desktop as desktop_mod
+
+        class _FakeAX:
+            def __init__(
+                self,
+                role: str = "",
+                *,
+                title: str = "",
+                description: str = "",
+                value: str = "",
+                url: str = "",
+                dom_id: str = "",
+                children: Optional[list[Any]] = None,
+            ) -> None:
+                self.attrs: dict[str, Any] = {
+                    "AXRole": role,
+                    "AXTitle": title,
+                    "AXDescription": description,
+                    "AXValue": value,
+                    "AXURL": url,
+                    "AXDOMIdentifier": dom_id,
+                    "AXChildren": list(children or []),
+                    "AXParent": None,
+                }
+                for ch in self.attrs["AXChildren"]:
+                    ch.attrs["AXParent"] = self
+
+        # Provider level: unparsed non-empty accessories or missing content node -> attachments=None
+        # Verified empty/absent accessories with content node -> attachments=[]
+        m1 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000001",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-content-600000000000000001", children=[
+                    _FakeAX("AXStaticText", value="With image"),
+                ]),
+                _FakeAX("AXGroup", dom_id="message-accessories-600000000000000001", children=[
+                    _FakeAX("AXLink", url="https://cdn.discordapp.com/attachments/1/2/shot.png"),
+                ]),
+            ],
+        )
+        m2 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000002",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-content-600000000000000002", children=[
+                    _FakeAX("AXStaticText", value="Unparsed acc"),
+                ]),
+                _FakeAX("AXGroup", dom_id="message-accessories-600000000000000002", children=[
+                    _FakeAX("AXImage", description="Image without AXURL"),
+                ]),
+            ],
+        )
+        m3 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000003",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-accessories-600000000000000003"),
+            ],
+        )
+        m4 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000004",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-content-600000000000000004", children=[
+                    _FakeAX("AXStaticText", value="Verified empty acc"),
+                ]),
+                _FakeAX("AXGroup", dom_id="message-accessories-600000000000000004"),
+            ],
+        )
+        m5 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000005",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-content-600000000000000005", children=[
+                    _FakeAX("AXStaticText", value="No acc node"),
+                ]),
+            ],
+        )
+        msg_list = _FakeAX(
+            "AXList",
+            description="Messages in North Ridge Depot",
+            children=[m1, m2, m3, m4, m5],
+        )
+        provider = desktop_mod.DesktopDiscordProvider()
+        with patch.object(
+            desktop_mod,
+            "_ax_attr",
+            side_effect=lambda el, attr: el.attrs.get(attr) if hasattr(el, "attrs") else None,
+        ):
+            _, _, msgs = provider._parse_messages_from_ax_list(msg_list, GUILD_ID, THREAD_1)
+
+        self.assertEqual(len(msgs["600000000000000001"].attachments or []), 1)
+        self.assertEqual(msgs["600000000000000001"].attachments[0]["name"], "shot.png")
+        self.assertIsNone(msgs["600000000000000002"].attachments)
+        self.assertIsNone(msgs["600000000000000003"].attachments)
+        self.assertEqual(msgs["600000000000000004"].attachments, [])
+        self.assertEqual(msgs["600000000000000005"].attachments, [])
+
+        # Store level: None preserves previously stored attachments even across body edit; [] removes them
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ForumStore(Path(tmp) / "mirror.sqlite3")
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID, snapshot_id="snap-att")
+                store.upsert_forum(forum_id=FORUM_ID, name="Forum", source_url=build_discord_channel_url(GUILD_ID, FORUM_ID))
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="North Ridge Depot")
+                store.upsert_message(
+                    entity_ref="msg:600000000000000001",
+                    message_id="600000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "FixtureAuthor"},
+                    body="Initial caption",
+                    attachments=[{"name": "shot.png", "source_url": "https://cdn.discordapp.com/attachments/1/2/shot.png"}],
+                )
+                quiet_chg = store.upsert_message(
+                    entity_ref="msg:600000000000000001",
+                    message_id="600000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "FixtureAuthor"},
+                    body="Initial caption",
+                    attachments=None,
+                )
+                self.assertIsNone(quiet_chg)
+                edit_chg = store.upsert_message(
+                    entity_ref="msg:600000000000000001",
+                    message_id="600000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "FixtureAuthor"},
+                    body="Edited caption",
+                    attachments=None,
+                )
+                self.assertIsNotNone(edit_chg)
+                self.assertEqual(len(edit_chg["after"]["attachments"]), 1)
+                self.assertEqual(len(store.export_snapshot()["messages"][0]["attachments"]), 1)
+
+                del_chg = store.upsert_message(
+                    entity_ref="msg:600000000000000001",
+                    message_id="600000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "FixtureAuthor"},
+                    body="Edited caption",
+                    attachments=[],
+                )
+                self.assertIsNotNone(del_chg)
+                self.assertEqual(del_chg["kind"], "attachment_changed")
+                self.assertEqual(store.export_snapshot()["messages"][0]["attachments"], [])
+            finally:
+                store.close()
+
+    def test_extract_post_cards_and_links_rejects_non_card_and_cross_channel_links(self) -> None:
+        from src.forums.providers import desktop as desktop_mod
+
+        class _FakeAX:
+            def __init__(
+                self,
+                role: str = "",
+                *,
+                title: str = "",
+                description: str = "",
+                value: str = "",
+                url: str = "",
+                dom_id: str = "",
+                children: Optional[list[Any]] = None,
+            ) -> None:
+                self.attrs: dict[str, Any] = {
+                    "AXRole": role,
+                    "AXTitle": title,
+                    "AXDescription": description,
+                    "AXValue": value,
+                    "AXURL": url,
+                    "AXDOMIdentifier": dom_id,
+                    "AXChildren": list(children or []),
+                    "AXParent": None,
+                }
+                for ch in self.attrs["AXChildren"]:
+                    ch.attrs["AXParent"] = self
+
+        win = _FakeAX(
+            "AXWindow",
+            children=[
+                _FakeAX("AXList", description="Messages in #general", children=[
+                    _FakeAX("AXLink", description="Chat link", url=build_discord_channel_url(GUILD_ID, "888000000000000001")),
+                ]),
+                _FakeAX("AXList", description="Channels", children=[
+                    _FakeAX("AXLink", description="Sidebar link", url=build_discord_channel_url(GUILD_ID, "888000000000000002")),
+                ]),
+                _FakeAX("AXList", description="Forum posts", children=[
+                    _FakeAX("AXGroup", children=[
+                        _FakeAX("AXButton", description="Post Card 101"),
+                        _FakeAX("AXGroup", dom_id="message-content-888000000000000101", children=[
+                            _FakeAX("AXHeading", title="Card 101"),
+                            _FakeAX("AXLink", description="Mentioned channel", url=build_discord_channel_url(GUILD_ID, "888000000000000003")),
+                        ]),
+                    ]),
+                    _FakeAX("AXGroup", children=[
+                        _FakeAX("AXButton", description="Post Permalink Card"),
+                        _FakeAX(
+                            "AXLink",
+                            description="Permalink",
+                            url=build_discord_channel_url(GUILD_ID, "888000000000000004", "999000000000000001"),
+                        ),
+                    ]),
+                    _FakeAX("AXGroup", children=[
+                        _FakeAX("AXButton", description="Post Link-Only Topic"),
+                        _FakeAX(
+                            "AXLink",
+                            description="Link-Only Topic",
+                            url=build_discord_channel_url(GUILD_ID, "888000000000000005"),
+                        ),
+                    ]),
+                ]),
+            ],
+        )
+        provider = desktop_mod.DesktopDiscordProvider()
+        with patch.object(
+            desktop_mod,
+            "_ax_attr",
+            side_effect=lambda el, attr: el.attrs.get(attr) if hasattr(el, "attrs") else None,
+        ):
+            nodes = desktop_mod._walk_ax_tree(win)
+            cards, links, _ = provider._extract_post_cards_and_links(nodes, GUILD_ID, FORUM_ID)
+
+        self.assertEqual([c.thread_id for c in cards], ["888000000000000101"])
+        self.assertEqual([l.thread_id for l in links], ["888000000000000005"])
+
+    def test_mixed_precision_rfc3339_timestamps_sort_chronologically_in_sql(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ForumStore(Path(tmp) / "mirror.sqlite3")
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID, snapshot_id="snap-ts")
+                store.upsert_forum(forum_id=FORUM_ID, name="Forum", source_url=build_discord_channel_url(GUILD_ID, FORUM_ID))
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="Mixed Timestamps")
+
+                # Insert .500000Z BEFORE whole-second Z so both ASCII and rowid order would invert chronology
+                store.upsert_message(
+                    entity_ref="msg:700000000000000002",
+                    message_id="700000000000000002",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "Tester"},
+                    body="Second chronologically (token-alpha)",
+                    observed_at="2026-11-14T22:23:07.500000Z",
+                )
+                store.upsert_message(
+                    entity_ref="msg:700000000000000001",
+                    message_id="700000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "Tester"},
+                    body="First chronologically (token-alpha)",
+                    observed_at="2026-11-14T22:23:07Z",
+                )
+
+                status = store.get_topic_status(THREAD_1)
+                self.assertEqual(
+                    [m["message_id"] for m in status["latest_messages"]],
+                    ["700000000000000001", "700000000000000002"],
+                )
+                snap_msgs = store.export_snapshot()["messages"]
+                self.assertEqual(
+                    [m["message_id"] for m in snap_msgs],
+                    ["700000000000000001", "700000000000000002"],
+                )
+                search_msgs = store.search("token-alpha", forum_id=FORUM_ID)["messages"]
+                self.assertEqual(
+                    [m["message_id"] for m in search_msgs],
+                    ["700000000000000002", "700000000000000001"],
+                )
+
+                base_receipt = {
+                    "schema": "handoff.receipt.v1",
+                    "producer_id": "discord-promo-helper",
+                    "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": {"user_id": None, "label": "Tester"}},
+                    "draft_id": "draft-mixed-ts",
+                    "draft_revision": 1,
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1, "message_id": None, "action": "reply_existing", "source_url": build_discord_channel_url(GUILD_ID, THREAD_1)},
+                    "actor": {"user_id": None, "label": "Tester"},
+                    "status": "needs_review",
+                    "reason": "temp",
+                    "message_id": None,
+                    "message_url": None,
+                    "observed_body_hash": None,
+                    "evidence_ids": [],
+                }
+                r_frac = {**base_receipt, "receipt_id": "rcpt-frac", "record_id": "rec-frac", "created_at": "2026-11-14T22:23:07.500000Z", "observed_at": "2026-11-14T22:23:07.500000Z", "status": "staged"}
+                r_whole = {**base_receipt, "receipt_id": "rcpt-whole", "record_id": "rec-whole", "created_at": "2026-11-14T22:23:07Z", "observed_at": "2026-11-14T22:23:07Z", "status": "needs_review"}
+                store.save_receipt(r_frac)
+                store.save_receipt(r_whole)
+                receipts = store.list_receipts("draft-mixed-ts")
+                self.assertEqual([r["record_id"] for r in receipts], ["rec-whole", "rec-frac"])
+            finally:
+                store.close()
+
+    def test_sync_stage_pending_retries_transient_needs_review_and_skips_recheck(self) -> None:
+        from contextlib import redirect_stdout
+        import io
+        from src.forums import __main__ as forums_cli
+        from src.forums.exchange import canonical_record_digest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "mirror.sqlite3"
+            ex_dir = root / "exchange"
+            profiles_path = root / "profiles.json"
+
+            fixture_path = Path("tests/fixtures/forum_exchange_v1/draft_with_attachment.v1.json")
+            draft_a = copy.deepcopy(read_record(fixture_path))
+            scope = draft_a["scope"]
+            gid, fid, tid = scope["guild_id"], scope["forum_id"], draft_a["destination"]["thread_id"]
+            prof = ForumProfile(
+                profile_id="sync-retry-prof",
+                name="Sync Retry Forum",
+                guild_id=gid,
+                forum_id=fid,
+                purpose="external_project",
+                catalog_enabled=True,
+                external_drafts_enabled=True,
+                stage_enabled=True,
+                db_path=str(db_path),
+                transfer_root=str(root / "unused_transfer"),
+                exchange_dir=str(ex_dir),
+            )
+            upsert_forum_profile(prof, profiles_path)
+
+            store = ForumStore(db_path)
+            try:
+                _seed_mirror_for_draft(store, draft_a)
+            finally:
+                store.close()
+
+            ev_bytes = b"SYNC-RETRY-PNG"
+            draft_a["evidence"][0]["sha256"] = compute_bytes_sha256(ev_bytes)
+            bundle_a = ex_dir / "bundles" / canonical_record_digest(draft_a)
+            ev_path_a = bundle_a / "transfer" / draft_a["evidence"][0]["local_ref"]
+            ev_path_a.parent.mkdir(parents=True, exist_ok=True)
+            ev_path_a.write_bytes(ev_bytes)
+            write_record_atomic(bundle_a / "draft.request.json", draft_a)
+
+            fail_obs = ComposerStageObservation(
+                status="needs_review",
+                observed_actor={"user_id": scope["actor"]["user_id"], "label": "DemoUser"},
+                destination=dict(draft_a["destination"]),
+                observed_composer_text=draft_a["body"],
+                staged_evidence_ids=[],
+                reason="attachment_upload_interrupted",
+            )
+            ok_obs = ComposerStageObservation(
+                status="staged",
+                observed_actor={"user_id": scope["actor"]["user_id"], "label": "DemoUser"},
+                destination=dict(draft_a["destination"]),
+                observed_composer_text=draft_a["body"],
+                staged_evidence_ids=[ev["evidence_id"] for ev in draft_a["evidence"]],
+                reason="staged_verified",
+            )
+
+            class FakeSyncDesktopProvider:
+                stage_calls = 0
+
+                def describe_session(self) -> SessionDescription:
+                    return SessionDescription(
+                        actor={"user_id": scope["actor"]["user_id"], "label": "DemoUser"},
+                        app_name="Discord",
+                        window_title="Discord",
+                        window_bbox=(0, 0, 1000, 700),
+                        current_url=draft_a["destination"]["source_url"],
+                        capabilities={"can_read_semantic": True, "can_stage_composer": True},
+                    )
+
+                def describe_forum(self, guild_id: str, forum_id: str) -> ForumObservation:
+                    return ForumObservation(
+                        forum_id=forum_id,
+                        guild_id=guild_id,
+                        name="CLI Bundle Forum",
+                        source_url=build_discord_channel_url(guild_id, forum_id),
+                        guidelines_text="",
+                        tags=[],
+                    )
+
+                def list_topics(self, guild_id: str, forum_id: str, cursor: Optional[str] = None) -> TopicListObservation:
+                    return TopicListObservation(
+                        topics=[TopicObservation(forum_id=forum_id, thread_id=tid, title="North Ridge Depot", source_url=draft_a["destination"]["source_url"])],
+                        next_cursor=None,
+                        complete=True,
+                    )
+
+                def read_requirements(self, guild_id: str, forum_id: str, references: Optional[list[dict[str, Any]]] = None) -> list[RequirementObservation]:
+                    return []
+
+                def read_topic(self, guild_id: str, forum_id: str, thread_id: str, cursor: Optional[str] = None) -> TopicHistoryObservation:
+                    return TopicHistoryObservation(
+                        topic=TopicObservation(forum_id=forum_id, thread_id=thread_id, title="North Ridge Depot", source_url=draft_a["destination"]["source_url"]),
+                        messages=[],
+                        complete=True,
+                    )
+
+                def stage_draft(self, *_args: Any, **_kwargs: Any) -> ComposerStageObservation:
+                    FakeSyncDesktopProvider.stage_calls += 1
+                    return fail_obs if FakeSyncDesktopProvider.stage_calls == 1 else ok_obs
+
+            with patch.object(forums_cli, "DesktopDiscordProvider", FakeSyncDesktopProvider):
+                # 1. First sync stages into transient needs_review + active review lock
+                out1 = io.StringIO()
+                with redirect_stdout(out1):
+                    rc1 = forums_cli.main(["--profiles-path", str(profiles_path), "sync", "--profile", prof.profile_id, "--provider", "desktop", "--stage-pending"])
+                self.assertEqual(rc1, 0)
+                res1 = json.loads(out1.getvalue())
+                self.assertEqual(res1["staged"][0]["status"], "needs_review")
+                self.assertEqual(FakeSyncDesktopProvider.stage_calls, 1)
+
+                # 2. While review lock is still held, sync skips retrying
+                out2 = io.StringIO()
+                with redirect_stdout(out2):
+                    rc2 = forums_cli.main(["--profiles-path", str(profiles_path), "sync", "--profile", prof.profile_id, "--provider", "desktop", "--stage-pending"])
+                self.assertEqual(rc2, 0)
+                self.assertEqual(json.loads(out2.getvalue())["staged"], [])
+                self.assertEqual(FakeSyncDesktopProvider.stage_calls, 1)
+
+                # 3. After release_review(), sync retries the transient needs_review draft cleanly
+                ctrl = SessionController(Path(db_path).with_suffix(".session.json"))
+                ctrl.release_review()
+                out3 = io.StringIO()
+                with redirect_stdout(out3):
+                    rc3 = forums_cli.main(["--profiles-path", str(profiles_path), "sync", "--profile", prof.profile_id, "--provider", "desktop", "--stage-pending"])
+                self.assertEqual(rc3, 0)
+                res3 = json.loads(out3.getvalue())
+                self.assertEqual(res3["staged"][0]["status"], "staged")
+                self.assertEqual(FakeSyncDesktopProvider.stage_calls, 2)
+
+                # 4. A needs_review draft flagged with needs_recheck=1 stays skipped even after release_review()
+                draft_b = copy.deepcopy(draft_a)
+                draft_b["draft_id"] = "draft-recheck-blocked"
+                draft_b["record_id"] = "rec-recheck-blocked"
+                bundle_b = ex_dir / "bundles" / canonical_record_digest(draft_b)
+                ev_path_b = bundle_b / "transfer" / draft_b["evidence"][0]["local_ref"]
+                ev_path_b.parent.mkdir(parents=True, exist_ok=True)
+                ev_path_b.write_bytes(ev_bytes)
+                write_record_atomic(bundle_b / "draft.request.json", draft_b)
+
+                store2 = ForumStore(db_path)
+                try:
+                    store2.save_draft(draft_b)
+                    store2.update_draft_status(
+                        draft_b["draft_id"],
+                        int(draft_b["revision"]),
+                        "needs_review",
+                        needs_recheck=True,
+                        recheck_reason="requirement_changed",
+                    )
+                finally:
+                    store2.close()
+
+                out4 = io.StringIO()
+                with redirect_stdout(out4):
+                    rc4 = forums_cli.main(["--profiles-path", str(profiles_path), "sync", "--profile", prof.profile_id, "--provider", "desktop", "--stage-pending"])
+                self.assertEqual(rc4, 0)
+                self.assertEqual(json.loads(out4.getvalue())["staged"], [])
+                self.assertEqual(FakeSyncDesktopProvider.stage_calls, 2)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,7 @@ Every record requires these keys:
 | `schema` | Exactly one of the four record names below; no second discriminator |
 | `record_id` | Globally unique opaque string for the record |
 | `producer_id` | Stable opaque producer installation ID |
-| `created_at` | RFC 3339 UTC string with `Z` |
+| `created_at` | RFC 3339 UTC string with `Z` (whole-second or fractional-second precision; compare chronologically as parsed UTC timestamps, not raw ASCII strings) |
 | `scope` | Object with `guild_id`, `forum_id`, `actor` |
 
 All Discord IDs are decimal **strings**; null is allowed only where a field explicitly says so. Scope guild/forum IDs and exchanged topic thread IDs must be resolved non-null IDs. Actor shape: `{ "user_id": null, "label": "Selected account" }`; `user_id` is an observed ID string or null. A label alone does not verify identity. Staging checks the current account/target, not just these fields.

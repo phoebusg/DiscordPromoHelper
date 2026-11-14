@@ -576,7 +576,14 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         )
                     )
 
-        def _in_forum_post_card(elem: Any) -> bool:
+        def _card_thread_id(card_elem: Any) -> Optional[str]:
+            for s in _walk_ax_tree(card_elem, max_nodes=60, max_depth=6):
+                m = re.match(r"^message-content-(\d+)$", s["dom_id"])
+                if m and m.group(1) != forum_id:
+                    return m.group(1)
+            return None
+
+        def _enclosing_forum_post_card_tid(elem: Any) -> tuple[bool, Optional[str]]:
             cur = elem
             for _ in range(6):
                 cur = _ax_attr(cur, "AXParent")
@@ -584,16 +591,17 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     break
                 c_role = str(_ax_attr(cur, "AXRole") or "")
                 c_desc = str(_ax_attr(cur, "AXDescription") or "")
-                if c_role == "AXList":
-                    break
+                if c_role == "AXList" or c_desc.startswith("Messages in ") or c_desc == "Channels":
+                    return False, None
                 if c_role == "AXButton" and c_desc.startswith("Post ") and c_desc != "Post Guidelines":
-                    return True
-                for sib in (_ax_attr(cur, "AXChildren") or [])[:10]:
+                    card_parent = _ax_attr(cur, "AXParent")
+                    return True, (_card_thread_id(card_parent) if card_parent is not None else None)
+                for sib in (_ax_attr(cur, "AXChildren") or [])[:15]:
                     s_role = str(_ax_attr(sib, "AXRole") or "")
                     s_desc = str(_ax_attr(sib, "AXDescription") or "")
                     if s_role == "AXButton" and s_desc.startswith("Post ") and s_desc != "Post Guidelines":
-                        return True
-            return False
+                        return True, _card_thread_id(cur)
+            return False, None
 
         for n in nodes:
             if n["role"] != "AXLink":
@@ -601,12 +609,17 @@ class DesktopDiscordProvider(DiscordViewProvider):
             desc_lower = (n["description"] or "").lower()
             if "channel)" in desc_lower or "private channel" in desc_lower:
                 continue
-            if not _in_forum_post_card(n["element"]):
+            in_card, card_tid = _enclosing_forum_post_card_tid(n["element"])
+            if not in_card:
                 continue
             for cand in (n["url"], n["value"], n["description"]):
                 parsed = parse_discord_channel_url(cand)
-                if parsed and parsed[0] == guild_id and parsed[1] != forum_id:
+                if not parsed or parsed[2] is not None:
+                    continue
+                if parsed[0] == guild_id and parsed[1] != forum_id:
                     tid = parsed[1]
+                    if card_tid is not None and tid != card_tid:
+                        continue
                     if tid in seen_cards or tid in seen_links:
                         continue
                     seen_links.add(tid)
@@ -852,6 +865,9 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     "edited": False,
                     "links": [],
                     "attachments": [],
+                    "has_content_node": False,
+                    "has_accessories_node": False,
+                    "accessories_unparsed": False,
                 },
             )
 
@@ -865,6 +881,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             last_author = entry["author"]
                             break
                 elif s["dom_id"] == f"message-content-{mid}":
+                    entry["has_content_node"] = True
                     c_sub = _walk_ax_tree(s["element"], max_nodes=180, max_depth=10)
                     for c in c_sub:
                         if c["role"] == "AXStaticText" and c["value"] == "edited":
@@ -882,10 +899,13 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         if t["role"] == "AXStaticText" and t["value"].strip():
                             entry["timestamps"].append(t["value"].strip())
                 elif s["dom_id"] == f"message-accessories-{mid}":
+                    entry["has_accessories_node"] = True
                     a_sub = _walk_ax_tree(s["element"], max_nodes=120, max_depth=8)
+                    parsed_urls = 0
                     for a in a_sub:
                         cand_url = a["url"] or ""
                         if "cdn.discordapp.com/attachments/" in cand_url or "media.discordapp.net/attachments/" in cand_url:
+                            parsed_urls += 1
                             if cand_url not in seen_att_urls:
                                 seen_att_urls.add(cand_url)
                                 fname = cand_url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"
@@ -898,6 +918,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
                                         "local_ref": None,
                                     }
                                 )
+                    if len(a_sub) > 1 and parsed_urls == 0:
+                        entry["accessories_unparsed"] = True
 
             if entry["author"] is None and last_author:
                 entry["author"] = last_author
@@ -908,6 +930,17 @@ class DesktopDiscordProvider(DiscordViewProvider):
             for link_url in ent["links"]:
                 if link_url and link_url not in body:
                     body = f"{body}\n{link_url}".strip()
+            # Keep None when attachments could not be verified (e.g. non-empty
+            # accessories without parsed CDN URLs or missing message-content box)
+            # so store.upsert_message does not clear previously mirrored files.
+            if ent["attachments"]:
+                obs_attachments: Optional[list[dict[str, Any]]] = (
+                    None if ent["accessories_unparsed"] else ent["attachments"]
+                )
+            elif ent["accessories_unparsed"] or not ent["has_content_node"]:
+                obs_attachments = None
+            else:
+                obs_attachments = []
             msgs_by_mid[mid] = MessageObservation(
                 thread_id=thread_id,
                 entity_ref=f"msg:{mid}",
@@ -916,7 +949,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 body=body,
                 source_url=build_discord_channel_url(guild_id, thread_id, mid),
                 identity_verified=False,
-                attachments=ent["attachments"],
+                attachments=obs_attachments,
                 recognition={"method": "accessibility", "confidence": 0.98},
                 explicit_edited_marker=bool(ent["edited"]),
                 source_method="accessibility",
@@ -1694,7 +1727,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         draft_body: str,
         observed_body: str,
         expected_filenames: list[str],
-        observed_attachments: list[dict[str, Any]],
+        observed_attachments: Optional[list[dict[str, Any]]],
     ) -> float:
         import difflib
         from ..models import normalize_text_for_hash
@@ -1714,7 +1747,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
 
         if expected_filenames:
             obs_att_text = " ".join(
-                f"{a.get('name', '')} {a.get('url', '')}" for a in observed_attachments
+                f"{a.get('name', '')} {a.get('url', '')}" for a in (observed_attachments or [])
             ).lower()
             matched_files = sum(
                 1 for fn in expected_filenames if fn.lower() in obs_att_text or Path(fn).stem.lower() in obs_att_text
