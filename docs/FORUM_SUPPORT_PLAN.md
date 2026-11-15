@@ -120,6 +120,14 @@ Support communities with one permanent topic per streamer, a shared promotion th
 
 `Copy draft` remains an optional fallback, not the definition of success. The primary acceptance target is a populated composer in the correct forum/topic with the intended evidence, ready for final human review.
 
+### External preparation without repetitive data entry
+
+The external application should derive context from its configured inputs, resolve a destination against retained source identities, retrieve its own reference data, and select supporting evidence before handing off a draft. A request to make the user transcribe observable facts, look up reference records or repeatedly copy reports is not completion of this workflow. Ask for a necessary clarification only after the available inputs and tools have been used. Final human review remains the place to correct uncertain interpretation.
+
+Capture recognition, domain reference lookup, screenshot/replay creation and optional media-host publication belong to the external producer. The helper receives a complete draft with selected files and, where applicable, an already published media URL in its body. Local screenshots and clips use the existing evidence records and bounded transfer root; a hosted clip link uses ordinary draft text. No new media-host credentials or private dependencies belong in the helper, and no v1 contract fork is required for these cases.
+
+Implemented generic priority read: `python -m src.forums refresh --profile PROFILE --thread THREAD_ID --provider desktop --export` refreshes the known topic and guidance without enumerating unrelated destinations. It preserves global coverage/freshness and other pending work; it does not claim the entire forum is current. The ID must already belong to the configured mirror. A paused or incomplete targeted read returns exit 2, so an orchestrator must check the result before preparing against that baseline. Capture-driven destination selection remains outside this public application.
+
 ## Cross-project contracts
 
 Start with versioned JSON files and atomic exports; add a CLI over the same interfaces. External producers need no private imports into this application and exchange no credentials. The [shared v1 field contract](FORUM_EXCHANGE_V1.md) fixes exact keys, types, cursors, baselines and evidence/receipt identities for parallel work.

@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from .config import ForumProfile
 from .handoff import SessionController
-from .models import utc_now_iso
+from .models import require_discord_id, utc_now_iso
 from .providers.base import DiscordViewProvider, TopicObservation
 from .store import ForumStore
 
@@ -135,6 +135,18 @@ class ForumReader:
                 thread_id,
                 cursor=cursor,
             )
+            if (
+                hist.topic.thread_id != thread_id
+                or hist.topic.forum_id != self.profile.forum_id
+                or any(msg.thread_id not in (None, thread_id) for msg in hist.messages)
+            ):
+                all_errors.append({
+                    "code": "history_target_mismatch",
+                    "message": "Observed history does not match the requested topic and forum",
+                    "thread_id": thread_id,
+                })
+                complete = False
+                break
             if hist.topic.thread_id:
                 self._ingest_topic_obs(hist.topic)
             for msg in hist.messages:
@@ -171,6 +183,57 @@ class ForumReader:
         if complete and not all_errors:
             self.store.mark_topic_deep_read(thread_id)
         return complete and not all_errors, all_errors
+
+    def refresh_topic(self, thread_id: str) -> dict[str, Any]:
+        """Refresh one known destination and guidance without enumerating the forum."""
+        thread_id = require_discord_id(thread_id, "thread_id")
+        self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
+        coverage = self.store.get_coverage()
+        if not self.profile.catalog_enabled:
+            return {"paused": True, "reason": "catalog_disabled", "coverage": coverage}
+        topic = self.store.get_topic_status(thread_id)
+        if topic is None or topic["forum_id"] != self.profile.forum_id:
+            return {"paused": True, "reason": "topic_not_in_configured_mirror", "coverage": coverage}
+        if not self.session.acquire_for_read():
+            return {"paused": True, "reason": "session_in_review_or_staging", "coverage": coverage}
+        try:
+            session = self.provider.describe_session()
+            self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id, actor=session.actor)
+            if not self.session.can_navigate():
+                return {"paused": True, "reason": "session_paused", "coverage": coverage}
+            has_reqs, req_errors, req_complete = self._sync_forum_and_requirements(session.errors)
+            complete, history_errors = self._read_single_topic_history(thread_id)
+            errors = list(session.errors) + req_errors + history_errors
+            pending = [
+                dict(p) for p in coverage.get("pending", [])
+                if p.get("thread_id") not in (None, thread_id)
+            ]
+            if not complete:
+                pending.append({
+                    "thread_id": thread_id,
+                    "reason": history_errors[0]["code"] if history_errors else "history_partial",
+                    "resume_token": f"thread:{thread_id}",
+                })
+            retained_errors = [e for e in coverage.get("errors", []) if e.get("thread_id") != thread_id]
+            # Reading one destination cannot establish freshness/completeness of the whole forum.
+            histories = coverage.get("histories", "not_started")
+            if histories != "complete" or not complete:
+                histories = "partial"
+            cov = self.store.update_coverage(
+                histories=histories,
+                requirements="complete" if req_complete else (
+                    "partial" if has_reqs or errors else coverage.get("requirements", "not_started")
+                ),
+                pending_known=pending,
+                errors=retained_errors + errors,
+            )
+            return {
+                "paused": False, "thread_id": thread_id, "threads_read": 1,
+                "topic_complete": complete, "requirements_complete": req_complete,
+                "errors": errors, "coverage": cov,
+            }
+        finally:
+            self.session.release_read()
 
     def initial_backfill(
         self,

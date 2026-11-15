@@ -154,6 +154,9 @@ def cmd_seed_index(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
+    if getattr(args, "thread", None) and args.backfill:
+        print("--thread and --backfill cannot be combined", file=sys.stderr)
+        return 2
     prof = _load_profile_or_exit(args.profile, args.profiles_path)
     desktop: Optional[DesktopDiscordProvider] = None
     if args.provider == "seed":
@@ -166,7 +169,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
         ctrl = _session_controller_for(prof)
         reader = ForumReader(prof, store, provider, session_controller=ctrl)
-        if args.backfill:
+        if getattr(args, "thread", None):
+            res = reader.refresh_topic(args.thread)
+        elif args.backfill:
             res = reader.initial_backfill(max_topics_per_run=args.max_topics)
         else:
             res = reader.incremental_refresh(
@@ -203,6 +208,14 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         )
     finally:
         store.close()
+    if getattr(args, "thread", None):
+        complete = (
+            not res.get("paused")
+            and res.get("topic_complete")
+            and res.get("requirements_complete")
+            and not res.get("errors")
+        )
+        return 0 if complete else 2
     return 0
 
 
@@ -529,6 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ref.add_argument("--profile", required=True)
     p_ref.add_argument("--provider", choices=["auto", "desktop", "seed"], default="auto")
     p_ref.add_argument("--backfill", action="store_true")
+    p_ref.add_argument("--thread", help="Refresh one already mirrored topic and guidance without a directory scan")
     p_ref.add_argument("--deep-reread", type=int, default=2)
     p_ref.add_argument("--max-topics", type=int)
     p_ref.add_argument("--export", action="store_true")
