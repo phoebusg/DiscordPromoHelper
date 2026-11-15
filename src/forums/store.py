@@ -217,6 +217,20 @@ class ForumStore:
                     payload_hash TEXT NOT NULL,
                     ingested_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS export_outbox (
+                    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_key TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    record_id TEXT NOT NULL UNIQUE,
+                    rel_path TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    snapshot_revision INTEGER NOT NULL,
+                    after_cursor_seq INTEGER,
+                    target_cursor_seq INTEGER NOT NULL,
+                    change_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             meta_cols = {
@@ -1586,17 +1600,16 @@ class ForumStore:
         advance_export_cursor: bool = False,
         guild_id: Optional[str] = None,
         forum_id: Optional[str] = None,
+        revision_override: Optional[int] = None,
     ) -> dict[str, Any]:
         """Export a validated forum.snapshot.v1 record from current mirror state."""
         meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
-        if cutover and int(meta["exported_snapshot_revision"]) > 0:
-            next_rev = int(meta["snapshot_revision"]) + 1
-            with self._conn:
-                self._conn.execute(
-                    "UPDATE mirror_meta SET snapshot_revision = ?, updated_at = ? WHERE scope_key = ?",
-                    (next_rev, utc_now_iso(), meta["scope_key"]),
-                )
-            meta = self._get_meta(meta["scope_key"])
+        if revision_override is not None:
+            snap_rev = int(revision_override)
+        elif cutover and int(meta["exported_snapshot_revision"]) > 0:
+            snap_rev = max(int(meta["snapshot_revision"]), int(meta["exported_snapshot_revision"])) + 1
+        else:
+            snap_rev = int(meta["snapshot_revision"])
 
         now = utc_now_iso()
         forum_row = self._conn.execute(
@@ -1695,7 +1708,6 @@ class ForumStore:
                 req_obj["parsed_checks"] = json.loads(r["parsed_checks_json"])
             req_list.append(req_obj)
 
-        snap_rev = int(meta["snapshot_revision"])
         cur_seq = int(meta["cursor_seq"])
         snap = {
             "schema": "forum.snapshot.v1",
@@ -1722,14 +1734,15 @@ class ForumStore:
         }
         validated = validate_exchange_record(snap)
         if advance_export_cursor:
+            next_meta_rev = max(int(meta["snapshot_revision"]), snap_rev)
             with self._conn:
                 self._conn.execute(
                     """
                     UPDATE mirror_meta
-                    SET exported_snapshot_revision = ?, exported_cursor_seq = ?, updated_at = ?
+                    SET snapshot_revision = ?, exported_snapshot_revision = ?, exported_cursor_seq = ?, updated_at = ?
                     WHERE scope_key = ?
                     """,
-                    (snap_rev, cur_seq, utc_now_iso(), meta["scope_key"]),
+                    (next_meta_rev, snap_rev, cur_seq, utc_now_iso(), meta["scope_key"]),
                 )
         return validated
 
@@ -1737,9 +1750,18 @@ class ForumStore:
         meta = self._get_meta()
         return {"stream_id": meta["stream_id"], "position": str(meta["cursor_seq"])}
 
-    def exported_checkpoint(self) -> dict[str, Any]:
-        """Return the last exported snapshot revision and cursor position."""
-        meta = self._get_meta()
+    def exported_checkpoint(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return the last durably exported snapshot revision, cursor position, and pending outbox count."""
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        pending_row = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM export_outbox WHERE scope_key = ?",
+            (meta["scope_key"],),
+        ).fetchone()
         return {
             "exported_snapshot_revision": int(meta["exported_snapshot_revision"]),
             "snapshot_revision": int(meta["snapshot_revision"]),
@@ -1747,6 +1769,7 @@ class ForumStore:
                 "stream_id": meta["stream_id"],
                 "position": str(meta["exported_cursor_seq"]),
             },
+            "pending_outbox_count": int(pending_row["cnt"]) if pending_row is not None else 0,
         }
 
     def export_changes(
@@ -1825,14 +1848,173 @@ class ForumStore:
                 )
         return validated
 
+    def _enqueue_export_outbox(
+        self,
+        *,
+        scope_key: str,
+        mode: str,
+        record: dict[str, Any],
+        rel_path: str,
+        snapshot_revision: int,
+        after_cursor_seq: Optional[int],
+        target_cursor_seq: int,
+        change_count: int,
+    ) -> sqlite3.Row:
+        payload = json.dumps(record, ensure_ascii=False)
+        now = utc_now_iso()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO export_outbox (
+                    scope_key, mode, record_id, rel_path, record_json,
+                    snapshot_revision, after_cursor_seq, target_cursor_seq,
+                    change_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope_key,
+                    mode,
+                    record["record_id"],
+                    rel_path,
+                    payload,
+                    int(snapshot_revision),
+                    int(after_cursor_seq) if after_cursor_seq is not None else None,
+                    int(target_cursor_seq),
+                    int(change_count),
+                    now,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM export_outbox WHERE outbox_id = ?",
+                (int(cur.lastrowid),),
+            ).fetchone()
+        assert row is not None
+        return row
+
+    @staticmethod
+    def _delta_file_end_seq(path: Path) -> Optional[int]:
+        parts = path.name.split("-")
+        if len(parts) >= 4 and parts[2].isdigit():
+            return int(parts[2])
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pos = (data.get("cursor") or {}).get("position")
+            if pos is not None and str(pos).isdigit():
+                return int(pos)
+        except Exception:
+            pass
+        return None
+
+    def _archive_superseded_deltas(
+        self,
+        changes_dir: Path,
+        archive_dir: Path,
+        max_cursor_seq: int,
+    ) -> None:
+        if not changes_dir.exists():
+            return
+        pending_deltas = sorted(changes_dir.glob("*.json"))
+        to_archive: list[Path] = []
+        for old_file in pending_deltas:
+            end_seq = self._delta_file_end_seq(old_file)
+            if end_seq is not None and end_seq <= max_cursor_seq:
+                to_archive.append(old_file)
+        if not to_archive:
+            return
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for old_file in to_archive:
+            shutil.move(str(old_file), str(archive_dir / old_file.name))
+
+    def _commit_outbox_checkpoint(self, row: sqlite3.Row) -> None:
+        scope_key = row["scope_key"]
+        mode = row["mode"]
+        snap_rev = int(row["snapshot_revision"])
+        target_seq = int(row["target_cursor_seq"])
+        now = utc_now_iso()
+        with self._conn:
+            if mode in ("bootstrap_snapshot", "cutover_snapshot"):
+                self._conn.execute(
+                    """
+                    UPDATE mirror_meta
+                    SET snapshot_revision = MAX(snapshot_revision, ?),
+                        exported_snapshot_revision = ?,
+                        exported_cursor_seq = MAX(exported_cursor_seq, ?),
+                        updated_at = ?
+                    WHERE scope_key = ?
+                    """,
+                    (snap_rev, snap_rev, target_seq, now, scope_key),
+                )
+                if mode == "cutover_snapshot":
+                    self._conn.execute(
+                        """
+                        UPDATE changes
+                        SET snapshot_revision = ?
+                        WHERE stream_id = (SELECT stream_id FROM mirror_meta WHERE scope_key = ?)
+                          AND seq > ?
+                        """,
+                        (snap_rev, scope_key, target_seq),
+                    )
+            elif mode == "incremental_changes":
+                self._conn.execute(
+                    """
+                    UPDATE mirror_meta
+                    SET exported_cursor_seq = MAX(exported_cursor_seq, ?),
+                        updated_at = ?
+                    WHERE scope_key = ?
+                    """,
+                    (target_seq, now, scope_key),
+                )
+            else:
+                raise ValueError(f"Unsupported export_outbox mode: {mode!r}")
+            self._conn.execute(
+                "DELETE FROM export_outbox WHERE outbox_id = ?",
+                (int(row["outbox_id"]),),
+            )
+
+    def _publish_outbox_row(self, ex_dir: Path, row: sqlite3.Row) -> dict[str, Any]:
+        record = json.loads(row["record_json"])
+        target_path = ex_dir / row["rel_path"]
+        written_path = write_record_atomic(target_path, record)
+        mode = row["mode"]
+        if mode in ("bootstrap_snapshot", "cutover_snapshot"):
+            self._archive_superseded_deltas(
+                ex_dir / "changes",
+                ex_dir / "archive" / "changes",
+                int(row["target_cursor_seq"]),
+            )
+            self._commit_outbox_checkpoint(row)
+            return {
+                "mode": mode,
+                "snapshot": str(written_path),
+                "snapshot_revision": record["revision"],
+                "cursor": record["cursor"],
+                "changes": None,
+                "change_count": 0,
+            }
+        self._commit_outbox_checkpoint(row)
+        return {
+            "mode": "incremental_changes",
+            "snapshot": None,
+            "snapshot_revision": record["snapshot_revision"],
+            "after_cursor": record["after_cursor"],
+            "cursor": record["cursor"],
+            "changes": str(written_path),
+            "change_count": len(record["changes"]),
+        }
+
     def export_exchange_dir(
         self,
         exchange_dir: str | Path,
         *,
         force_snapshot: bool = False,
         export_empty_changes: bool = False,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Export ordered bootstrap snapshot, incremental delta batch, or snapshot cutover into exchange_dir.
+
+        Uses a durable outbox table so checkpoints advance only after atomic file publication succeeds,
+        while preserving immutable record_ids and canonical payloads across crash/write-failure retries.
 
         Directory layout matches consumer expectations:
         - snapshots/  (forum.snapshot.v1)
@@ -1848,43 +2030,94 @@ class ForumStore:
         acks_dir = ex_dir / "acks"
         drafts_dir = ex_dir / "drafts"
         receipts_dir = ex_dir / "receipts"
-        archive_dir = ex_dir / "archive" / "changes"
         for d in (snapshots_dir, changes_dir, acks_dir, drafts_dir, receipts_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        meta = self._get_meta()
-        is_bootstrap = int(meta["exported_snapshot_revision"]) == 0
-        if is_bootstrap or force_snapshot:
-            # Archive superseded delta files before writing a new snapshot cutover so a restarted
-            # consumer processes snapshots first and does not replay stale pre-cutover deltas.
-            if changes_dir.exists():
-                pending_deltas = sorted(changes_dir.glob("*.json"))
-                if pending_deltas:
-                    archive_dir.mkdir(parents=True, exist_ok=True)
-                    for old_file in pending_deltas:
-                        shutil.move(str(old_file), str(archive_dir / old_file.name))
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        scope_key = meta["scope_key"]
 
+        # Phase 1: recover/complete any durably queued publication before generating new batches.
+        pending_rows = self._conn.execute(
+            "SELECT * FROM export_outbox WHERE scope_key = ? ORDER BY outbox_id ASC",
+            (scope_key,),
+        ).fetchall()
+        last_published: Optional[dict[str, Any]] = None
+        first_after_cursor: Optional[dict[str, str]] = None
+        total_published_changes = 0
+        for prow in pending_rows:
+            pub = self._publish_outbox_row(ex_dir, prow)
+            last_published = pub
+            if pub["mode"] == "incremental_changes":
+                if first_after_cursor is None:
+                    first_after_cursor = pub["after_cursor"]
+                total_published_changes += int(pub["change_count"])
+
+        # Phase 2: publish any new pending mirror state beyond the committed checkpoint.
+        meta = self._get_meta(scope_key)
+        is_bootstrap = int(meta["exported_snapshot_revision"]) == 0
+        if is_bootstrap:
             snap = self.export_snapshot(
-                cutover=(force_snapshot and not is_bootstrap),
-                advance_export_cursor=True,
+                cutover=False,
+                advance_export_cursor=False,
+                guild_id=meta["guild_id"],
+                forum_id=meta["forum_id"],
             )
             snap_name = (
                 f"{int(snap['revision']):06d}-"
                 f"{int(snap['cursor']['position']):08d}-"
                 f"{snap['record_id']}.snapshot.v1.json"
             )
-            snap_path = write_record_atomic(snapshots_dir / snap_name, snap)
-            return {
-                "mode": "bootstrap_snapshot" if is_bootstrap else "cutover_snapshot",
-                "snapshot": str(snap_path),
-                "snapshot_revision": snap["revision"],
-                "cursor": snap["cursor"],
-                "changes": None,
-                "change_count": 0,
-            }
+            out_row = self._enqueue_export_outbox(
+                scope_key=scope_key,
+                mode="bootstrap_snapshot",
+                record=snap,
+                rel_path=f"snapshots/{snap_name}",
+                snapshot_revision=int(snap["revision"]),
+                after_cursor_seq=None,
+                target_cursor_seq=int(snap["cursor"]["position"]),
+                change_count=0,
+            )
+            return self._publish_outbox_row(ex_dir, out_row)
 
-        batch = self.export_changes(after_cursor=None, advance_export_cursor=True)
-        if not batch["changes"] and not export_empty_changes:
+        if force_snapshot:
+            if (
+                last_published is not None
+                and last_published["mode"] in ("bootstrap_snapshot", "cutover_snapshot")
+                and int(meta["exported_cursor_seq"]) == int(meta["cursor_seq"])
+            ):
+                return last_published
+            snap = self.export_snapshot(
+                cutover=True,
+                advance_export_cursor=False,
+                guild_id=meta["guild_id"],
+                forum_id=meta["forum_id"],
+            )
+            snap_name = (
+                f"{int(snap['revision']):06d}-"
+                f"{int(snap['cursor']['position']):08d}-"
+                f"{snap['record_id']}.snapshot.v1.json"
+            )
+            out_row = self._enqueue_export_outbox(
+                scope_key=scope_key,
+                mode="cutover_snapshot",
+                record=snap,
+                rel_path=f"snapshots/{snap_name}",
+                snapshot_revision=int(snap["revision"]),
+                after_cursor_seq=None,
+                target_cursor_seq=int(snap["cursor"]["position"]),
+                change_count=0,
+            )
+            return self._publish_outbox_row(ex_dir, out_row)
+
+        batch = self.export_changes(
+            after_cursor=None,
+            advance_export_cursor=False,
+            guild_id=meta["guild_id"],
+            forum_id=meta["forum_id"],
+        )
+        if not batch["changes"] and (not export_empty_changes or last_published is not None):
+            if last_published is not None:
+                return last_published
             return {
                 "mode": "quiet_noop",
                 "snapshot": None,
@@ -1900,16 +2133,21 @@ class ForumStore:
             f"{int(batch['cursor']['position']):08d}-"
             f"{batch['record_id']}.changes.v1.json"
         )
-        chg_path = write_record_atomic(changes_dir / chg_name, batch)
-        return {
-            "mode": "incremental_changes",
-            "snapshot": None,
-            "snapshot_revision": batch["snapshot_revision"],
-            "after_cursor": batch["after_cursor"],
-            "cursor": batch["cursor"],
-            "changes": str(chg_path),
-            "change_count": len(batch["changes"]),
-        }
+        out_row = self._enqueue_export_outbox(
+            scope_key=scope_key,
+            mode="incremental_changes",
+            record=batch,
+            rel_path=f"changes/{chg_name}",
+            snapshot_revision=int(batch["snapshot_revision"]),
+            after_cursor_seq=int(batch["after_cursor"]["position"]),
+            target_cursor_seq=int(batch["cursor"]["position"]),
+            change_count=len(batch["changes"]),
+        )
+        res = self._publish_outbox_row(ex_dir, out_row)
+        if total_published_changes > 0:
+            res["change_count"] = total_published_changes + int(res["change_count"])
+            res["after_cursor"] = first_after_cursor or res["after_cursor"]
+        return res
 
     def search(self, query: str, forum_id: Optional[str] = None) -> dict[str, Any]:
         """Local search across topics, messages, unresolved observations, and requirements."""

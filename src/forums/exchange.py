@@ -759,11 +759,14 @@ def write_record_atomic(path: str | Path, record: dict[str, Any]) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.parent / f".{target.name}.{os.getpid()}.tmp"
     payload = json.dumps(record, indent=2, ensure_ascii=False) + "\n"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, target)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
     return target
 
 

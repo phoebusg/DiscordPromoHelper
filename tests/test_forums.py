@@ -2985,6 +2985,403 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                 self.assertEqual(json.loads(out4.getvalue())["staged"], [])
                 self.assertEqual(FakeSyncDesktopProvider.stage_calls, 2)
 
+    def test_export_publication_failures_preserve_checkpoint_and_cutover_files(self) -> None:
+        from src.forums import store as store_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "mirror.sqlite3"
+            ex_dir = root / "exchange"
+            store = ForumStore(db_path)
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID, snapshot_id="snap-rec-1")
+                store.upsert_forum(forum_id=FORUM_ID, name="Recovery Forum v1")
+
+                # 1. Bootstrap failure leaves checkpoint at 0/0 with pending outbox item and no file
+                with patch.object(store_mod, "write_record_atomic", side_effect=OSError("simulated disk failure")):
+                    with self.assertRaises(OSError):
+                        store.export_exchange_dir(ex_dir)
+                chk0 = store.exported_checkpoint()
+                self.assertEqual(chk0["exported_snapshot_revision"], 0)
+                self.assertEqual(chk0["cursor"]["position"], "0")
+                self.assertEqual(chk0["pending_outbox_count"], 1)
+                self.assertEqual(list((ex_dir / "snapshots").glob("*.json")), [])
+                boot_outbox_row = store._conn.execute("SELECT record_id FROM export_outbox").fetchone()
+                self.assertIsNotNone(boot_outbox_row)
+
+                # Quiet retry recovers bootstrap with identical record_id
+                boot = store.export_exchange_dir(ex_dir)
+                self.assertEqual(boot["mode"], "bootstrap_snapshot")
+                boot_rec = read_record(boot["snapshot"])
+                self.assertEqual(boot_rec["record_id"], boot_outbox_row["record_id"])
+                chk1 = store.exported_checkpoint()
+                self.assertEqual(chk1["exported_snapshot_revision"], 1)
+                self.assertEqual(chk1["cursor"]["position"], "1")
+                self.assertEqual(chk1["pending_outbox_count"], 0)
+
+                # 2. Delta failure leaves exported_cursor_seq un-advanced; retry does NOT become quiet_noop
+                store.upsert_forum(forum_id=FORUM_ID, name="Recovery Forum v2")
+                with patch.object(store_mod, "write_record_atomic", side_effect=OSError("simulated delta write failure")):
+                    with self.assertRaises(OSError):
+                        store.export_exchange_dir(ex_dir)
+                chk2 = store.exported_checkpoint()
+                self.assertEqual(chk2["cursor"]["position"], "1")
+                self.assertEqual(chk2["pending_outbox_count"], 1)
+                self.assertEqual(list((ex_dir / "changes").glob("*.json")), [])
+                delta_outbox_row = store._conn.execute("SELECT record_id FROM export_outbox").fetchone()
+                self.assertIsNotNone(delta_outbox_row)
+
+                inc = store.export_exchange_dir(ex_dir)
+                self.assertEqual(inc["mode"], "incremental_changes")
+                self.assertEqual(inc["change_count"], 1)
+                inc_rec = read_record(inc["changes"])
+                self.assertEqual(inc_rec["record_id"], delta_outbox_row["record_id"])
+                self.assertEqual(store.exported_checkpoint()["cursor"]["position"], "2")
+
+                # 3. Cutover failure keeps last usable snapshot & pending deltas intact (nothing archived early)
+                with patch.object(store_mod, "write_record_atomic", side_effect=OSError("simulated cutover failure")):
+                    with self.assertRaises(OSError):
+                        store.export_exchange_dir(ex_dir, force_snapshot=True)
+                chk_cut_fail = store.exported_checkpoint()
+                self.assertEqual(chk_cut_fail["exported_snapshot_revision"], 1)
+                self.assertEqual(chk_cut_fail["snapshot_revision"], 1)
+                self.assertEqual(chk_cut_fail["pending_outbox_count"], 1)
+                self.assertEqual(len(list((ex_dir / "snapshots").glob("*.json"))), 1)
+                self.assertEqual(len(list((ex_dir / "changes").glob("*.json"))), 1)
+                self.assertEqual(list((ex_dir / "archive" / "changes").glob("*.json")), [])
+                cut_outbox_row = store._conn.execute("SELECT record_id FROM export_outbox").fetchone()
+
+                # Retry completes cutover with identical record_id and archives superseded delta afterwards
+                cut = store.export_exchange_dir(ex_dir, force_snapshot=True)
+                self.assertEqual(cut["mode"], "cutover_snapshot")
+                cut_rec = read_record(cut["snapshot"])
+                self.assertEqual(cut_rec["record_id"], cut_outbox_row["record_id"])
+                self.assertEqual(cut_rec["revision"], 2)
+                self.assertEqual(store.exported_checkpoint()["exported_snapshot_revision"], 2)
+                self.assertEqual(store.exported_checkpoint()["pending_outbox_count"], 0)
+                self.assertEqual(list((ex_dir / "changes").glob("*.json")), [])
+                self.assertEqual(len(list((ex_dir / "archive" / "changes").glob("*.json"))), 1)
+            finally:
+                store.close()
+
+    def test_export_recovery_across_restarts_for_write_rename_and_post_publish_failures(self) -> None:
+        import builtins
+        from src.forums import exchange as exchange_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "mirror.sqlite3"
+            ex_dir = root / "exchange"
+
+            store = ForumStore(db_path)
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID, snapshot_id="snap-restart")
+                store.upsert_forum(forum_id=FORUM_ID, name="Restart Recovery Forum")
+                store.export_exchange_dir(ex_dir)
+
+                # A. Failure before/during temp file write across restart
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="Topic PreWrite")
+                real_open = builtins.open
+
+                def failing_tmp_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+                    if ".changes.v1.json" in str(file) and str(file).endswith(".tmp") and "w" in mode:
+                        raise OSError("simulated pre-write failure")
+                    return real_open(file, mode, *args, **kwargs)
+
+                with patch.object(builtins, "open", side_effect=failing_tmp_open):
+                    with self.assertRaises(OSError):
+                        store.export_exchange_dir(ex_dir)
+                out_a = store._conn.execute("SELECT record_id, record_json FROM export_outbox").fetchone()
+                self.assertIsNotNone(out_a)
+                self.assertEqual(list((ex_dir / "changes").iterdir()), [])
+            finally:
+                store.close()
+
+            store = ForumStore(db_path)
+            try:
+                res_a = store.export_exchange_dir(ex_dir)
+                self.assertEqual(res_a["mode"], "incremental_changes")
+                rec_a = read_record(res_a["changes"])
+                self.assertEqual(rec_a["record_id"], out_a["record_id"])
+                self.assertEqual(rec_a, json.loads(out_a["record_json"]))
+                self.assertEqual(store.exported_checkpoint()["pending_outbox_count"], 0)
+
+                # B. Failure during atomic rename (os.replace) cleans .tmp and recovers across restart
+                store.upsert_message(
+                    entity_ref="msg:710000000000000001",
+                    message_id="710000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": None, "label": "Tester"},
+                    body="Rename fault test message",
+                )
+                with patch.object(exchange_mod.os, "replace", side_effect=OSError("simulated atomic rename failure")):
+                    with self.assertRaises(OSError):
+                        store.export_exchange_dir(ex_dir)
+                self.assertEqual(
+                    [p.name for p in (ex_dir / "changes").iterdir() if p.name.startswith(".")],
+                    [],
+                )
+                out_b = store._conn.execute("SELECT record_id, rel_path, record_json FROM export_outbox").fetchone()
+                self.assertIsNotNone(out_b)
+                self.assertFalse((ex_dir / out_b["rel_path"]).exists())
+            finally:
+                store.close()
+
+            store = ForumStore(db_path)
+            try:
+                res_b = store.export_exchange_dir(ex_dir)
+                self.assertEqual(res_b["mode"], "incremental_changes")
+                rec_b = read_record(res_b["changes"])
+                self.assertEqual(rec_b["record_id"], out_b["record_id"])
+                self.assertEqual(rec_b, json.loads(out_b["record_json"]))
+
+                # C. Failure AFTER file is written on disk / BEFORE SQLite checkpoint commit
+                store.upsert_requirement(
+                    requirement_id="guidance",
+                    forum_id=FORUM_ID,
+                    body="Requirement v1 before post-write crash",
+                )
+                with patch.object(store, "_commit_outbox_checkpoint", side_effect=RuntimeError("simulated crash before commit")):
+                    with self.assertRaises(RuntimeError):
+                        store.export_exchange_dir(ex_dir)
+                out_c = store._conn.execute("SELECT record_id, rel_path FROM export_outbox").fetchone()
+                self.assertIsNotNone(out_c)
+                published_path = ex_dir / out_c["rel_path"]
+                self.assertTrue(published_path.exists())
+                disk_bytes_before = published_path.read_bytes()
+                self.assertEqual(store.exported_checkpoint()["pending_outbox_count"], 1)
+            finally:
+                store.close()
+
+            # Restarted process recovers checkpoint cleanly with identical bytes and no duplicate file
+            store = ForumStore(db_path)
+            try:
+                files_before = sorted(p.name for p in (ex_dir / "changes").glob("*.json"))
+                res_c = store.export_exchange_dir(ex_dir)
+                files_after = sorted(p.name for p in (ex_dir / "changes").glob("*.json"))
+                self.assertEqual(files_before, files_after)
+                self.assertEqual(res_c["mode"], "incremental_changes")
+                self.assertEqual(Path(res_c["changes"]).read_bytes(), disk_bytes_before)
+                self.assertEqual(read_record(res_c["changes"])["record_id"], out_c["record_id"])
+                self.assertEqual(store.exported_checkpoint()["pending_outbox_count"], 0)
+            finally:
+                store.close()
+
+    def test_export_fault_recovery_with_strict_consumer(self) -> None:
+        import hashlib
+        from src.forums import exchange as exchange_mod
+        from src.forums import store as store_mod
+
+        class _StrictConsumer:
+            """Strict v1 exchange consumer enforcing immutable records and contiguous cursors."""
+
+            def __init__(self, exchange_dir: Path, expected_scope: dict[str, str]) -> None:
+                self.snapshots_dir = exchange_dir / "snapshots"
+                self.changes_dir = exchange_dir / "changes"
+                self.expected_scope = dict(expected_scope)
+                self.processed_inodes: dict[str, int] = {}
+                self.record_hashes: dict[str, str] = {}
+                self.applied_change_ids: set[str] = set()
+                self.snapshot_id: str | None = None
+                self.snapshot_revision = 0
+                self.cursor: dict[str, str] | None = None
+                self.requirements: dict[str, dict[str, Any]] = {}
+                self.messages: dict[str, dict[str, Any]] = {}
+
+            @staticmethod
+            def _canonical_hash(record: dict[str, Any]) -> str:
+                raw = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                return hashlib.sha256(raw).hexdigest()
+
+            def _apply_change_item(self, item: dict[str, Any]) -> None:
+                etype = item["entity_type"]
+                eref = item["entity_ref"]
+                if item["kind"] == "removal_observed":
+                    if etype == "requirement":
+                        self.requirements.pop(eref, None)
+                    elif etype == "message":
+                        self.messages.pop(eref, None)
+                    return
+                after = copy.deepcopy(item["after"])
+                if etype == "requirement":
+                    self.requirements[after["requirement_id"]] = after
+                elif etype == "message":
+                    self.messages[after["entity_ref"]] = after
+
+            def _ingest_record(self, path: Path) -> bool:
+                record = read_record(path)
+                validate_exchange_record(record)
+                scope = record.get("scope") or {}
+                for key, expected_val in self.expected_scope.items():
+                    if scope.get(key) != expected_val:
+                        raise ContractValidationError(f"Scope mismatch for {key}: {scope.get(key)} != {expected_val}")
+
+                record_id = record["record_id"]
+                payload_hash = self._canonical_hash(record)
+                previous_hash = self.record_hashes.get(record_id)
+                if previous_hash is not None:
+                    if previous_hash != payload_hash:
+                        raise RecordConflictError(f"Conflicting payload for record_id {record_id}")
+                    return False
+
+                schema = record["schema"]
+                if schema == "forum.snapshot.v1":
+                    rev = int(record["revision"])
+                    if rev < self.snapshot_revision:
+                        raise ContractValidationError(f"Regressing snapshot revision {rev} < {self.snapshot_revision}")
+                    self.snapshot_id = record["snapshot_id"]
+                    self.snapshot_revision = rev
+                    self.cursor = dict(record["cursor"])
+                    self.requirements = {req["requirement_id"]: copy.deepcopy(req) for req in record["requirements"]}
+                    self.messages = {msg["entity_ref"]: copy.deepcopy(msg) for msg in record["messages"]}
+                elif schema == "forum.changes.v1":
+                    if self.snapshot_id is None:
+                        raise ContractValidationError("Cannot apply changes before initial snapshot")
+                    if record["snapshot_id"] != self.snapshot_id:
+                        raise ContractValidationError(
+                            f"Snapshot id mismatch: {record['snapshot_id']} != {self.snapshot_id}"
+                        )
+                    if int(record["snapshot_revision"]) != self.snapshot_revision:
+                        raise ContractValidationError(
+                            f"Snapshot revision mismatch: {record['snapshot_revision']} != {self.snapshot_revision}"
+                        )
+                    if record["after_cursor"] != self.cursor:
+                        raise ContractValidationError(
+                            f"Non-contiguous cursor: after_cursor={record['after_cursor']} != {self.cursor}"
+                        )
+                    for item in record["changes"]:
+                        cid = item["change_id"]
+                        if cid in self.applied_change_ids:
+                            raise ContractValidationError(f"Duplicate change_id {cid}")
+                        self.applied_change_ids.add(cid)
+                        self._apply_change_item(item)
+                    self.cursor = dict(record["cursor"])
+                else:
+                    raise ContractValidationError(f"Unexpected schema {schema}")
+
+                self.record_hashes[record_id] = payload_hash
+                return True
+
+            def process_pending(self) -> list[dict[str, Any]]:
+                candidates: list[Path] = []
+                for directory in (self.snapshots_dir, self.changes_dir):
+                    if directory.is_dir():
+                        candidates.extend(sorted(p for p in directory.glob("*.json") if p.is_file()))
+                results: list[dict[str, Any]] = []
+                for path in candidates:
+                    ino = path.stat().st_ino
+                    key = str(path)
+                    if self.processed_inodes.get(key) == ino:
+                        continue
+                    applied = self._ingest_record(path)
+                    self.processed_inodes[key] = ino
+                    results.append({"path": key, "applied": applied})
+                return results
+
+        actor = {"user_id": "100000000000000099", "label": "Fictional reviewer"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "mirror.sqlite3"
+            ex_dir = root / "exchange"
+            consumer = _StrictConsumer(ex_dir, expected_scope={"guild_id": GUILD_ID, "forum_id": FORUM_ID})
+
+            # 1. Bootstrap export & strict intake
+            pub = ForumStore(db_path)
+            try:
+                pub.ensure_scope(GUILD_ID, FORUM_ID, actor=actor, snapshot_id="snap-strict-rec")
+                pub.upsert_forum(forum_id=FORUM_ID, name="Fictional Forum v1")
+                pub.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="Fictional Outpost")
+                pub.upsert_requirement(
+                    requirement_id="guidance",
+                    forum_id=FORUM_ID,
+                    body="Req rev 1: report observed status.",
+                )
+                boot = pub.export_exchange_dir(ex_dir)
+                self.assertEqual(boot["mode"], "bootstrap_snapshot")
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [True])
+
+                # 2. Exact reproduction: forum update -> write failure -> normal retry (never quiet_noop)
+                pub.upsert_forum(forum_id=FORUM_ID, name="Fictional Forum v2")
+                with patch.object(store_mod, "write_record_atomic", side_effect=OSError("simulated disk failure")):
+                    with self.assertRaises(OSError):
+                        pub.export_exchange_dir(ex_dir)
+                self.assertEqual(consumer.process_pending(), [])
+
+                retry_forum = pub.export_exchange_dir(ex_dir)
+                self.assertEqual(retry_forum["mode"], "incremental_changes")
+                self.assertEqual(retry_forum["change_count"], 1)
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [True])
+                self.assertEqual(consumer.snapshot_revision, 1)
+
+                # 3. Requirement edit fails during atomic rename across restart, then recovers without cutover
+                pub.upsert_requirement(
+                    requirement_id="guidance",
+                    forum_id=FORUM_ID,
+                    body="Req rev 2: include coordinates and screenshot.",
+                )
+                with patch.object(exchange_mod.os, "replace", side_effect=OSError("simulated rename failure")):
+                    with self.assertRaises(OSError):
+                        pub.export_exchange_dir(ex_dir)
+                self.assertEqual(consumer.process_pending(), [])
+            finally:
+                pub.close()
+
+            pub = ForumStore(db_path)
+            try:
+                retry_req = pub.export_exchange_dir(ex_dir)
+                self.assertEqual(retry_req["mode"], "incremental_changes")
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [True])
+                req_item = consumer.requirements["guidance"]
+                self.assertEqual(req_item["revision"], 2)
+                self.assertIn("coordinates", req_item["body"])
+
+                # 4. Post-write / pre-commit crash where strict consumer ingests BEFORE producer restarts
+                pub.upsert_message(
+                    entity_ref="msg:900000000000000001",
+                    message_id="900000000000000001",
+                    thread_id=THREAD_1,
+                    author=actor,
+                    body="Ordinary update during post-write crash window.",
+                )
+                with patch.object(pub, "_commit_outbox_checkpoint", side_effect=RuntimeError("crash before SQLite commit")):
+                    with self.assertRaises(RuntimeError):
+                        pub.export_exchange_dir(ex_dir)
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [True])
+            finally:
+                pub.close()
+
+            # Producer restarts, recovers checkpoint with identical record, then delivers requirement rev 3
+            pub = ForumStore(db_path)
+            try:
+                recovered = pub.export_exchange_dir(ex_dir)
+                self.assertEqual(recovered["mode"], "incremental_changes")
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [False])
+
+                pub.upsert_requirement(
+                    requirement_id="guidance",
+                    forum_id=FORUM_ID,
+                    body="Req rev 3: attach annotated crop.",
+                )
+                req3 = pub.export_exchange_dir(ex_dir)
+                self.assertEqual(req3["mode"], "incremental_changes")
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [True])
+                req3_item = consumer.requirements["guidance"]
+                self.assertEqual(req3_item["revision"], 3)
+                self.assertIn("annotated crop", req3_item["body"])
+                self.assertEqual(len(consumer.messages), 1)
+                self.assertEqual(consumer.snapshot_revision, 1)
+
+                # 5. Cutover failure preserves existing files; retry completes cutover
+                with patch.object(store_mod, "write_record_atomic", side_effect=OSError("simulated cutover failure")):
+                    with self.assertRaises(OSError):
+                        pub.export_exchange_dir(ex_dir, force_snapshot=True)
+                self.assertEqual(consumer.process_pending(), [])
+                cut_ok = pub.export_exchange_dir(ex_dir, force_snapshot=True)
+                self.assertEqual(cut_ok["mode"], "cutover_snapshot")
+                self.assertEqual([r["applied"] for r in consumer.process_pending()], [True])
+                self.assertEqual(consumer.snapshot_revision, 2)
+            finally:
+                pub.close()
 
 
 if __name__ == "__main__":
