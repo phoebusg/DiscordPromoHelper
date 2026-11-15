@@ -900,7 +900,13 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             entry["timestamps"].append(t["value"].strip())
                 elif s["dom_id"] == f"message-accessories-{mid}":
                     entry["has_accessories_node"] = True
-                    a_sub = _walk_ax_tree(s["element"], max_nodes=120, max_depth=8)
+                    acc_children = _ax_attr(s["element"], "AXChildren") or []
+                    a_sub: list[dict[str, Any]] = []
+                    for acc_ch in acc_children:
+                        ch_dom_id = str(_ax_attr(acc_ch, "AXDOMIdentifier") or "")
+                        if ch_dom_id.startswith("message-reactions-"):
+                            continue
+                        a_sub.extend(_walk_ax_tree(acc_ch, max_nodes=120, max_depth=8))
                     parsed_urls = 0
                     for a in a_sub:
                         cand_url = a["url"] or ""
@@ -918,7 +924,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                                         "local_ref": None,
                                     }
                                 )
-                    if len(a_sub) > 1 and parsed_urls == 0:
+                    if len(a_sub) > 0 and parsed_urls == 0:
                         entry["accessories_unparsed"] = True
 
             if entry["author"] is None and last_author:
@@ -1239,6 +1245,10 @@ class DesktopDiscordProvider(DiscordViewProvider):
         composer_elem: Optional[Any] = None,
     ) -> list[dict[str, Any]]:
         """Inspect attachment preview items currently staged in Discord's composer."""
+        if composer_elem is None and ax_win is not None:
+            composer_elem, _ = self._inspect_composer(ax_win)
+            if composer_elem is None and _ax_bounds(ax_win) is not None:
+                return []
         comp_bounds = _ax_bounds(composer_elem) if composer_elem is not None else None
         # Narrow scan to composer ancestor container (excluding chat message history) when possible
         scan_root = ax_win
@@ -1251,7 +1261,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 p_bounds = _ax_bounds(parent)
                 if p_bounds is not None and comp_bounds is not None:
                     # Stay tightly scoped around composer tray (avoid scanning full scroller)
-                    if p_bounds[3] > 500 or p_bounds[1] < max(0, comp_bounds[1] - 340):
+                    if p_bounds[3] > 520 or p_bounds[1] < max(0, comp_bounds[1] - 460):
                         break
                 scan_root = parent
                 cur = parent
@@ -1260,13 +1270,18 @@ class DesktopDiscordProvider(DiscordViewProvider):
         items: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
         for n in nodes:
+            if n["role"] in ("AXTextArea", "AXTextField"):
+                continue
+            parent_el = _ax_attr(n["element"], "AXParent")
+            if parent_el is not None and str(_ax_attr(parent_el, "AXRole") or "") in ("AXTextArea", "AXTextField"):
+                continue
             dom_id = n["dom_id"] or ""
             if dom_id.startswith("message-content-") or dom_id.startswith("chat-messages-"):
                 continue
             bounds = _ax_bounds(n["element"])
             if comp_bounds is not None and bounds is not None:
                 # Staged attachments sit immediately above/within composer band
-                if bounds[1] + bounds[3] < comp_bounds[1] - 340 or bounds[1] > comp_bounds[1] + comp_bounds[3] + 40:
+                if bounds[1] + bounds[3] < comp_bounds[1] - 460 or bounds[1] > comp_bounds[1] + comp_bounds[3] + 40:
                     continue
                 if bounds[0] + bounds[2] < comp_bounds[0] - 140:
                     continue
@@ -1281,6 +1296,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
             is_remove_btn = n["role"] == "AXButton" and (
                 "remove attachment" in lower or "remove file" in lower
             )
+            if bounds is not None and (bounds[2] <= 1.0 or bounds[3] <= 0.0) and not is_remove_btn:
+                continue
             looks_like_file = bool(
                 re.search(r"[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}\b", text)
             )
@@ -1365,11 +1382,15 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 escaped = resolved_str.replace("\\", "\\\\").replace('"', '\\"')
                 script = f'set the clipboard to POSIX file "{escaped}"'
                 subprocess.run(["osascript", "-e", script], check=True, timeout=5.0)
+                time.sleep(0.1)
                 self._focus_element(composer_elem)
                 pyautogui.hotkey(paste_mod, "v")
-                deadline = time.monotonic() + 2.8
+                deadline = time.monotonic() + 3.5
+                retried_paste = False
+                step = 0
                 while time.monotonic() < deadline:
                     time.sleep(0.35)
+                    step += 1
                     cur_win = self._get_ax_window() or ax_win
                     cur_comp, _ = self._inspect_composer(cur_win)
                     items = self._inspect_staged_attachments(cur_win, cur_comp or composer_elem)
@@ -1379,6 +1400,12 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         if filename not in self._unverified_attachment_filenames:
                             self._unverified_attachment_filenames.append(filename)
                         return True
+                    if step == 3 and not retried_paste:
+                        retried_paste = True
+                        subprocess.run(["osascript", "-e", script], check=True, timeout=5.0)
+                        time.sleep(0.1)
+                        self._focus_element(cur_comp or composer_elem)
+                        pyautogui.hotkey(paste_mod, "v")
             except Exception:
                 pass
         return False
@@ -1389,7 +1416,17 @@ class DesktopDiscordProvider(DiscordViewProvider):
         if ax_win is None or pyautogui is None:
             return False
         mod = "command" if sys.platform.startswith("darwin") else "ctrl"
-        # First clear staged attachment pills via their Remove attachment buttons
+        # First clear composer text so multiline expansion shrinks and reveals full attachment cards
+        cur_win = self._get_ax_window() or ax_win
+        comp_elem, existing = self._inspect_composer(cur_win)
+        if comp_elem is not None and existing:
+            self._focus_element(comp_elem)
+            pyautogui.hotkey(mod, "a")
+            time.sleep(0.1)
+            self._safe_key_press("backspace")
+            time.sleep(0.25)
+
+        # Then clear staged attachment pills via their Remove attachment buttons
         for _ in range(12):
             cur_win = self._get_ax_window() or ax_win
             comp_elem, _ = self._inspect_composer(cur_win)
@@ -1401,7 +1438,14 @@ class DesktopDiscordProvider(DiscordViewProvider):
             if b is not None:
                 self._activate_discord_window()
                 time.sleep(0.1)
-                pyautogui.click(int(b[0] + b[2] * 0.5), int(b[1] + b[3] * 0.5))
+                cx = int(b[0] + b[2] * 0.5)
+                cy = int(b[1] + b[3] * 0.5)
+                if hasattr(pyautogui, "moveTo"):
+                    pyautogui.moveTo(max(0, cx - 60), cy + 40, duration=0.1)
+                    time.sleep(0.12)
+                    pyautogui.moveTo(cx, cy, duration=0.1)
+                    time.sleep(0.12)
+                pyautogui.click(cx, cy)
             else:
                 try:
                     from ApplicationServices import AXUIElementPerformAction, kAXPressAction  # type: ignore
@@ -1409,16 +1453,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     AXUIElementPerformAction(rem_item["element"], kAXPressAction)
                 except Exception:
                     break
-            time.sleep(0.25)
-
-        cur_win = self._get_ax_window() or ax_win
-        comp_elem, existing = self._inspect_composer(cur_win)
-        if comp_elem is not None and existing:
-            self._focus_element(comp_elem)
-            pyautogui.hotkey(mod, "a")
-            time.sleep(0.1)
-            self._safe_key_press("backspace")
-            time.sleep(0.2)
+            time.sleep(0.3)
 
         final_win = self._get_ax_window() or ax_win
         final_comp, final_text = self._inspect_composer(final_win)
@@ -1437,11 +1472,19 @@ class DesktopDiscordProvider(DiscordViewProvider):
         exp_lbl = (expected_actor.get("label") or "").strip().lower()
         obs_lbl = (observed_actor.get("label") or "").strip().lower()
         unverified_labels = {"", "unverified desktop session", "unknown session", "unknown"}
+        placeholder_expected_labels = {"selected account", "current_user_selected_discord_account"}
         if exp_uid:
             if not obs_uid:
                 return f"account_unverified: expected user_id={exp_uid}, observed={obs_uid!r}"
             if obs_uid != exp_uid:
                 return f"account_mismatch: expected user_id={exp_uid}, observed={obs_uid}"
+        if exp_lbl in placeholder_expected_labels:
+            if obs_lbl in unverified_labels and not obs_uid:
+                return (
+                    f"account_unverified: expected label={expected_actor.get('label')!r}, "
+                    f"observed={observed_actor.get('label')!r}"
+                )
+            return None
         if exp_lbl and exp_lbl not in unverified_labels:
             if obs_lbl in unverified_labels:
                 if not (exp_uid and obs_uid and exp_uid == obs_uid):
@@ -1549,23 +1592,6 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason=post_actor_err,
             )
 
-        parsed_url = parse_discord_channel_url(post_session.current_url)
-        if parsed_url is None:
-            return ComposerStageObservation(
-                status="needs_review",
-                observed_actor=post_session.actor,
-                destination=dest,
-                reason="destination_url_unverified",
-            )
-        obs_guild, obs_chan, _ = parsed_url
-        if obs_guild != str(expected_guild) or obs_chan != str(target_id):
-            return ComposerStageObservation(
-                status="needs_review",
-                observed_actor=post_session.actor,
-                destination=dest,
-                reason=f"destination_url_mismatch: expected={target_url}, observed={post_session.current_url}",
-            )
-
         if ax_win is None:
             return ComposerStageObservation(
                 status="needs_review",
@@ -1580,6 +1606,30 @@ class DesktopDiscordProvider(DiscordViewProvider):
             m = re.match(r"^chat-messages-(\d+)-", n["dom_id"] or "")
             if m:
                 msg_thread_ids.add(m.group(1))
+
+        parsed_url = parse_discord_channel_url(post_session.current_url)
+        if parsed_url is None:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=post_session.actor,
+                destination=dest,
+                reason="destination_url_unverified",
+            )
+        obs_guild, obs_chan, _ = parsed_url
+        expected_forum = dest.get("forum_id")
+        chan_matches = obs_chan == str(target_id) or (
+            bool(expected_forum)
+            and obs_chan == str(expected_forum)
+            and str(target_id) in msg_thread_ids
+        )
+        if obs_guild != str(expected_guild) or not chan_matches:
+            return ComposerStageObservation(
+                status="needs_review",
+                observed_actor=post_session.actor,
+                destination=dest,
+                reason=f"destination_url_mismatch: expected={target_url}, observed={post_session.current_url}",
+            )
+
         if msg_thread_ids and str(target_id) not in msg_thread_ids:
             return ComposerStageObservation(
                 status="needs_review",

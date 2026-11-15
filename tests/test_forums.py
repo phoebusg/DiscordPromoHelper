@@ -1527,6 +1527,47 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
                 mock_focus.assert_called_once()
                 mock_att.assert_called_once()
 
+            # Split-pane forum URL verifies against chat-messages-<THREAD_1>-* DOM nodes; fails if absent
+            split_pane_session = SessionDescription(
+                actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                app_name="Discord",
+                window_title="Discord",
+                window_bbox=(0, 0, 1280, 800),
+                current_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                capabilities={"can_read_semantic": True, "can_read_ocr": True, "can_stage_composer": True},
+            )
+            with patch.object(provider, "describe_session", return_value=split_pane_session), \
+                 patch.object(provider, "navigate_to_url", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_inspect_composer", return_value=(comp_elem, "")), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=[]), \
+                 patch.object(desktop_mod.time, "sleep"):
+                no_dom_mismatch = provider.stage_draft(draft_req, [])
+                self.assertEqual(no_dom_mismatch.status, "needs_review")
+                self.assertIn("destination_url_mismatch", no_dom_mismatch.reason or "")
+
+            split_state = {"pasted": False}
+
+            def fake_split_hotkey(*args):
+                if args[-1] == "v":
+                    split_state["pasted"] = True
+
+            FakePyAutoGui.hotkey = staticmethod(fake_split_hotkey)  # type: ignore[assignment]
+            split_dom_nodes = [{"dom_id": f"chat-messages-{THREAD_1}-{THREAD_1}", "role": "AXGroup"}]
+            with patch.object(provider, "describe_session", return_value=split_pane_session), \
+                 patch.object(provider, "navigate_to_url", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_focus_element", return_value=True), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=split_dom_nodes), \
+                 patch.object(provider, "_inspect_composer", side_effect=lambda _ax: (comp_elem, "Line 1\nLine 2 ✓\n" if split_state["pasted"] else "")), \
+                 patch.object(provider, "_inspect_staged_attachments", return_value=[]), \
+                 patch.object(desktop_mod, "pyperclip", FakeClip), \
+                 patch.object(desktop_mod, "pyautogui", FakePyAutoGui), \
+                 patch.object(desktop_mod.time, "sleep"):
+                split_ok = provider.stage_draft(draft_req, [])
+                self.assertEqual(split_ok.status, "staged")
+                self.assertEqual(split_ok.staged_evidence_ids, [])
+
         # observe_submission handles reply correlation, edit correlation, create_topic, and in_discord_review
         reply_hist = TopicHistoryObservation(
             topic=TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_1, title="Target Thread"),
@@ -2144,6 +2185,30 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
             )
             or "",
         )
+        self.assertIsNone(
+            DesktopDiscordProvider._actor_mismatch_reason(
+                {"user_id": None, "label": "Selected account"},
+                {"user_id": None, "label": "Tester"},
+            )
+        )
+        self.assertTrue(
+            (
+                DesktopDiscordProvider._actor_mismatch_reason(
+                    {"user_id": None, "label": "Selected account"},
+                    {"user_id": None, "label": "Unverified desktop session"},
+                )
+                or ""
+            ).startswith("account_unverified:")
+        )
+        self.assertTrue(
+            (
+                DesktopDiscordProvider._actor_mismatch_reason(
+                    {"user_id": None, "label": "OtherUser"},
+                    {"user_id": None, "label": "Tester"},
+                )
+                or ""
+            ).startswith("account_mismatch:")
+        )
 
         # 3. stage_draft rejects non-reply_existing action and mismatched destination.source_url before navigation
         provider = DesktopDiscordProvider()
@@ -2608,10 +2673,39 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                 ]),
             ],
         )
+        m6 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000006",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-content-600000000000000006", children=[
+                    _FakeAX("AXStaticText", value="Reactions only inside accessories"),
+                ]),
+                _FakeAX("AXGroup", dom_id="message-accessories-600000000000000006", children=[
+                    _FakeAX("AXGroup", dom_id="message-reactions-600000000000000006", children=[
+                        _FakeAX("AXButton", description="Add Reaction"),
+                    ]),
+                ]),
+            ],
+        )
+        m7 = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-600000000000000007",
+            children=[
+                _FakeAX("AXGroup", dom_id="message-content-600000000000000007", children=[
+                    _FakeAX("AXStaticText", value="Reactions plus attachment"),
+                ]),
+                _FakeAX("AXGroup", dom_id="message-accessories-600000000000000007", children=[
+                    _FakeAX("AXLink", url="https://cdn.discordapp.com/attachments/1/2/crop.png"),
+                    _FakeAX("AXGroup", dom_id="message-reactions-600000000000000007", children=[
+                        _FakeAX("AXButton", description="Add Reaction"),
+                    ]),
+                ]),
+            ],
+        )
         msg_list = _FakeAX(
             "AXList",
             description="Messages in North Ridge Depot",
-            children=[m1, m2, m3, m4, m5],
+            children=[m1, m2, m3, m4, m5, m6, m7],
         )
         provider = desktop_mod.DesktopDiscordProvider()
         with patch.object(
@@ -2627,6 +2721,9 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
         self.assertIsNone(msgs["600000000000000003"].attachments)
         self.assertEqual(msgs["600000000000000004"].attachments, [])
         self.assertEqual(msgs["600000000000000005"].attachments, [])
+        self.assertEqual(msgs["600000000000000006"].attachments, [])
+        self.assertEqual(len(msgs["600000000000000007"].attachments or []), 1)
+        self.assertEqual(msgs["600000000000000007"].attachments[0]["name"], "crop.png")
 
         # Store level: None preserves previously stored attachments even across body edit; [] removes them
         with tempfile.TemporaryDirectory() as tmp:
