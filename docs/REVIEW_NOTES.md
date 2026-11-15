@@ -124,3 +124,12 @@
   - `<EXT_SCRIPT_RECOVERY_01>` -> `ALL PRIVATE CONSUMER RECOVERY SCENARIOS PASSED` (exit code `0`).
   - `<LOCAL_EXT_PYTHON> <LOCAL_EXT_REPO>/scripts/<EXT_PROBE_01> --helper-checkout <LOCAL_HELPER_REPO> --helper-python <LOCAL_EXT_PYTHON> --report-root <LOCAL_TMP_PROBE_01>` -> exit code `0`, `"state": "passed"` (`public_commit`: `81ef8fa5a5174a7b7254c0058990c90074bbde9b`, `private_commit`: `<EXT_REV_02>`, `sources_unchanged_during_probe`: `true`).
   - `<EXT_SCRIPT_ALIGN_01>` -> exit code `0`, all 6 fictional scenarios passed.
+
+## Independent follow-up at `c656009` — 15 November 2026
+
+- Local branch and remote PR #3 head both match `c656009b876984ca703fb2a89d27550581113a07`. The GitHub API returned 50 resolved review threads and no status checks; neither is owner acceptance.
+- Independently reran `.venv/bin/python -m pytest tests/test_forums.py -q`: **33 passed in 3.32s**, including publication/restart regression cases.
+- Reran the optional actual-receiver probe against unmodified private consumer `<EXT_REV_02>`: **passed**, source hashes unchanged. The provider is fictional; the probe does not touch Discord, capture or OBS.
+- Separately reran the external strict-consumer recovery script after inspecting it: **ALL PRIVATE CONSUMER RECOVERY SCENARIOS PASSED**. This covers the original lost-delta reproduction, rename failure/restart with identical payload/record identity, post-publication/pre-checkpoint restart with idempotent intake, cutover preservation/retry, and bootstrap write failure/restart. The earlier exporter recovery blocker is cleared for these tested cases.
+- Deployment readiness remains separate: a directory seeded with topic links and partial/stale histories is not a current forum mirror. Before the first genuine report, verify the selected topic/guidance refresh, persistent exporter/consumer directory agreement, selected-file availability and receipt return in the actual configuration. Full capture-to-composer delivery and final human Send/reconciliation remain outstanding.
+- Keep the first community report small and factual; do not manufacture a post merely to exercise Send. Existing promotion behavior and the longer-term forum-promotion UI scope are unchanged.
