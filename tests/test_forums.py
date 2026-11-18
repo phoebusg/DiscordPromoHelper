@@ -1905,6 +1905,12 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                 d_stale_req["baseline"]["requirements"] = [{"requirement_id": "guidelines-fixture", "revision": 1}]
                 self.assertTrue(any("revision mismatch" in c for c in check_draft_conflicts(d_stale_req, store)))
 
+                d_omitted_req = copy.deepcopy(base_draft)
+                d_omitted_req["baseline"]["requirements"] = []
+                self.assertTrue(
+                    any("missing required requirement guidelines-fixture" in c for c in check_draft_conflicts(d_omitted_req, store))
+                )
+
                 # Archived / locked target topic
                 store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="North Ridge Depot", archived=True, locked=True)
                 c_state = "; ".join(check_draft_conflicts(base_draft, store))
@@ -2413,6 +2419,7 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
             )
         self.assertEqual(len(reqs_out), 1)
         self.assertFalse(reqs_out[0].complete)
+        self.assertIsNone(reqs_out[0].source_entity_ref)
         self.assertEqual(reqs_out[0].errors[0]["code"], "scroll_stagnant")
 
         # 9. read_topic sets starter_message_id=None when top not reached and starter not visible

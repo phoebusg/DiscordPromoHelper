@@ -75,10 +75,29 @@ class ForumReader:
             confidence=forum_obs.confidence,
             raw_observation=forum_obs.raw,
         )
+        merged_refs: list[dict[str, Any]] = []
+        seen_rids: set[str] = set()
+        seen_tids: set[str] = set()
+        for source_refs in (
+            self.profile.requirement_refs,
+            self.store.get_requirement_references(self.profile.forum_id),
+        ):
+            for ref in source_refs or []:
+                tid = ref.get("thread_id")
+                rid = ref.get("requirement_id")
+                if rid and rid in seen_rids:
+                    continue
+                if tid and tid in seen_tids:
+                    continue
+                merged_refs.append(dict(ref))
+                if rid:
+                    seen_rids.add(rid)
+                if tid:
+                    seen_tids.add(tid)
         reqs = self.provider.read_requirements(
             self.profile.guild_id,
             self.profile.forum_id,
-            references=self.profile.requirement_refs,
+            references=merged_refs,
         )
         req_errors: list[dict[str, Any]] = []
         req_complete = bool(reqs) and not session_errors
@@ -214,7 +233,9 @@ class ForumReader:
                     "reason": history_errors[0]["code"] if history_errors else "history_partial",
                     "resume_token": f"thread:{thread_id}",
                 })
-            retained_errors = [e for e in coverage.get("errors", []) if e.get("thread_id") != thread_id]
+            retained_errors = [
+                e for e in coverage.get("errors", []) if e.get("thread_id") not in (None, thread_id)
+            ]
             # Reading one destination cannot establish freshness/completeness of the whole forum.
             histories = coverage.get("histories", "not_started")
             if histories != "complete" or not complete:

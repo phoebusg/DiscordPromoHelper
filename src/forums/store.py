@@ -20,6 +20,7 @@ from .models import (
     compute_bytes_sha256,
     compute_content_hash,
     optional_discord_id,
+    parse_discord_channel_url,
     parse_rfc3339_utc,
     require_discord_id,
     utc_now_iso,
@@ -1205,6 +1206,51 @@ class ForumStore:
         ).fetchall()
         return [r["thread_id"] for r in rows]
 
+    def get_requirement_references(
+        self,
+        forum_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Extract stored requirement (requirement_id, thread_id, source_entity_ref) mappings."""
+        meta = self._get_meta()
+        fid = require_discord_id(forum_id or meta["forum_id"], "forum_id")
+        rows = self._conn.execute(
+            """
+            SELECT requirement_id, source_entity_ref, source_url
+            FROM requirements
+            WHERE forum_id = ?
+            ORDER BY requirement_id ASC
+            """,
+            (fid,),
+        ).fetchall()
+        refs: list[dict[str, Any]] = []
+        for row in rows:
+            tid: Optional[str] = None
+            src_url = row["source_url"]
+            if src_url:
+                parsed = parse_discord_channel_url(src_url)
+                if parsed is not None and parsed[1] != fid:
+                    tid = parsed[1]
+            src_ref = row["source_entity_ref"]
+            if tid is None and isinstance(src_ref, str) and src_ref.startswith("thread:"):
+                cand_tid = src_ref.split(":", 1)[1].strip()
+                if cand_tid and cand_tid.isdigit() and cand_tid != fid:
+                    tid = cand_tid
+            if tid is None:
+                continue
+            norm_src_ref = (
+                None
+                if (isinstance(src_ref, str) and src_ref.startswith("thread:"))
+                else src_ref
+            )
+            refs.append(
+                {
+                    "requirement_id": row["requirement_id"],
+                    "thread_id": tid,
+                    "source_entity_ref": norm_src_ref,
+                }
+            )
+        return refs
+
     def upsert_requirement(
         self,
         *,
@@ -1229,10 +1275,25 @@ class ForumStore:
         row = self._conn.execute(
             "SELECT * FROM requirements WHERE requirement_id = ?", (requirement_id,)
         ).fetchone()
+        if row is None and requirement_id.startswith("forum-guidance-") and source_url:
+            alias_row = self._conn.execute(
+                """
+                SELECT * FROM requirements
+                WHERE forum_id = ? AND source_url = ?
+                ORDER BY requirement_id ASC
+                LIMIT 1
+                """,
+                (fid, source_url),
+            ).fetchone()
+            if alias_row is not None:
+                row = alias_row
+                requirement_id = alias_row["requirement_id"]
+
+        next_source_url = source_url or (row["source_url"] if row is not None else None)
         entity = {
             "requirement_id": requirement_id,
             "source_entity_ref": source_entity_ref,
-            "source_url": source_url,
+            "source_url": next_source_url,
             "body": body,
             "content_hash": chash,
             "observed_at": now,
@@ -1256,7 +1317,7 @@ class ForumStore:
                         requirement_id,
                         fid,
                         source_entity_ref,
-                        source_url,
+                        next_source_url,
                         body,
                         chash,
                         rev,
@@ -1276,7 +1337,7 @@ class ForumStore:
                     None,
                     rev,
                     source_method,
-                    source_url,
+                    next_source_url,
                     confidence,
                     entity,
                     observed_at=now,
@@ -1289,7 +1350,11 @@ class ForumStore:
             if was_complete and not complete:
                 return None
 
-            if row["content_hash"] == chash:
+            metadata_changed = (
+                row["source_entity_ref"] != source_entity_ref
+                or (bool(source_url) and row["source_url"] != source_url)
+            )
+            if row["content_hash"] == chash and not metadata_changed:
                 if not was_complete and complete:
                     self._conn.execute(
                         "UPDATE requirements SET is_complete = 1, observed_at = ? WHERE requirement_id = ?",
@@ -1308,8 +1373,8 @@ class ForumStore:
                 WHERE requirement_id = ?
                 """,
                 (
-                    source_entity_ref or row["source_entity_ref"],
-                    source_url or row["source_url"],
+                    source_entity_ref,
+                    next_source_url,
                     body,
                     chash,
                     rev,
@@ -1330,7 +1395,7 @@ class ForumStore:
                 before_rev,
                 rev,
                 source_method,
-                source_url or row["source_url"],
+                next_source_url,
                 confidence,
                 entity,
                 observed_at=now,
@@ -2289,6 +2354,32 @@ class ForumStore:
         params: list[Any] = [since_seq, tid] + msg_refs
         recent_changes = [dict(c) for c in self._conn.execute(chg_sql, params).fetchall()]
 
+        cov = self.get_coverage()
+        pending_entry = next(
+            (p for p in cov.get("pending", []) if p.get("thread_id") == tid),
+            None,
+        )
+        has_thread_error = any(e.get("thread_id") == tid for e in cov.get("errors", []))
+        history_complete = (
+            topic["last_deep_read_at"] is not None
+            and pending_entry is None
+            and not has_thread_error
+        )
+        starter_ref = starter["entity_ref"] if starter else None
+        reply_count = (
+            sum(
+                1
+                for m in msgs
+                if (
+                    m["message_id"] != topic["starter_message_id"]
+                    if topic["starter_message_id"]
+                    else m["entity_ref"] != starter_ref
+                )
+            )
+            if msgs
+            else 0
+        )
+
         return {
             "thread_id": tid,
             "forum_id": topic["forum_id"],
@@ -2301,7 +2392,12 @@ class ForumStore:
             "observed_at": topic["observed_at"],
             "last_deep_read_at": topic["last_deep_read_at"],
             "remote_last_activity_at": topic["remote_last_activity_at"],
+            "starter_message_id": topic["starter_message_id"],
             "message_count": len(msgs),
+            "reply_count": int(reply_count),
+            "has_non_starter_replies": bool(reply_count > 0),
+            "history_complete": history_complete,
+            "pending_reason": pending_entry.get("reason") if pending_entry else None,
             "starter_summary": starter["body"] if starter else None,
             "starter_source_url": starter["source_url"] if starter else None,
             "recent_contributors": contributors,
@@ -2311,18 +2407,21 @@ class ForumStore:
                     "message_id": m["message_id"],
                     "author": json.loads(m["author_json"]),
                     "body": m["body"],
+                    "content_hash": m["content_hash"],
                     "revision": int(m["revision"]),
                     "observed_at": m["observed_at"],
                     "remote_created_at": m["remote_created_at"],
                     "remote_edited_at": m["remote_edited_at"],
                     "source_url": m["source_url"],
                     "identity_verified": bool(m["identity_verified"]),
+                    "attachments": json.loads(m["attachments_json"]),
+                    "recognition": json.loads(m["recognition_json"]) if m["recognition_json"] else None,
                 }
                 for m in msgs[-5:]
             ],
             "requirements": [dict(r) for r in reqs],
             "changes_since_cursor": recent_changes,
-            "coverage": self.get_coverage(),
+            "coverage": cov,
         }
 
     def get_forum_status(
@@ -2335,9 +2434,23 @@ class ForumStore:
         meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
         gid = meta["guild_id"]
         fid = meta["forum_id"]
+        cov = self.get_coverage(guild_id=gid, forum_id=fid)
         topics_cnt = self._conn.execute(
             "SELECT COUNT(*) FROM topics WHERE forum_id = ?", (fid,)
         ).fetchone()[0]
+        topics_deep_read = self._conn.execute(
+            "SELECT COUNT(*) FROM topics WHERE forum_id = ? AND last_deep_read_at IS NOT NULL",
+            (fid,),
+        ).fetchone()[0]
+        unread_tids = {
+            r["thread_id"]
+            for r in self._conn.execute(
+                "SELECT thread_id FROM topics WHERE forum_id = ? AND last_deep_read_at IS NULL",
+                (fid,),
+            ).fetchall()
+        }
+        pending_tids = {p["thread_id"] for p in cov.get("pending", []) if p.get("thread_id")}
+        topics_pending_history = len(unread_tids | pending_tids)
         msgs_cnt = self._conn.execute(
             "SELECT COUNT(*) FROM messages WHERE thread_id IN (SELECT thread_id FROM topics WHERE forum_id = ?)",
             (fid,),
@@ -2364,14 +2477,17 @@ class ForumStore:
             "forum_id": fid,
             "actor": json.loads(meta["actor_json"]),
             "cursor": {"stream_id": meta["stream_id"], "position": str(meta["cursor_seq"])},
+            "exported_checkpoint": self.exported_checkpoint(guild_id=gid, forum_id=fid),
             "counts": {
                 "topics": int(topics_cnt),
+                "topics_deep_read": int(topics_deep_read),
+                "topics_pending_history": int(topics_pending_history),
                 "messages": int(msgs_cnt),
                 "requirements": int(reqs_cnt),
                 "unresolved_topics": int(unres_cnt),
                 "drafts": int(drafts_cnt),
                 "drafts_needing_review": int(pending_recheck),
             },
-            "coverage": self.get_coverage(guild_id=gid, forum_id=fid),
+            "coverage": cov,
             "updated_at": meta["updated_at"],
         }

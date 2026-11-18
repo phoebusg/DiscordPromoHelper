@@ -158,8 +158,10 @@ def check_draft_conflicts(draft_record: dict[str, Any], store: ForumStore) -> li
 
     # Every referenced requirement revision must exist in the mirror and match the baseline.
     req_by_id = {r["requirement_id"]: r for r in snap.get("requirements", [])}
+    seen_base_req_ids: set[str] = set()
     for req_ref in baseline.get("requirements", []):
         rid = req_ref["requirement_id"]
+        seen_base_req_ids.add(rid)
         base_rev = int(req_ref["revision"])
         base_req_hash = req_ref.get("content_hash")
         curr = req_by_id.get(rid)
@@ -178,9 +180,25 @@ def check_draft_conflicts(draft_record: dict[str, Any], store: ForumStore) -> li
                 f"requirement {rid} content_hash mismatch at r{curr_rev}"
             )
 
-    # Target topic availability check for reply_existing / edit_own_message.
     action = draft_record.get("action")
     target_tid = dest.get("thread_id")
+    forum_id_str = str(scope.get("forum_id") or "")
+    target_msg_refs = {
+        m["entity_ref"]
+        for m in snap.get("messages", [])
+        if target_tid and m.get("thread_id") == target_tid and m.get("entity_ref")
+    }
+    for req in snap.get("requirements", []):
+        rid = req["requirement_id"]
+        if rid in seen_base_req_ids:
+            continue
+        src_ref = req.get("source_entity_ref")
+        if src_ref is None or src_ref in {"forum-guidelines", f"forum:{forum_id_str}"} or src_ref in target_msg_refs:
+            conflicts.append(
+                f"draft baseline missing required requirement {rid} (current r{req['revision']})"
+            )
+
+    # Target topic availability check for reply_existing / edit_own_message.
     topic_by_id = {t["thread_id"]: t for t in snap.get("topics", [])}
     if action in {"reply_existing", "edit_own_message"}:
         if not target_tid:

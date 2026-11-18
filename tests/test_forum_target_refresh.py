@@ -134,3 +134,98 @@ class TestTargetRefresh(unittest.TestCase):
         changes = self.store.export_changes(after_cursor=cursor)["changes"]
         self.assertTrue(any(c["entity_type"] == "message" and c["after"]["body"] == final.messages[0].body
                             for c in changes))
+
+    def test_stored_requirement_refs_legacy_migration_and_status_fields(self):
+        from src.forums.models import build_discord_channel_url
+        from src.forums.providers.base import RequirementObservation
+
+        guide_tid = "100000000000000099"
+        guide_url = build_discord_channel_url(self.profile.guild_id, guide_tid)
+        self.store.upsert_requirement(
+            requirement_id="poi-guidance-custom",
+            forum_id=FORUM_ID,
+            body="Guidelines body",
+            source_entity_ref=f"thread:{guide_tid}",
+            source_url=guide_url,
+        )
+        # Stale session-level (thread_id=None) error alongside unrelated per-thread error
+        self.store.update_coverage(
+            topics="partial",
+            histories="partial",
+            requirements="partial",
+            pending_known=[
+                {"thread_id": THREAD_1, "reason": "history_unread", "resume_token": f"thread:{THREAD_1}"},
+                {"thread_id": THREAD_2, "reason": "history_unread", "resume_token": f"thread:{THREAD_2}"},
+            ],
+            errors=[
+                {"thread_id": None, "code": "session_stale", "message": "Transient error"},
+                {"thread_id": THREAD_2, "code": "history_unread", "message": "History unread"},
+            ],
+        )
+        cursor_before = self.store.current_cursor()
+        self.assertEqual(
+            self.store.get_requirement_references(FORUM_ID),
+            [{"requirement_id": "poi-guidance-custom", "thread_id": guide_tid, "source_entity_ref": None}],
+        )
+
+        # Auto-detected requirement ID reusing same source_url deduplicates against existing ID
+        self.provider.histories[THREAD_1].topic.starter_message_id = "100000000000000105"
+        self.provider.histories[THREAD_1].messages.append(
+            MessageObservation(
+                thread_id=THREAD_1,
+                author={"label": "Responder"},
+                body="Follow-up reply",
+                message_id="100000000000000106",
+                entity_ref="msg:100000000000000106",
+                attachments=[{"attachment_id": None, "name": "crop.png", "source_url": None, "sha256": None, "local_ref": None}],
+            )
+        )
+        seen_refs = []
+
+        def _fake_read_reqs(_gid, _fid, references=None):
+            seen_refs.append(references)
+            return [
+                RequirementObservation(
+                    requirement_id=f"forum-guidance-{guide_tid}",
+                    forum_id=FORUM_ID,
+                    body="Guidelines body",
+                    source_entity_ref=None,
+                    source_url=guide_url,
+                    complete=True,
+                )
+            ]
+
+        with patch.object(self.provider, "list_topics", side_effect=AssertionError("directory scan")), \
+             patch.object(self.provider, "read_requirements", side_effect=_fake_read_reqs):
+            res = self.reader.refresh_topic(THREAD_1)
+
+        self.assertTrue(res["topic_complete"])
+        self.assertTrue(res["requirements_complete"])
+        self.assertEqual(seen_refs[0][0]["requirement_id"], "poi-guidance-custom")
+        self.assertEqual(res["coverage"]["errors"], [{"thread_id": THREAD_2, "code": "history_unread", "message": "History unread"}])
+
+        changes = self.store.export_changes(after_cursor=cursor_before)["changes"]
+        req_chg = [c for c in changes if c["entity_type"] == "requirement" and c["entity_ref"] == "poi-guidance-custom"]
+        self.assertEqual(len(req_chg), 1)
+        self.assertEqual((req_chg[0]["before_revision"], req_chg[0]["after_revision"]), (1, 2))
+        self.assertIsNone(req_chg[0]["after"]["source_entity_ref"])
+
+        t1_status = self.store.get_topic_status(THREAD_1)
+        self.assertEqual(t1_status["starter_message_id"], "100000000000000105")
+        self.assertEqual(t1_status["message_count"], 2)
+        self.assertEqual(t1_status["reply_count"], 1)
+        self.assertTrue(t1_status["has_non_starter_replies"])
+        self.assertTrue(t1_status["history_complete"])
+        self.assertIsNone(t1_status["pending_reason"])
+        self.assertIn("content_hash", t1_status["latest_messages"][1])
+        self.assertEqual(t1_status["latest_messages"][1]["attachments"][0]["name"], "crop.png")
+
+        t2_status = self.store.get_topic_status(THREAD_2)
+        self.assertFalse(t2_status["history_complete"])
+        self.assertEqual(t2_status["pending_reason"], "history_unread")
+
+        f_status = self.store.get_forum_status()
+        self.assertEqual(f_status["counts"]["requirements"], 1)
+        self.assertEqual(f_status["counts"]["topics_deep_read"], 1)
+        self.assertEqual(f_status["counts"]["topics_pending_history"], 1)
+        self.assertIn("exported_checkpoint", f_status)

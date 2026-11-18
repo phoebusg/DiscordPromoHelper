@@ -1146,12 +1146,13 @@ class DesktopDiscordProvider(DiscordViewProvider):
         if ax_win is None:
             return reqs
 
-        ref_tids: list[tuple[str, str]] = []
+        ref_tids: list[tuple[str, str, Optional[str]]] = []
         for ref in references or []:
             tid = ref.get("thread_id")
             rid = ref.get("requirement_id") or (f"forum-guidance-{tid}" if tid else "")
+            src_entity_ref = ref.get("source_entity_ref")
             if tid:
-                ref_tids.append((rid, tid))
+                ref_tids.append((rid, tid, src_entity_ref))
 
         if not ref_tids:
             nodes = _walk_ax_tree(ax_win, max_nodes=2500, max_depth=28)
@@ -1168,12 +1169,12 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             m = re.match(r"^message-content-(\d+)$", s["dom_id"])
                             if m and m.group(1) != forum_id:
                                 tid = m.group(1)
-                                ref_tids.append((f"forum-guidance-{tid}", tid))
+                                ref_tids.append((f"forum-guidance-{tid}", tid, None))
                                 break
                     if ref_tids:
                         break
 
-        for rid, tid in ref_tids:
+        for rid, tid, src_entity_ref in ref_tids:
             hist = self.read_topic(guild_id, forum_id, tid)
             combined_body = "\n\n".join(m.body for m in hist.messages if m.body).strip()
             req_complete = bool(hist.complete and not hist.errors)
@@ -1183,7 +1184,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         requirement_id=rid,
                         forum_id=forum_id,
                         body=combined_body,
-                        source_entity_ref=f"thread:{tid}",
+                        source_entity_ref=src_entity_ref,
                         source_url=build_discord_channel_url(guild_id, tid),
                         complete=req_complete,
                         errors=list(hist.errors),
