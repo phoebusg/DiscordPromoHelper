@@ -1,6 +1,7 @@
 """Generic forum draft rendering and baseline conflict checks."""
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from .changes import make_record_id
@@ -8,6 +9,45 @@ from .config import ForumProfile
 from .exchange import validate_exchange_record
 from .models import build_discord_channel_url, utc_now_iso
 from .store import ForumStore
+
+
+def _find_streamer_thread_id(
+    store: ForumStore,
+    *,
+    guild_id: str,
+    forum_id: str,
+    username: str,
+) -> Optional[str]:
+    """Find an open mirrored topic matching a streamer handle for one_topic_per_streamer routing."""
+    uname = (username or "").strip().lower()
+    if not uname:
+        return None
+    store.ensure_scope(guild_id, forum_id)
+    topics = store.search("", forum_id=forum_id).get("topics", [])
+    pattern = re.compile(rf"(?<![a-z0-9_]){re.escape(uname)}(?![a-z0-9_])")
+    partial_match: Optional[str] = None
+    for topic in topics:
+        if topic.get("archived") is True or topic.get("locked") is True:
+            continue
+        t_title = (topic.get("title") or "").strip().lower()
+        if not t_title:
+            continue
+        if t_title == uname:
+            return str(topic["thread_id"])
+        if partial_match is None and pattern.search(t_title):
+            partial_match = str(topic["thread_id"])
+    return partial_match
+
+
+def _default_streamer_topic_title(username: str, stream_title: str) -> str:
+    """Build a non-empty topic title for one_topic_per_streamer create_topic fallback."""
+    uname = (username or "").strip()
+    stitle = (stream_title or "").strip()
+    if uname and stitle:
+        if uname.lower() in stitle.lower():
+            return stitle
+        return f"{uname} - {stitle}"
+    return uname or stitle or "Live Stream"
 
 
 def render_forum_promo_draft(
@@ -24,6 +64,10 @@ def render_forum_promo_draft(
     snapshot_revision: Optional[int] = None,
     requirements: Optional[list[dict[str, Any]]] = None,
     template: Optional[str] = None,
+    store: Optional[ForumStore] = None,
+    message_id: Optional[str] = None,
+    message_content_hash: Optional[str] = None,
+    allow_create_if_missing: bool = False,
 ) -> dict[str, Any]:
     """Build a validated draft.request.v1 for a generic self-promotion forum."""
     if not profile.can_promote():
@@ -34,6 +78,7 @@ def render_forum_promo_draft(
     stream_title = getattr(stream_info, "title", "") or "Live Stream"
     stream_game = getattr(stream_info, "game", "") or ""
     stream_url = getattr(stream_info, "stream_url", "") or ""
+    username = (getattr(stream_info, "username", "") or "").strip()
 
     if template:
         body = template.format(
@@ -41,7 +86,7 @@ def render_forum_promo_draft(
             game=stream_game,
             url=stream_url,
             platform=getattr(stream_info, "platform", ""),
-            username=getattr(stream_info, "username", ""),
+            username=username,
         )
     else:
         lines = [f"Live now: {stream_title}"]
@@ -52,9 +97,57 @@ def render_forum_promo_draft(
         body = "\n".join(lines)
 
     eff_thread = thread_id or profile.default_thread_id
-    if profile.routing_mode == "create_topic" and not eff_thread:
+    if (
+        profile.routing_mode == "one_topic_per_streamer"
+        and not eff_thread
+        and store is not None
+        and username
+    ):
+        eff_thread = _find_streamer_thread_id(
+            store,
+            guild_id=profile.guild_id,
+            forum_id=profile.forum_id,
+            username=username,
+        )
+
+    snap: Optional[dict[str, Any]] = None
+    if store is not None and (
+        snapshot_id is None
+        or snapshot_revision is None
+        or requirements is None
+        or (message_id is not None and message_content_hash is None)
+    ):
+        store.ensure_scope(profile.guild_id, profile.forum_id)
+        snap = store.export_snapshot(guild_id=profile.guild_id, forum_id=profile.forum_id)
+
+    eff_message_id: Optional[str] = None
+    eff_msg_hash: Optional[str] = None
+    if message_id is not None:
+        if not eff_thread:
+            raise ValueError(
+                f"Forum profile {profile.profile_id!r} requires an existing thread_id to edit message_id={message_id!r}"
+            )
+        action = "edit_own_message"
+        eff_title = None
+        eff_message_id = str(message_id)
+        source_url = build_discord_channel_url(profile.guild_id, eff_thread, eff_message_id)
+        eff_msg_hash = message_content_hash
+        if eff_msg_hash is None and snap is not None:
+            for msg in snap.get("messages", []):
+                if str(msg.get("message_id") or "") == eff_message_id:
+                    eff_msg_hash = msg.get("content_hash")
+                    break
+    elif profile.routing_mode == "create_topic" and not eff_thread:
         action = "create_topic"
         eff_title = title or stream_title
+        source_url = profile.source_url
+    elif (
+        profile.routing_mode == "one_topic_per_streamer"
+        and not eff_thread
+        and allow_create_if_missing
+    ):
+        action = "create_topic"
+        eff_title = title or _default_streamer_topic_title(username, stream_title)
         source_url = profile.source_url
     else:
         if not eff_thread:
@@ -64,6 +157,42 @@ def render_forum_promo_draft(
         action = "reply_existing"
         eff_title = None
         source_url = build_discord_channel_url(profile.guild_id, eff_thread)
+
+    eff_snapshot_id = snapshot_id if snapshot_id is not None else (snap["snapshot_id"] if snap else None)
+    eff_snapshot_rev = (
+        snapshot_revision
+        if snapshot_revision is not None
+        else (int(snap["revision"]) if snap else None)
+    )
+    if requirements is not None:
+        eff_requirements = list(requirements)
+    elif snap is not None:
+        target_msg_refs = (
+            {
+                m["entity_ref"]
+                for m in snap.get("messages", [])
+                if eff_thread and m.get("thread_id") == eff_thread and m.get("entity_ref")
+            }
+            if eff_thread
+            else set()
+        )
+        eff_requirements = [
+            {
+                "requirement_id": req["requirement_id"],
+                "revision": int(req["revision"]),
+                **(
+                    {"content_hash": req["content_hash"]}
+                    if req.get("content_hash") is not None
+                    else {}
+                ),
+            }
+            for req in snap.get("requirements", [])
+            if req.get("source_entity_ref") is None
+            or req.get("source_entity_ref") in {"forum-guidelines", f"forum:{profile.forum_id}"}
+            or req.get("source_entity_ref") in target_msg_refs
+        ]
+    else:
+        eff_requirements = []
 
     record = {
         "schema": "draft.request.v1",
@@ -82,7 +211,7 @@ def render_forum_promo_draft(
             "guild_id": profile.guild_id,
             "forum_id": profile.forum_id,
             "thread_id": None if action == "create_topic" else eff_thread,
-            "message_id": None,
+            "message_id": eff_message_id,
             "source_url": source_url,
         },
         "body": body,
@@ -90,10 +219,10 @@ def render_forum_promo_draft(
         "tags": list(tags or []),
         "evidence": [],
         "baseline": {
-            "snapshot_id": snapshot_id,
-            "snapshot_revision": snapshot_revision,
-            "requirements": list(requirements or []),
-            "message_content_hash": None,
+            "snapshot_id": eff_snapshot_id,
+            "snapshot_revision": eff_snapshot_rev,
+            "requirements": eff_requirements,
+            "message_content_hash": eff_msg_hash,
         },
     }
     return validate_exchange_record(record)

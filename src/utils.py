@@ -1610,6 +1610,221 @@ def capture_icon_image(cx, cy, size=48):
 
 
 
+def _load_synthetic_ocr_font(px_size: int):
+    """Load a crisp TrueType/default Pillow font for synthetic OCR benchmarks."""
+    from PIL import ImageFont
+
+    candidates = (
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    )
+    for font_path in candidates:
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, px_size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=px_size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _render_synthetic_ocr_image(
+    lines: list[str],
+    *,
+    theme: str = "dark",
+    scale: float = 1.0,
+    base_font_size: int = 18,
+):
+    """Render synthetic dark/light forum text crops at a requested pixel scale."""
+    from PIL import ImageDraw
+
+    if theme == "light":
+        bg = (255, 255, 255)
+        fg = (18, 20, 24)
+    else:
+        bg = (49, 51, 56)
+        fg = (242, 243, 245)
+
+    px_size = max(12, int(round(base_font_size * scale)))
+    font = _load_synthetic_ocr_font(px_size)
+    pad = max(16, int(round(20 * scale)))
+    line_step = max(px_size + 6, int(round(px_size * 1.45)))
+
+    probe = Image.new("RGB", (64, 64), color=bg)
+    probe_draw = ImageDraw.Draw(probe)
+    max_w = 180
+    for ln in lines:
+        try:
+            bbox = probe_draw.textbbox((0, 0), ln, font=font)
+            w = bbox[2] - bbox[0]
+        except Exception:
+            w = len(ln) * px_size
+        if w > max_w:
+            max_w = w
+
+    width = max(int(round(240 * scale)), max_w + pad * 2)
+    height = max(int(round(68 * scale)), pad * 2 + line_step * len(lines))
+    img = Image.new("RGB", (width, height), color=bg)
+    draw = ImageDraw.Draw(img)
+    y = pad
+    for ln in lines:
+        draw.text((pad, y), ln, fill=fg, font=font)
+        y += line_step
+    return img
+
+
+def benchmark_synthetic_forum_ocr(font_size: int = 18) -> dict[str, object]:
+    """Measure OCR accuracy and cold/cached latency across synthetic forum cases.
+
+    Covers multiline content, Unicode characters, canonical Discord links,
+    one-word forum titles, dark/light themes, and 1x/2x scaling.
+    """
+    import difflib
+
+    if not _HAS_PIL or Image is None:
+        return {
+            "engine": "unavailable",
+            "cases": [],
+            "summary": {"case_count": 0},
+        }
+
+    cases_spec = [
+        {
+            "name": "multiline_dark_1x",
+            "task": "message_body",
+            "theme": "dark",
+            "scale": 1.0,
+            "lines": ["Outpost Status Report", "Sector: North-12", "Visibility: Clear"],
+            "expected_tokens": ["Outpost", "Status", "Report", "Sector:", "North-12", "Visibility:", "Clear"],
+        },
+        {
+            "name": "multiline_light_1x",
+            "task": "message_body",
+            "theme": "light",
+            "scale": 1.0,
+            "lines": ["Outpost Status Report", "Sector: North-12", "Visibility: Clear"],
+            "expected_tokens": ["Outpost", "Status", "Report", "Sector:", "North-12", "Visibility:", "Clear"],
+        },
+        {
+            "name": "unicode_dark_1x",
+            "task": "message_body",
+            "theme": "dark",
+            "scale": 1.0,
+            "lines": ["Survey Café Route", "Résumé: Sector Alpha"],
+            "expected_tokens": ["Survey", "Route", "Sector", "Alpha"],
+        },
+        {
+            "name": "link_dark_1x",
+            "task": "message_body",
+            "theme": "dark",
+            "scale": 1.0,
+            "lines": ["Reference thread:", "https://discord.com/channels/1001/2002/3003"],
+            "expected_tokens": ["Reference", "thread:", "https://discord.com/channels/1001/2002/3003"],
+        },
+        {
+            "name": "one_word_title_dark_1x",
+            "task": "forum_title",
+            "theme": "dark",
+            "scale": 1.0,
+            "lines": ["Explore"],
+            "expected_tokens": ["Explore"],
+        },
+        {
+            "name": "one_word_title_light_1x",
+            "task": "forum_title",
+            "theme": "light",
+            "scale": 1.0,
+            "lines": ["Explore"],
+            "expected_tokens": ["Explore"],
+        },
+        {
+            "name": "scaled_2x_dark",
+            "task": "message_body",
+            "theme": "dark",
+            "scale": 2.0,
+            "lines": ["Scaled Capture Test", "Grid: B-04 Verified"],
+            "expected_tokens": ["Scaled", "Capture", "Test", "Grid:", "B-04", "Verified"],
+        },
+        {
+            "name": "scaled_2x_light_link",
+            "task": "message_body",
+            "theme": "light",
+            "scale": 2.0,
+            "lines": ["Mirror Link:", "https://discord.com/channels/1001/2002"],
+            "expected_tokens": ["Mirror", "Link:", "https://discord.com/channels/1001/2002"],
+        },
+    ]
+
+    clear_ocr_cache()
+    results: list[dict[str, object]] = []
+    engine_seen = "unknown"
+
+    for spec in cases_spec:
+        img = _render_synthetic_ocr_image(
+            spec["lines"],
+            theme=str(spec["theme"]),
+            scale=float(spec["scale"]),
+            base_font_size=font_size,
+        )
+        t0 = time.perf_counter()
+        cold_res = ocr_image_structured(img, task=str(spec["task"]), use_cache=True)
+        cold_ms = (time.perf_counter() - t0) * 1000.0
+
+        t1 = time.perf_counter()
+        warm_res = ocr_image_structured(img, task=str(spec["task"]), use_cache=True)
+        warm_ms = (time.perf_counter() - t1) * 1000.0
+        engine_seen = cold_res.engine
+
+        expected_text = "\n".join(spec["lines"]) if spec["task"] == "message_body" else " ".join(spec["lines"])
+        norm_expected = re.sub(r"\s+", " ", expected_text).strip()
+        norm_observed = re.sub(r"\s+", " ", cold_res.text).strip()
+        char_sim = difflib.SequenceMatcher(None, norm_expected, norm_observed).ratio()
+
+        exp_tokens = list(spec["expected_tokens"])
+        hits = sum(1 for tok in exp_tokens if tok in cold_res.text)
+        token_recall = (hits / len(exp_tokens)) if exp_tokens else 1.0
+
+        results.append(
+            {
+                "name": spec["name"],
+                "task": spec["task"],
+                "theme": spec["theme"],
+                "scale": spec["scale"],
+                "expected_text": expected_text,
+                "observed_text": cold_res.text,
+                "line_count": len(cold_res.lines),
+                "char_similarity": round(char_sim, 4),
+                "token_recall": round(token_recall, 4),
+                "confidence": cold_res.confidence,
+                "cold_ms": round(cold_ms, 2),
+                "cached_ms": round(warm_ms, 4),
+                "warm_cached_flag": bool(warm_res.cached),
+            }
+        )
+
+    n = len(results)
+    mean_cold = sum(float(r["cold_ms"]) for r in results) / n
+    mean_warm = sum(float(r["cached_ms"]) for r in results) / n
+    return {
+        "engine": engine_seen,
+        "cases": results,
+        "summary": {
+            "case_count": n,
+            "themes_tested": sorted({str(r["theme"]) for r in results}),
+            "scales_tested": sorted({float(r["scale"]) for r in results}),
+            "mean_char_similarity": round(sum(float(r["char_similarity"]) for r in results) / n, 4),
+            "mean_token_recall": round(sum(float(r["token_recall"]) for r in results) / n, 4),
+            "mean_confidence": round(sum(float(r["confidence"]) for r in results) / n, 4),
+            "mean_cold_ms": round(mean_cold, 2),
+            "mean_cached_ms": round(mean_warm, 4),
+            "cache_speedup": round(mean_cold / max(mean_warm, 1e-4), 1),
+        },
+    }
+
+
 # NOTE: capture_discord_servers has been moved to src/discord_nav.py as iterate_all_servers()
 # Use: from src.discord_nav import iterate_all_servers
 

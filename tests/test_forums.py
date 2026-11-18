@@ -3488,5 +3488,373 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                 pub.close()
 
 
+class TestPromotionRoutingAndDialogAndBenchmark(unittest.TestCase):
+    def test_promo_draft_one_topic_per_streamer_resolve_create_and_edit_own(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            prof = ForumProfile(
+                profile_id="promo-streamer-routing",
+                name="Streamer Promo Forum",
+                guild_id=GUILD_ID,
+                forum_id=FORUM_ID,
+                purpose="promotion",
+                catalog_enabled=True,
+                promotion_enabled=True,
+                external_drafts_enabled=False,
+                stage_enabled=True,
+                routing_mode="one_topic_per_streamer",
+                db_path=str(tmp / "mirror.sqlite3"),
+                exchange_dir=str(tmp / "exchange"),
+            )
+            store = ForumStore(prof.db_path)
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID)
+                store.upsert_forum(
+                    forum_id=FORUM_ID,
+                    name=prof.name,
+                    source_url=prof.source_url,
+                    tags=[],
+                    guidelines_text="Include stream link.",
+                    observed_at="2026-11-18T10:00:00Z",
+                )
+                store.upsert_requirement(
+                    requirement_id="guidelines-fixture",
+                    forum_id=FORUM_ID,
+                    body="Include stream link.",
+                    source_entity_ref="forum-guidelines",
+                    source_url=prof.source_url,
+                    observed_at="2026-11-18T10:00:00Z",
+                )
+                store.upsert_topic(
+                    thread_id=THREAD_1,
+                    forum_id=FORUM_ID,
+                    title="StreamerAlpha",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                    observed_at="2026-11-18T10:01:00Z",
+                    starter_message_id="200000000000000001",
+                )
+                store.upsert_message(
+                    entity_ref="msg:200000000000000001",
+                    message_id="200000000000000001",
+                    thread_id=THREAD_1,
+                    author={"user_id": ACTOR_USER_ID, "label": "StreamerAlpha"},
+                    body="Previous schedule post",
+                    observed_at="2026-11-18T10:01:00Z",
+                )
+
+                # 1. Existing streamer topic resolved case-insensitively
+                stream_existing = SimpleNamespace(
+                    username="streameralpha",
+                    title="Morning Run",
+                    game="Test Game",
+                    stream_url="https://example.invalid/streameralpha",
+                    platform="Twitch",
+                )
+                reply_draft = render_forum_promo_draft(
+                    profile=prof,
+                    stream_info=stream_existing,
+                    draft_id="promo-existing-1",
+                    store=store,
+                )
+                self.assertEqual(reply_draft["action"], "reply_existing")
+                self.assertEqual(reply_draft["destination"]["thread_id"], THREAD_1)
+                self.assertIsNone(reply_draft["title"])
+                self.assertEqual(len(reply_draft["baseline"]["requirements"]), 1)
+                self.assertEqual(check_draft_conflicts(reply_draft, store), [])
+
+                # 2. Unknown streamer requires allow_create_if_missing=True or creates new topic
+                stream_new = SimpleNamespace(
+                    username="NewCreator",
+                    title="First Stream",
+                    game="Test Game",
+                    stream_url="https://example.invalid/newcreator",
+                    platform="Twitch",
+                )
+                with self.assertRaises(ValueError):
+                    render_forum_promo_draft(
+                        profile=prof,
+                        stream_info=stream_new,
+                        draft_id="promo-missing-err",
+                        store=store,
+                        allow_create_if_missing=False,
+                    )
+                create_draft = render_forum_promo_draft(
+                    profile=prof,
+                    stream_info=stream_new,
+                    draft_id="promo-create-1",
+                    store=store,
+                    allow_create_if_missing=True,
+                )
+                self.assertEqual(create_draft["action"], "create_topic")
+                self.assertEqual(create_draft["title"], "NewCreator - First Stream")
+                self.assertIsNone(create_draft["destination"]["thread_id"])
+                self.assertEqual(create_draft["destination"]["source_url"], prof.source_url)
+                self.assertEqual(check_draft_conflicts(create_draft, store), [])
+
+                # 3. Edit own message populates message_content_hash from store and passes conflict check
+                edit_draft = render_forum_promo_draft(
+                    profile=prof,
+                    stream_info=stream_existing,
+                    draft_id="promo-edit-1",
+                    store=store,
+                    message_id="200000000000000001",
+                )
+                self.assertEqual(edit_draft["action"], "edit_own_message")
+                self.assertEqual(edit_draft["destination"]["thread_id"], THREAD_1)
+                self.assertEqual(edit_draft["destination"]["message_id"], "200000000000000001")
+                self.assertIsNotNone(edit_draft["baseline"]["message_content_hash"])
+                self.assertEqual(check_draft_conflicts(edit_draft, store), [])
+            finally:
+                store.close()
+
+    def test_forum_mirror_dialog_routing_bundle_and_confirmation(self):
+        from src.forums.dialog import _HAS_TK, ForumMirrorController, ForumMirrorDialog
+        from src.forums.exchange import canonical_record_digest
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profiles_path = tmp / "profiles.json"
+            provider = FakeForumProvider()
+            topic_obs = TopicObservation(
+                forum_id=FORUM_ID,
+                title="StreamerAlpha",
+                thread_id=THREAD_1,
+                source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                starter_message_id="200000000000000001",
+                observed_at="2026-11-18T10:00:00Z",
+            )
+            provider.topic_pages = [
+                TopicListObservation(
+                    topics=[topic_obs],
+                    next_cursor=None,
+                    complete=True,
+                )
+            ]
+            provider.histories[THREAD_1] = TopicHistoryObservation(
+                topic=topic_obs,
+                messages=[
+                    MessageObservation(
+                        entity_ref="msg:200000000000000001",
+                        message_id="200000000000000001",
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "StreamerAlpha"},
+                        body="Starter summary text",
+                        source_url=build_discord_channel_url(GUILD_ID, THREAD_1, "200000000000000001"),
+                        observed_at="2026-11-18T10:00:00Z",
+                    )
+                ],
+                complete=True,
+                observed_at="2026-11-18T10:00:00Z",
+            )
+
+            promo_prof = ForumProfile(
+                profile_id="promo-ui",
+                name="Promo UI Forum",
+                guild_id=GUILD_ID,
+                forum_id=FORUM_ID,
+                purpose="promotion",
+                catalog_enabled=True,
+                promotion_enabled=True,
+                external_drafts_enabled=False,
+                stage_enabled=True,
+                routing_mode="reply_existing",
+                default_thread_id=THREAD_1,
+                db_path=str(tmp / "promo.sqlite3"),
+                exchange_dir=str(tmp / "promo_exchange"),
+            )
+            ext_prof = _make_profile(tmp, purpose="external_project", stage_enabled=True)
+            upsert_forum_profile(promo_prof, profiles_path)
+            upsert_forum_profile(ext_prof, profiles_path)
+
+            ctrl = ForumMirrorController(
+                profiles_path=profiles_path,
+                provider_factory=lambda _p: provider,
+                handoff_provider_factory=lambda: provider,
+            )
+
+            # 1. Full refresh followed by targeted single-topic refresh + export_exchange_dir + rich status formatting
+            ctrl.select_profile("promo-ui")
+            full_res = ctrl.refresh()
+            self.assertFalse(full_res.get("paused"))
+            provider.histories[THREAD_1].messages.append(
+                MessageObservation(
+                    entity_ref="msg:200000000000000002",
+                    message_id="200000000000000002",
+                    thread_id=THREAD_1,
+                    author={"user_id": ACTOR_USER_ID, "label": "ReviewerBeta"},
+                    body="Follow-up reply",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_1, "200000000000000002"),
+                    observed_at="2026-11-18T10:02:00Z",
+                )
+            )
+            single_res = ctrl.refresh(thread_id=THREAD_1)
+            self.assertEqual(single_res.get("threads_read"), 1)
+            snap_files = list((Path(promo_prof.exchange_dir) / "snapshots").glob("*.snapshot.v1.json"))
+            self.assertEqual(len(snap_files), 1)
+            topic_st = ctrl.get_topic_status(THREAD_1)
+            self.assertIsNotNone(topic_st)
+            self.assertEqual(topic_st["reply_count"], 1)
+            self.assertTrue(topic_st["has_non_starter_replies"])
+            formatted_status = ctrl.format_topic_status(topic_st)
+            self.assertIn("History complete: True", formatted_status)
+            self.assertIn("guidelines-fixture@r1", formatted_status)
+
+            # 2. Save routing mode update via controller
+            saved = ctrl.save_profile(
+                routing_mode="one_topic_per_streamer",
+                default_thread_id="",
+            )
+            self.assertIsNone(saved.default_thread_id)
+            self.assertEqual(load_forum_profiles(profiles_path)["promo-ui"].routing_mode, "one_topic_per_streamer")
+
+            # 3. Build promo drafts (one_topic_per_streamer resolve + create fallback), stage (No Send), observe vs confirm
+            built_reply, conflicts_reply = ctrl.build_promo_draft(
+                stream_info=SimpleNamespace(
+                    username="StreamerAlpha",
+                    title="Evening Stream",
+                    game="Arena",
+                    stream_url="https://example.invalid/live",
+                    platform="Twitch",
+                ),
+                draft_id="ui-promo-1",
+            )
+            self.assertEqual(conflicts_reply, [])
+            self.assertEqual(built_reply["action"], "reply_existing")
+            self.assertEqual(built_reply["destination"]["thread_id"], THREAD_1)
+            self.assertEqual(ctrl.current_source_kind, "promotion")
+
+            staged = ctrl.stage_current_draft()
+            self.assertEqual(staged["status"], "staged", msg=repr(staged))
+            self.assertEqual(provider.send_pressed_count, 0)
+
+            observed = ctrl.reconcile_current_draft(user_confirmed=False)
+            self.assertEqual(observed["status"], "in_discord_review")
+            confirmed = ctrl.reconcile_current_draft(user_confirmed=True)
+            self.assertEqual(confirmed["status"], "user_confirmed_submitted")
+            ctrl.release_review_pause()
+
+            built_create, conflicts_create = ctrl.build_promo_draft(
+                stream_info=SimpleNamespace(
+                    username="BrandNewStreamer",
+                    title="Opening Night",
+                    game="Arena",
+                    stream_url="https://example.invalid/new",
+                    platform="Twitch",
+                ),
+                draft_id="ui-promo-create-1",
+                allow_create_if_missing=True,
+            )
+            self.assertEqual(conflicts_create, [])
+            self.assertEqual(built_create["action"], "create_topic")
+            self.assertEqual(built_create["title"], "BrandNewStreamer - Opening Night")
+
+            # 4. External project profile rejects promotion_enabled=True and accepts portable bundle dir
+            ctrl.select_profile(ext_prof.profile_id)
+            with self.assertRaises(ValueError):
+                ctrl.save_profile(promotion_enabled=True)
+            self.assertFalse(load_forum_profiles(profiles_path)[ext_prof.profile_id].promotion_enabled)
+
+            ctrl.refresh()
+            ext_store = ForumStore(ext_prof.db_path)
+            try:
+                ext_snap = ext_store.export_snapshot()
+            finally:
+                ext_store.close()
+            att_bytes = b"synthetic-evidence-crop"
+            bundle_draft = validate_exchange_record(
+                {
+                    "schema": "draft.request.v1",
+                    "record_id": "draft-bundle-ui-1",
+                    "producer_id": "external-tool",
+                    "created_at": "2026-11-18T10:05:00Z",
+                    "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": provider.actor},
+                    "draft_id": "ext-bundle-ui-1",
+                    "revision": 1,
+                    "action": "reply_existing",
+                    "destination": {
+                        "guild_id": GUILD_ID,
+                        "forum_id": FORUM_ID,
+                        "thread_id": THREAD_1,
+                        "message_id": None,
+                        "source_url": build_discord_channel_url(GUILD_ID, THREAD_1),
+                    },
+                    "body": "Consolidated observation note.",
+                    "title": None,
+                    "tags": [],
+                    "evidence": [
+                        {
+                            "evidence_id": "ev-ui-1",
+                            "name": "crop.png",
+                            "media_type": "image/png",
+                            "sha256": compute_bytes_sha256(att_bytes),
+                            "local_ref": "crop.png",
+                        }
+                    ],
+                    "baseline": {
+                        "snapshot_id": ext_snap["snapshot_id"],
+                        "snapshot_revision": ext_snap["revision"],
+                        "requirements": [
+                            {
+                                "requirement_id": r["requirement_id"],
+                                "revision": r["revision"],
+                                "content_hash": r["content_hash"],
+                            }
+                            for r in ext_snap["requirements"]
+                        ],
+                        "message_content_hash": None,
+                    },
+                }
+            )
+            bundle_dir = tmp / canonical_record_digest(bundle_draft)
+            (bundle_dir / "transfer").mkdir(parents=True)
+            (bundle_dir / "transfer" / "crop.png").write_bytes(att_bytes)
+            (bundle_dir / "draft.request.json").write_text(json.dumps(bundle_draft), encoding="utf-8")
+
+            loaded_bundle = ctrl.load_draft_bundle_dir(bundle_dir)
+            self.assertEqual(loaded_bundle["draft_id"], "ext-bundle-ui-1")
+            self.assertEqual(ctrl.current_source_kind, "external")
+            ext_stage = ctrl.stage_current_draft()
+            self.assertEqual(ext_stage["status"], "staged")
+            self.assertEqual(ext_stage["evidence_ids"], ["ev-ui-1"])
+            self.assertEqual(provider.send_pressed_count, 0)
+            ctrl.release_review_pause()
+
+            # 5. Also instantiate the Tkinter wrapper if _tkinter and a display are available
+            if _HAS_TK:
+                import tkinter as tk
+                try:
+                    root = tk.Tk()
+                    root.withdraw()
+                except tk.TclError:
+                    root = None
+                if root is not None:
+                    dlg = ForumMirrorDialog(
+                        root,
+                        profiles_path=profiles_path,
+                        provider_factory=lambda _p: provider,
+                        handoff_provider_factory=lambda: provider,
+                    )
+                    try:
+                        dlg.topics_tree.selection_set(THREAD_1)
+                        dlg._on_topic_select()
+                        self.assertIn("History complete:", dlg.detail_text.get("1.0", tk.END))
+                    finally:
+                        dlg.destroy()
+                        root.destroy()
+
+    def test_synthetic_forum_ocr_benchmark_metrics(self):
+        report = utils.benchmark_synthetic_forum_ocr()
+        summary = report["summary"]
+        self.assertEqual(report["engine"], "tesseract")
+        self.assertEqual(summary["case_count"], 8)
+        self.assertEqual(summary["themes_tested"], ["dark", "light"])
+        self.assertEqual(summary["scales_tested"], [1.0, 2.0])
+        self.assertGreaterEqual(summary["mean_token_recall"], 0.95)
+        self.assertGreaterEqual(summary["mean_char_similarity"], 0.90)
+        for case in report["cases"]:
+            self.assertTrue(case["warm_cached_flag"], msg=case["name"])
+            self.assertLess(case["cached_ms"], case["cold_ms"], msg=case["name"])
+
+
 if __name__ == "__main__":
     unittest.main()

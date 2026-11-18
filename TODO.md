@@ -38,7 +38,7 @@ Long term: support promotion in owner-designated self-promotion forums as well a
 
 - [x] Add optional forum/topic destinations to existing settings (`src/forums/config.py`, `src/server_config.py::get_forum_profiles` / `set_forum_profile`) without replacing the Tkinter UI or changing defaults.
 - [x] Keep catalogue, promotion, external-draft and staging enablement separate. Imported/project forums forbid `promotion_enabled=True`.
-- [ ] Support shared-topic replies, one-topic-per-streamer updates and new-topic drafts across both backend and UI (`reply_existing`, `one_topic_per_streamer`, and `create_topic` modeled in `ForumProfile`/`render_forum_promo_draft`; Tkinter UI controls pending).
+- [x] Support shared-topic replies, one-topic-per-streamer updates and new-topic drafts across both backend and UI (`src/forums/drafts.py::render_forum_promo_draft` resolves `one_topic_per_streamer` from `ForumStore`, supports `create_topic` fallback and `edit_own_message`, and auto-populates baselines; `src/forums/dialog.py::ForumMirrorController` & `ForumMirrorDialog` support routing/profile editing, single-topic refresh + exchange export, `<digest>/` bundle loading, promo draft building, and separate observe vs confirm-submitted actions).
 - [x] Reuse stream title/game/link generically in `render_forum_promo_draft` without private protocols/data.
 - [x] Key promotion cadence/cooldowns to canonical forum targets (`forum:<guild_id>:<target_id>`) and observed/confirmed submission.
 
@@ -63,7 +63,7 @@ Long term: support promotion in owner-designated self-promotion forums as well a
 
 - [x] Structured OCR output (`OCRTokenBox`, `OCRResult`, `ocr_image_structured`) preserving raw text, lines, boxes, confidence and task/settings; existing `ocr_image_to_text` wrapper preserved.
 - [x] Task-specific cleanup/preprocessing, settled-view helper (`_capture_settled_region`), and bounded content/task crop cache (`_OCR_CROP_CACHE`).
-- [ ] Synthetic fixtures and accuracy/latency measurements across multiline forum content, Unicode, links, one-word names, dark/light themes, and scaling (unit tests cover multiline, dark/light, one-word title, and cache hit; systematic Unicode/link/scaling benchmark metrics remain).
+- [x] Synthetic fixtures and accuracy/latency measurements across multiline forum content, Unicode, links, one-word names, dark/light themes, and scaling (`src/utils.py::benchmark_synthetic_forum_ocr` benchmarked 8 synthetic Tesseract cases covering multiline, accented Unicode, canonical `discord.com/channels/...` links, one-word forum title, dark/light themes, and `1.0x`/`2.0x` scaling with `0.9934` mean char similarity, `1.0` mean token recall, `0.9382` mean confidence, `191.39ms` cold vs `0.2359ms` cached latency / `811.3x` cache speedup).
 - [x] Implement generic mechanisms without moving private <EXT_APP_01> source, game tuning, models, or datasets into this repository.
 
 ## Parallel ownership and starting point
