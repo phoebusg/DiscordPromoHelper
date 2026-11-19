@@ -155,6 +155,10 @@ def cmd_seed_index(args: argparse.Namespace) -> int:
 
 def cmd_refresh(args: argparse.Namespace) -> int:
     discover_mode = bool(getattr(args, "discover", False))
+    guidance_mode = bool(getattr(args, "guidance_only", False))
+    if guidance_mode and (discover_mode or getattr(args, "thread", None) or args.backfill):
+        print("--guidance-only cannot be combined with --thread, --discover, or --backfill", file=sys.stderr)
+        return 2
     if discover_mode and not getattr(args, "thread", None):
         print("--discover requires --thread", file=sys.stderr)
         return 2
@@ -176,7 +180,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
         ctrl = _session_controller_for(prof)
         reader = ForumReader(prof, store, provider, session_controller=ctrl)
-        if discover_mode:
+        if guidance_mode:
+            res = reader.refresh_guidance_only()
+        elif discover_mode:
             res = reader.discover_topic(args.thread)
         elif getattr(args, "thread", None):
             res = reader.refresh_topic(args.thread)
@@ -217,6 +223,13 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         )
     finally:
         store.close()
+    if guidance_mode:
+        complete = (
+            not res.get("paused")
+            and bool(res.get("requirements_complete"))
+            and not res.get("errors")
+        )
+        return 0 if complete else 2
     if discover_mode:
         complete = (
             not res.get("paused")
@@ -286,7 +299,36 @@ def cmd_search(args: argparse.Namespace) -> int:
     store = ForumStore(prof.db_path)
     try:
         store.ensure_scope(prof.guild_id, prof.forum_id)
-        _print_json(store.search(args.query, forum_id=prof.forum_id))
+        lim = getattr(args, "limit", 25)
+        max_chars = getattr(args, "max_body_chars", 240)
+        _print_json(
+            store.search(
+                args.query,
+                forum_id=prof.forum_id,
+                limit=(lim if (lim is not None and int(lim) > 0) else None),
+                max_body_chars=(max_chars if (max_chars is not None and int(max_chars) > 0) else None),
+            )
+        )
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    prof = _load_profile_or_exit(args.profile, args.profiles_path)
+    ctrl = _session_controller_for(prof)
+    store = ForumStore(prof.db_path)
+    try:
+        store.ensure_scope(prof.guild_id, prof.forum_id)
+        _print_json(
+            store.get_attention_queue(
+                guild_id=prof.guild_id,
+                forum_id=prof.forum_id,
+                session_state=ctrl.status(),
+                exchange_dir=prof.exchange_dir,
+                limit=getattr(args, "limit", 50),
+            )
+        )
     finally:
         store.close()
     return 0
@@ -539,6 +581,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
                     prof,
                     source_kind=args.source_kind,
                     transfer_root=transfer_root,
+                    refresh_before_stage=bool(getattr(args, "refresh_before_stage", False)),
                 )
                 staged.append(receipt)
                 if receipt["status"] in ("staged", "in_discord_review", "needs_review"):
@@ -609,6 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ref.add_argument("--backfill", action="store_true")
     p_ref.add_argument("--thread", help="Refresh one mirrored (or with --discover, supplied) topic and guidance")
     p_ref.add_argument("--discover", action="store_true", help="Discover and ingest a supplied --thread URL/ID if not yet mirrored")
+    p_ref.add_argument("--guidance-only", action="store_true", help="Refresh forum metadata and guidance requirements only")
     p_ref.add_argument("--deep-reread", type=int, default=2)
     p_ref.add_argument("--max-topics", type=int)
     p_ref.add_argument("--export", action="store_true")
@@ -632,7 +676,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser("search", help="Search mirrored topics, messages, and requirements")
     p_search.add_argument("--profile", required=True)
+    p_search.add_argument("--limit", type=int, default=25, help="Max items per entity type (0 = unlimited)")
+    p_search.add_argument("--max-body-chars", type=int, default=240, help="Truncate long bodies to N chars (0 = full)")
     p_search.add_argument("query")
+
+    p_queue = sub.add_parser("queue", help="Inspect local attention queue and next action without touching Discord")
+    p_queue.add_argument("--profile", required=True)
+    p_queue.add_argument("--limit", type=int, default=50)
 
     p_chg = sub.add_parser("changes", help="Export forum.changes.v1 batch")
     p_chg.add_argument("--profile", required=True)
@@ -676,6 +726,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--max-topics", type=int)
     p_sync.add_argument("--snapshot", action="store_true", help="Force a snapshot cutover on export")
     p_sync.add_argument("--stage-pending", action="store_true", help="Stage next un-staged draft in exchange/drafts")
+    p_sync.add_argument("--refresh-before-stage", action="store_true", help="Refresh target/guidance before staging pending drafts")
     p_sync.add_argument("--reconcile", action="store_true", help="Reconcile previously staged drafts first")
     p_sync.add_argument("--source-kind", choices=["external", "promotion"], default="external")
 
@@ -693,6 +744,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "status": cmd_status,
         "topics": cmd_topics,
         "search": cmd_search,
+        "queue": cmd_queue,
         "changes": cmd_changes,
         "stage": cmd_stage,
         "reconcile": cmd_reconcile,

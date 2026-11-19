@@ -2247,7 +2247,14 @@ class ForumStore:
             res["after_cursor"] = first_after_cursor or res["after_cursor"]
         return res
 
-    def search(self, query: str, forum_id: Optional[str] = None) -> dict[str, Any]:
+    def search(
+        self,
+        query: str,
+        forum_id: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
+        max_body_chars: Optional[int] = None,
+    ) -> dict[str, Any]:
         """Local search across topics, messages, unresolved observations, and requirements."""
         q = f"%{(query or '').strip().lower()}%"
         t_params: list[Any] = [q, q]
@@ -2256,7 +2263,7 @@ class ForumStore:
             t_sql += " AND forum_id = ?"
             t_params.append(forum_id)
         t_sql += " ORDER BY ts_sort_key(observed_at) DESC"
-        topics = [
+        all_topics = [
             {
                 "thread_id": r["thread_id"],
                 "title": r["title"],
@@ -2267,6 +2274,14 @@ class ForumStore:
             }
             for r in self._conn.execute(t_sql, t_params).fetchall()
         ]
+
+        cap_chars = int(max_body_chars) if (max_body_chars is not None and int(max_body_chars) > 0) else None
+
+        def _clip_body(raw_text: str) -> tuple[str, int, bool]:
+            raw_len = len(raw_text or "")
+            if cap_chars is not None and raw_len > cap_chars:
+                return f"{raw_text[:cap_chars]}...", raw_len, True
+            return raw_text, raw_len, False
 
         m_sql = """
             SELECT m.*, t.title AS topic_title
@@ -2279,43 +2294,53 @@ class ForumStore:
             m_sql += " AND t.forum_id = ?"
             m_params.append(forum_id)
         m_sql += " ORDER BY ts_sort_key(m.observed_at) DESC"
-        messages = [
-            {
-                "entity_ref": r["entity_ref"],
-                "message_id": r["message_id"],
-                "thread_id": r["thread_id"],
-                "topic_title": r["topic_title"],
-                "author": json.loads(r["author_json"]),
-                "body": r["body"],
-                "source_url": r["source_url"],
-                "revision": int(r["revision"]),
-                "observed_at": r["observed_at"],
-            }
-            for r in self._conn.execute(m_sql, m_params).fetchall()
-        ]
+        all_messages = []
+        for r in self._conn.execute(m_sql, m_params).fetchall():
+            body_out, body_chars, body_trunc = _clip_body(r["body"] or "")
+            all_messages.append(
+                {
+                    "entity_ref": r["entity_ref"],
+                    "message_id": r["message_id"],
+                    "thread_id": r["thread_id"],
+                    "topic_title": r["topic_title"],
+                    "author": json.loads(r["author_json"]),
+                    "body": body_out,
+                    "content_hash": r["content_hash"],
+                    "body_chars": body_chars,
+                    "body_truncated": body_trunc,
+                    "source_url": r["source_url"],
+                    "revision": int(r["revision"]),
+                    "observed_at": r["observed_at"],
+                }
+            )
 
         r_sql = "SELECT * FROM requirements WHERE LOWER(body) LIKE ?"
         r_params: list[Any] = [q]
         if forum_id:
             r_sql += " AND forum_id = ?"
             r_params.append(forum_id)
-        requirements = [
-            {
-                "requirement_id": r["requirement_id"],
-                "source_url": r["source_url"],
-                "body": r["body"],
-                "revision": int(r["revision"]),
-                "observed_at": r["observed_at"],
-            }
-            for r in self._conn.execute(r_sql, r_params).fetchall()
-        ]
+        all_requirements = []
+        for r in self._conn.execute(r_sql, r_params).fetchall():
+            body_out, body_chars, body_trunc = _clip_body(r["body"] or "")
+            all_requirements.append(
+                {
+                    "requirement_id": r["requirement_id"],
+                    "source_url": r["source_url"],
+                    "body": body_out,
+                    "content_hash": r["content_hash"],
+                    "body_chars": body_chars,
+                    "body_truncated": body_trunc,
+                    "revision": int(r["revision"]),
+                    "observed_at": r["observed_at"],
+                }
+            )
 
         u_sql = "SELECT * FROM unresolved_topics WHERE resolved_thread_id IS NULL AND LOWER(title) LIKE ?"
         u_params: list[Any] = [q]
         if forum_id:
             u_sql += " AND forum_id = ?"
             u_params.append(forum_id)
-        unresolved = [
+        all_unresolved = [
             {
                 "observation_ref": r["observation_ref"],
                 "title": r["title"],
@@ -2325,8 +2350,30 @@ class ForumStore:
             for r in self._conn.execute(u_sql, u_params).fetchall()
         ]
 
+        counts = {
+            "topics": len(all_topics),
+            "messages": len(all_messages),
+            "requirements": len(all_requirements),
+            "unresolved_topics": len(all_unresolved),
+        }
+        if limit is not None:
+            limit_n = max(0, int(limit))
+            topics = all_topics[:limit_n]
+            messages = all_messages[:limit_n]
+            requirements = all_requirements[:limit_n]
+            unresolved = all_unresolved[:limit_n]
+            truncated = any(v > limit_n for v in counts.values())
+        else:
+            topics = all_topics
+            messages = all_messages
+            requirements = all_requirements
+            unresolved = all_unresolved
+            truncated = False
+
         return {
             "query": query,
+            "counts": counts,
+            "truncated": truncated,
             "topics": topics,
             "messages": messages,
             "requirements": requirements,
@@ -2673,6 +2720,328 @@ class ForumStore:
         """Return current change cursor sequence number for this mirror scope."""
         meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
         return int(meta["cursor_seq"])
+
+    def summarize_changes_since(
+        self,
+        start_seq: int,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Return compact IDs, revisions, and content hashes for changes after start_seq (no raw bodies)."""
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        rows = self._conn.execute(
+            """
+            SELECT change_id, entity_type, entity_ref, kind, before_revision, after_revision, observed_at, after_json
+            FROM changes
+            WHERE stream_id = ? AND seq > ?
+            ORDER BY seq ASC
+            LIMIT ?
+            """,
+            (meta["stream_id"], int(start_seq), max(1, int(limit))),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            content_hash: Optional[str] = None
+            raw_after = r["after_json"]
+            if raw_after:
+                try:
+                    after_obj = json.loads(raw_after)
+                    if isinstance(after_obj, dict):
+                        content_hash = after_obj.get("content_hash")
+                except Exception:
+                    content_hash = None
+            items.append(
+                {
+                    "change_id": r["change_id"],
+                    "entity_type": r["entity_type"],
+                    "entity_ref": r["entity_ref"],
+                    "kind": r["kind"],
+                    "before_revision": r["before_revision"],
+                    "after_revision": r["after_revision"],
+                    "content_hash": content_hash,
+                    "observed_at": r["observed_at"],
+                }
+            )
+        return items
+
+    def get_attention_queue(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+        session_state: Optional[dict[str, Any]] = None,
+        exchange_dir: Optional[str | Path] = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return a pure read-only local queue of review holds, pending/conflicted drafts, bundles, and mirror gaps."""
+        eff_limit = max(1, min(500, int(limit)))
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        gid = meta["guild_id"]
+        fid = meta["forum_id"]
+
+        active_review: Optional[dict[str, Any]] = None
+        if isinstance(session_state, dict) and session_state.get("mode") in ("in_discord_review", "staging"):
+            active_review = {
+                "mode": session_state.get("mode"),
+                "owner_pid": session_state.get("owner_pid"),
+                "updated_at": session_state.get("updated_at"),
+                "review_draft": session_state.get("review_draft"),
+            }
+
+        latest_receipts: dict[tuple[str, int], dict[str, Any]] = {}
+        receipt_rows = self._conn.execute(
+            "SELECT receipt_id, record_id, draft_id, draft_revision, status, observed_at, record_json FROM receipts ORDER BY ts_sort_key(observed_at), rowid"
+        ).fetchall()
+        for rr in receipt_rows:
+            try:
+                rec_obj = json.loads(rr["record_json"])
+            except Exception:
+                continue
+            r_scope = rec_obj.get("scope") or {}
+            r_dest = rec_obj.get("destination") or {}
+            r_gid = r_scope.get("guild_id") or r_dest.get("guild_id")
+            r_fid = r_scope.get("forum_id") or r_dest.get("forum_id")
+            if r_gid != gid or r_fid != fid:
+                continue
+            latest_receipts[(str(rr["draft_id"]), int(rr["draft_revision"]))] = rec_obj
+
+        drafts_attention: list[dict[str, Any]] = []
+        draft_rows = self._conn.execute(
+            "SELECT * FROM drafts ORDER BY ts_sort_key(updated_at) DESC, draft_id ASC, revision DESC"
+        ).fetchall()
+        for dr in draft_rows:
+            try:
+                d_rec = json.loads(dr["record_json"])
+            except Exception:
+                continue
+            d_scope = d_rec.get("scope") or {}
+            d_dest = d_rec.get("destination") or {}
+            d_gid = d_scope.get("guild_id") or d_dest.get("guild_id")
+            d_fid = d_scope.get("forum_id") or d_dest.get("forum_id")
+            if d_gid != gid or d_fid != fid:
+                continue
+            did = str(dr["draft_id"])
+            rev = int(dr["revision"])
+            lr = latest_receipts.get((did, rev))
+            eff_status = str(lr.get("status") if lr else dr["status"])
+            needs_recheck = bool(int(dr["needs_recheck"] or 0) == 1)
+            if eff_status in ("staged", "in_discord_review", "needs_review", "failed") or needs_recheck:
+                drafts_attention.append(
+                    {
+                        "draft_id": did,
+                        "draft_revision": rev,
+                        "record_id": d_rec.get("record_id"),
+                        "latest_receipt_id": lr.get("receipt_id") if lr else None,
+                        "latest_receipt_record_id": lr.get("record_id") if lr else None,
+                        "status": eff_status,
+                        "needs_recheck": needs_recheck,
+                        "reason": dr["recheck_reason"] or (lr.get("reason") if lr else None),
+                        "thread_id": d_dest.get("thread_id"),
+                        "action": d_rec.get("action"),
+                        "updated_at": dr["updated_at"],
+                    }
+                )
+        drafts_attention = drafts_attention[:eff_limit]
+
+        pending_bundles: list[dict[str, Any]] = []
+        if exchange_dir is not None and str(exchange_dir).strip():
+            ex_path = Path(exchange_dir)
+            from .exchange import ContractValidationError, read_record
+            from .handoff import BundleValidationError, ingest_draft_bundle
+
+            candidates: list[tuple[Path, bool]] = []
+            b_dir = ex_path / "bundles"
+            d_dir = ex_path / "drafts"
+            if b_dir.is_dir():
+                for child in sorted(b_dir.iterdir()):
+                    if child.is_dir():
+                        candidates.append((child, True))
+            if d_dir.is_dir():
+                for child in sorted(d_dir.iterdir()):
+                    if child.is_dir():
+                        candidates.append((child, True))
+                    elif child.is_file() and child.suffix == ".json":
+                        candidates.append((child, False))
+
+            terminal_or_active = {
+                "staged",
+                "in_discord_review",
+                "submission_observed",
+                "user_confirmed_submitted",
+                "rejected",
+            }
+            for entry_path, is_bundle in candidates:
+                if len(pending_bundles) >= eff_limit:
+                    break
+                try:
+                    if is_bundle:
+                        d_rec, _tr = ingest_draft_bundle(entry_path)
+                    else:
+                        d_rec = read_record(entry_path)
+                except (BundleValidationError, ContractValidationError, RecordConflictError, OSError, json.JSONDecodeError) as exc:
+                    pending_bundles.append(
+                        {
+                            "path": str(entry_path),
+                            "status": "invalid_bundle",
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                if d_rec.get("schema") != "draft.request.v1":
+                    continue
+                d_scope = d_rec.get("scope") or {}
+                d_dest = d_rec.get("destination") or {}
+                if d_scope.get("guild_id") != gid or d_scope.get("forum_id") != fid:
+                    continue
+                did = str(d_rec["draft_id"])
+                rev = int(d_rec["revision"])
+                d_row = self.get_draft_row(did, rev)
+                lr = latest_receipts.get((did, rev))
+                if (d_row is not None and d_row["status"] in terminal_or_active) or (
+                    lr is not None and lr.get("status") in terminal_or_active
+                ):
+                    continue
+                pending_bundles.append(
+                    {
+                        "path": str(entry_path),
+                        "draft_id": did,
+                        "draft_revision": rev,
+                        "record_id": d_rec.get("record_id"),
+                        "action": d_rec.get("action"),
+                        "thread_id": d_dest.get("thread_id"),
+                        "status": "pending",
+                    }
+                )
+
+        chk = self.exported_checkpoint(guild_id=gid, forum_id=fid)
+        pending_outbox = int(chk.get("pending_outbox_count") or 0)
+
+        unres_rows = self._conn.execute(
+            """
+            SELECT observation_ref, title, reason, observed_at
+            FROM unresolved_topics
+            WHERE forum_id = ? AND resolved_thread_id IS NULL
+            ORDER BY ts_sort_key(observed_at) DESC
+            LIMIT ?
+            """,
+            (fid, eff_limit),
+        ).fetchall()
+        unresolved_items = [
+            {
+                "observation_ref": r["observation_ref"],
+                "title": r["title"],
+                "reason": r["reason"],
+                "observed_at": r["observed_at"],
+            }
+            for r in unres_rows
+        ]
+
+        fstatus = self.get_forum_status(guild_id=gid, forum_id=fid)
+        cov = fstatus.get("coverage") or {}
+        pending_histories = list((cov.get("pending") or [])[:eff_limit])
+        coverage_errors = list(cov.get("errors") or [])
+        pending_histories_count = int((fstatus.get("counts") or {}).get("topics_pending_history") or 0)
+        unresolved_count = int((fstatus.get("counts") or {}).get("unresolved_topics") or 0)
+
+        valid_pending_bundles = [b for b in pending_bundles if b.get("status") == "pending"]
+        reconcile_item = next(
+            (d for d in drafts_attention if d["status"] in ("staged", "in_discord_review")),
+            None,
+        )
+        recheck_item = next(
+            (d for d in drafts_attention if d["status"] in ("needs_review", "failed") or d["needs_recheck"]),
+            None,
+        )
+        filter_err = next(
+            (e for e in coverage_errors if isinstance(e, dict) and e.get("code") == "directory_filtered"),
+            None,
+        )
+
+        if active_review and active_review.get("mode") == "in_discord_review":
+            rd = active_review.get("review_draft") if isinstance(active_review.get("review_draft"), dict) else {}
+            next_action = {
+                "action": "complete_or_release_active_review",
+                "reason": rd.get("reason") or "in_discord_review",
+                "correlation_id": rd.get("draft_id"),
+                "thread_id": None,
+            }
+        elif pending_outbox > 0:
+            next_action = {
+                "action": "flush_pending_export_outbox",
+                "reason": "pending_outbox_entries",
+                "correlation_id": f"{gid}:{fid}:outbox",
+                "thread_id": None,
+            }
+        elif reconcile_item is not None:
+            next_action = {
+                "action": "reconcile_staged_draft",
+                "reason": reconcile_item.get("reason") or reconcile_item["status"],
+                "correlation_id": reconcile_item["draft_id"],
+                "thread_id": reconcile_item.get("thread_id"),
+            }
+        elif recheck_item is not None:
+            next_action = {
+                "action": "recheck_conflicted_draft",
+                "reason": recheck_item.get("reason") or recheck_item["status"],
+                "correlation_id": recheck_item["draft_id"],
+                "thread_id": recheck_item.get("thread_id"),
+            }
+        elif valid_pending_bundles:
+            first_b = valid_pending_bundles[0]
+            next_action = {
+                "action": "stage_pending_bundle",
+                "reason": "validated_bundle_ready",
+                "correlation_id": first_b["draft_id"],
+                "thread_id": first_b.get("thread_id"),
+            }
+        elif filter_err is not None:
+            next_action = {
+                "action": "clear_directory_filter",
+                "reason": str(filter_err.get("filter_state") or "directory_filtered"),
+                "correlation_id": f"{gid}:{fid}:filter",
+                "thread_id": None,
+            }
+        elif pending_histories_count > 0 or unresolved_count > 0:
+            first_tid = pending_histories[0].get("thread_id") if pending_histories else None
+            first_corr = first_tid or (unresolved_items[0]["observation_ref"] if unresolved_items else None)
+            next_action = {
+                "action": "resume_pending_histories",
+                "reason": "pending_histories_or_unresolved",
+                "correlation_id": first_corr,
+                "thread_id": first_tid,
+            }
+        else:
+            next_action = {
+                "action": "idle",
+                "reason": "no_attention_items",
+                "correlation_id": None,
+                "thread_id": None,
+            }
+
+        return {
+            "scope": {"guild_id": gid, "forum_id": fid},
+            "snapshot_id": meta["snapshot_id"],
+            "snapshot_revision": int(meta["snapshot_revision"]),
+            "cursor": {"stream_id": meta["stream_id"], "position": str(meta["cursor_seq"])},
+            "active_review": active_review,
+            "counts": {
+                "drafts_attention": len(drafts_attention),
+                "pending_bundles": len(valid_pending_bundles),
+                "invalid_bundles": sum(1 for b in pending_bundles if b.get("status") == "invalid_bundle"),
+                "pending_outbox": pending_outbox,
+                "pending_histories": pending_histories_count,
+                "unresolved_topics": unresolved_count,
+                "coverage_errors": len(coverage_errors),
+            },
+            "next_action": next_action,
+            "drafts_attention": drafts_attention,
+            "pending_bundles": pending_bundles,
+            "unresolved_topics": unresolved_items,
+            "pending_histories": pending_histories,
+            "coverage_errors": coverage_errors[:eff_limit],
+        }
 
     def get_topic_starter_message(self, thread_id: str) -> Optional[dict[str, Any]]:
         """Return the starter message row for a mirrored topic when known or deeply read."""

@@ -134,7 +134,7 @@ class ForumReader:
             )
         return bool(reqs), req_errors, req_complete
 
-    def _begin_run_metrics(self) -> tuple[float, dict[str, int], int]:
+    def _begin_run_metrics(self) -> tuple[float, dict[str, int], int, str]:
         t0 = time.perf_counter()
         snap_fn = getattr(self.provider, "metrics_snapshot", None)
         start_prov = dict(snap_fn()) if callable(snap_fn) else {}
@@ -142,17 +142,17 @@ class ForumReader:
             guild_id=self.profile.guild_id,
             forum_id=self.profile.forum_id,
         )
-        return t0, start_prov, start_seq
+        return t0, start_prov, start_seq, f"run-{uuid.uuid4().hex[:12]}"
 
     def _finish_run_metrics(
         self,
-        run_state: tuple[float, dict[str, int], int],
+        run_state: tuple[float, dict[str, int], int, str],
         *,
         reasons: Optional[list[str]] = None,
         fallback_pages: int = 0,
         extra_cache_hits: int = 0,
     ) -> dict[str, Any]:
-        t0, start_prov, start_seq = run_state
+        t0, start_prov, start_seq, correlation_id = run_state
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         snap_fn = getattr(self.provider, "metrics_snapshot", None)
         end_prov = dict(snap_fn()) if callable(snap_fn) else {}
@@ -161,7 +161,14 @@ class ForumReader:
             forum_id=self.profile.forum_id,
         )
         pages_delta = int(end_prov.get("pages_read", 0)) - int(start_prov.get("pages_read", 0))
+        changed_items = self.store.summarize_changes_since(
+            start_seq,
+            guild_id=self.profile.guild_id,
+            forum_id=self.profile.forum_id,
+            limit=25,
+        )
         return {
+            "correlation_id": correlation_id,
             "elapsed_ms": elapsed_ms,
             "desktop_reads": max(0, int(end_prov.get("desktop_reads", 0)) - int(start_prov.get("desktop_reads", 0))),
             "pages_read": max(fallback_pages, max(0, pages_delta)),
@@ -170,9 +177,22 @@ class ForumReader:
                 + max(0, int(extra_cache_hits))
             ),
             "changed_entities": max(0, int(end_seq) - int(start_seq)),
+            "changed_items": changed_items,
             "ui_actions": max(0, int(end_prov.get("ui_actions", 0)) - int(start_prov.get("ui_actions", 0))),
             "reasons": list(dict.fromkeys(r for r in (reasons or []) if r)),
         }
+
+    def _known_requirement_thread_ids(self) -> set[str]:
+        known: set[str] = set()
+        for source_refs in (
+            self.profile.requirement_refs,
+            self.store.get_requirement_references(self.profile.forum_id),
+        ):
+            for ref in source_refs or []:
+                tid = str(ref.get("thread_id") or "").strip() if isinstance(ref, dict) else ""
+                if tid and is_valid_discord_id(tid):
+                    known.add(tid)
+        return known
 
     def _sync_topic_starter_requirement(self, thread_id: str, *, history_complete: bool) -> bool:
         """Export the mirrored topic starter's form/body as a topic-bound requirement."""
@@ -665,6 +685,17 @@ class ForumReader:
                 "metrics": self._finish_run_metrics(run_state, reasons=["catalog_disabled"]),
             }
         topic = self.store.get_topic_status(thread_id)
+        if topic is None and thread_id in self._known_requirement_thread_ids():
+            res = self.refresh_guidance_only()
+            return {
+                **res,
+                "thread_id": thread_id,
+                "target_kind": "requirement_reference",
+                "threads_read": 0,
+                "topic_complete": bool(
+                    not res.get("paused") and res.get("requirements_complete") and not res.get("errors")
+                ),
+            }
         if topic is None or topic["forum_id"] != self.profile.forum_id:
             if allow_discover and topic is None:
                 return self.discover_topic(thread_id, refresh_requirements=True)

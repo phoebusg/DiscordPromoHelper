@@ -206,3 +206,17 @@
   - `.venv/bin/python -m unittest tests.test_forums tests.test_forum_target_refresh -q` -> **55 tests OK**.
   - `.venv/bin/python -m pytest tests/ --ignore=tests/test_channel_nav.py -q` -> **69 passed, 5 subtests passed**.
   - Verified unmodified external strict v1 consumer interop in an isolated temp dir covering `discover_topic`, automatic `topic-starter:<thread_id>` selection into target status & draft baseline, UI-decoration tolerance, and `needs_review` block with zero composer calls after a silent post-bundle starter edit.
+
+## Guidance-only refresh, local attention queue, bounded search & correlation metrics — 19 November 2026
+
+- **Guidance-thread routing & CLI `--guidance-only` (`src/forums/reader.py`, `src/forums/__main__.py`, `src/forums/dialog.py`)**:
+  - Updated `ForumReader.refresh_topic` to delegate known configured requirement-reference threads (not stored as `topics` rows) directly to `refresh_guidance_only()` instead of pausing with `topic_not_in_configured_mirror`.
+  - Added `refresh --guidance-only` CLI flag (rejecting conflicting `--thread`/`--discover`/`--backfill` combinations) and `ForumMirrorController.refresh_guidance_only()`.
+- **Pure read-only local attention queue & bounded queries (`src/forums/store.py`, `src/forums/dialog.py`, `src/forums/__main__.py`)**:
+  - Added `ForumStore.get_attention_queue` (inspecting persistent session state, scoped `drafts`/`receipts`, `exchange/{bundles,drafts}/`, `export_outbox`, `unresolved_topics`, and `coverage` pending/error entries to emit prioritized `next_action` guidance with durable correlation IDs), exposed via `python -m src.forums queue --profile ... [--limit N]`, `ForumMirrorController.get_attention_queue` / `format_attention_queue`, and Tkinter dialog `Queue` / `Discover URL/ID...` buttons.
+  - Added optional `limit`, `max_body_chars`, `counts`, `truncated`, `content_hash`, `body_chars`, and `body_truncated` to `ForumStore.search` (`search --limit 25 --max-body-chars 240`), preserving backward-compatible `None` defaults for programmatic callers.
+  - Added `--refresh-before-stage` option to `sync --stage-pending` and extended `metrics` with per-run `correlation_id` and compact `changed_items` summaries (`ForumStore.summarize_changes_since`, omitting raw bodies).
+  - Updated [docs/FORUM_EXCHANGE_V1.md](FORUM_EXCHANGE_V1.md) and [docs/FORUM_SUPPORT_PLAN.md](FORUM_SUPPORT_PLAN.md) with the additive `topic-starter:<thread_id>` convention and current CLI paths.
+- **Offline verification (live Discord intentionally untouched during active review hold `<PROFILE_01>`)**:
+  - Read-only CLI `queue --profile <PROFILE_01> --limit 5` and `search --profile <PROFILE_01> report --limit 2 --max-body-chars 80` inspected the local mirror cleanly without modifying `<PROFILE_01>.session.json`.
+  - Offline automated suites (`unittest`, `pytest`, and `<EXT_APP_01>` joint probe `<EXT_PROBE_01>`) passed on this revision with live Discord untouched under the active review hold.

@@ -36,7 +36,7 @@ When resolved, retain the local observation-to-thread mapping, reconcile repeate
 
 Message required keys: `entity_ref` (stable opaque string), `message_id` (string/null), `thread_id`, `author` (actor shape), `body` (string), `content_hash`, `revision`, `observed_at`, `remote_created_at` (string/null), `remote_edited_at` (string/null), `source_url` (string/null), `identity_verified` (boolean), `attachments` (array). With no remote ID, use an explicitly provisional `entity_ref`; do not merge messages just by author/time. Later reconciliation retains an alias. Optional `recognition` supplies method/confidence without rewriting source text.
 
-Requirement required keys: `requirement_id` (stable string), `source_entity_ref` (string/null), `source_url` (string/null), `body`, `content_hash`, `revision`, `observed_at`. Optional parsed checks supplement full source text.
+Requirement required keys: `requirement_id` (stable string), `source_entity_ref` (string/null), `source_url` (string/null), `body`, `content_hash`, `revision`, `observed_at`. Optional parsed checks supplement full source text. Per-topic starter templates use the additive `topic-starter:<thread_id>` ID convention bound to the topic's starter message via `source_entity_ref: "msg:<starter_message_id>"` (trailing UI timestamp/`(edited)` decorations stripped from normalized `body` while preserving raw source separately).
 
 Tag shape: `{ "tag_id": null, "name": "Example" }`, using a remote string ID when known. Attachment shape: `attachment_id` (string/null), `name`, `source_url` (string/null), `sha256` (string/null), `local_ref` (string/null). Null local data does not mean an attachment was archived.
 

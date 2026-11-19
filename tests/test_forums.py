@@ -5195,12 +5195,285 @@ class TestBackfillPaginationAndTopicFilters(unittest.TestCase):
                 self.assertFalse(g_res["paused"])
                 self.assertTrue(g_res["requirements_complete"])
                 m = g_res["metrics"]
-                for key in ("elapsed_ms", "desktop_reads", "pages_read", "cache_hits", "changed_entities", "ui_actions", "reasons"):
+                for key in ("correlation_id", "elapsed_ms", "desktop_reads", "pages_read", "cache_hits", "changed_entities", "changed_items", "ui_actions", "reasons"):
                     self.assertIn(key, m)
+                self.assertTrue(str(m["correlation_id"]).startswith("run-"))
                 self.assertGreaterEqual(m["changed_entities"], 1)
+                self.assertTrue(m["changed_items"])
+                self.assertNotIn("body", m["changed_items"][0])
+                self.assertIn("content_hash", m["changed_items"][0])
                 self.assertEqual(m["reasons"], ["ok"])
             finally:
                 store.close()
+
+    def test_bounded_search_attention_queue_and_sync_refresh(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from src.forums import __main__ as forums_cli
+        from src.forums.config import upsert_forum_profile
+        from src.forums.dialog import ForumMirrorController
+        from src.forums.exchange import canonical_record_digest
+        from src.forums.models import topic_starter_requirement_id
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profiles_path = tmp / "profiles.json"
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=True)
+            upsert_forum_profile(prof, profiles_path)
+            provider = FakeForumProvider()
+            provider.histories[THREAD_1] = TopicHistoryObservation(
+                topic=TopicObservation(
+                    forum_id=FORUM_ID,
+                    thread_id=THREAD_1,
+                    title="Alpha Outpost",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                    starter_message_id=THREAD_1,
+                    observed_guild_id=GUILD_ID,
+                    observed_parent_forum_id=FORUM_ID,
+                ),
+                messages=[
+                    MessageObservation(
+                        entity_ref=f"msg:{THREAD_1}",
+                        message_id=THREAD_1,
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                        body="Marker phrase long message body " + ("x" * 100),
+                        remote_created_at="2026-11-19T12:00:00Z",
+                    ),
+                    MessageObservation(
+                        entity_ref="msg:200000000000000109",
+                        message_id="200000000000000109",
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Responder"},
+                        body="Marker phrase second reply " + ("y" * 100),
+                        remote_created_at="2026-11-19T12:05:00Z",
+                    ),
+                ],
+                complete=True,
+            )
+
+            ctrl = ForumMirrorController(
+                profiles_path=profiles_path,
+                provider_factory=lambda _p: provider,
+                handoff_provider_factory=lambda: provider,
+            )
+            ctrl.select_profile(prof.profile_id)
+            sess_ctrl = ctrl.session_controller
+            g_res = ctrl.refresh_guidance_only(profile_id=prof.profile_id)
+            self.assertTrue(g_res["requirements_complete"])
+            self.assertTrue(ctrl.discover_topic(THREAD_1, profile_id=prof.profile_id)["discovered"])
+
+            # 1. Bounded search (method + CLI)
+            store = ForumStore(prof.db_path)
+            try:
+                bounded = store.search("Marker phrase", forum_id=FORUM_ID, limit=1, max_body_chars=20)
+                self.assertEqual(bounded["counts"]["messages"], 2)
+                self.assertTrue(bounded["truncated"])
+                self.assertEqual(len(bounded["messages"]), 1)
+                self.assertTrue(bounded["messages"][0]["body"].endswith("..."))
+                self.assertTrue(bounded["messages"][0]["body_truncated"])
+                self.assertGreater(bounded["messages"][0]["body_chars"], 100)
+                self.assertIn("content_hash", bounded["messages"][0])
+
+                unbounded = store.search("Marker phrase", forum_id=FORUM_ID)
+                self.assertEqual(len(unbounded["messages"]), 2)
+                self.assertFalse(unbounded["truncated"])
+                self.assertFalse(unbounded["messages"][0]["body_truncated"])
+
+                # 2. Verify all next_action priority transitions on get_attention_queue
+                # Initial clean state -> idle
+                q_idle = store.get_attention_queue(
+                    guild_id=GUILD_ID,
+                    forum_id=FORUM_ID,
+                    session_state=sess_ctrl.status(),
+                    exchange_dir=prof.exchange_dir,
+                )
+                self.assertEqual(q_idle["next_action"]["action"], "idle")
+
+                # Pending history / unresolved -> resume_pending_histories
+                cov_prev = store.get_coverage()
+                store.update_coverage(
+                    histories="partial",
+                    pending_known=[{"thread_id": THREAD_2, "reason": "history_unread", "resume_token": f"thread:{THREAD_2}"}],
+                )
+                q_hist = ctrl.get_attention_queue(profile_id=prof.profile_id)
+                self.assertEqual(q_hist["next_action"]["action"], "resume_pending_histories")
+
+                # Directory filtered error overrides resume_pending_histories -> clear_directory_filter
+                store.update_coverage(
+                    errors=[{"code": "directory_filtered", "message": "Filtered", "filter_state": "tag:Pending"}]
+                )
+                self.assertEqual(ctrl.get_attention_queue()["next_action"]["action"], "clear_directory_filter")
+                store.update_coverage(
+                    histories=cov_prev["histories"],
+                    pending_known=[],
+                    errors=[],
+                )
+
+                # Pending bundle & malformed bundle in exchange/bundles/ -> stage_pending_bundle + invalid_bundles count
+                snap = store.export_snapshot()
+                draft = validate_exchange_record({
+                    "schema": "draft.request.v1",
+                    "record_id": "drec-queue-1",
+                    "producer_id": "external-tool",
+                    "created_at": "2026-11-19T12:10:00Z",
+                    "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": provider.actor},
+                    "draft_id": "draft-queue-1",
+                    "revision": 1,
+                    "action": "reply_existing",
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1, "message_id": None, "source_url": build_discord_channel_url(GUILD_ID, THREAD_1)},
+                    "body": "Queue verification update",
+                    "title": None,
+                    "tags": [],
+                    "evidence": [],
+                    "baseline": {
+                        "snapshot_id": snap["snapshot_id"],
+                        "snapshot_revision": snap["revision"],
+                        "requirements": [
+                            {"requirement_id": r["requirement_id"], "revision": r["revision"], "content_hash": r["content_hash"]}
+                            for r in snap["requirements"]
+                        ],
+                        "message_content_hash": None,
+                    },
+                })
+                bdir = Path(prof.exchange_dir) / "bundles" / canonical_record_digest(draft)
+                bdir.mkdir(parents=True, exist_ok=True)
+                (bdir / "draft.request.json").write_text(json.dumps(draft), encoding="utf-8")
+                bad_bdir = Path(prof.exchange_dir) / "bundles" / ("0" * 64)
+                bad_bdir.mkdir(parents=True, exist_ok=True)
+                (bad_bdir / "draft.request.json").write_text("{corrupt", encoding="utf-8")
+
+                q_bnd = ctrl.get_attention_queue()
+                self.assertEqual(q_bnd["counts"]["pending_bundles"], 1)
+                self.assertEqual(q_bnd["counts"]["invalid_bundles"], 1)
+                self.assertEqual(q_bnd["next_action"]["action"], "stage_pending_bundle")
+                self.assertEqual(q_bnd["next_action"]["correlation_id"], "draft-queue-1")
+                formatted_q = ctrl.format_attention_queue(q_bnd)
+                self.assertIn("Next action: stage_pending_bundle", formatted_q)
+                self.assertIn("Invalid bundle", formatted_q)
+
+                # needs_review draft overrides pending bundle -> recheck_conflicted_draft
+                store.ingest_record(draft)
+                store.update_draft_status("draft-queue-1", 1, "needs_review", needs_recheck=True, recheck_reason="starter_edited")
+                q_recheck = ctrl.get_attention_queue()
+                self.assertEqual(q_recheck["next_action"]["action"], "recheck_conflicted_draft")
+                self.assertEqual(q_recheck["next_action"]["correlation_id"], "draft-queue-1")
+
+                # staged draft overrides recheck -> reconcile_staged_draft
+                store.update_draft_status("draft-queue-1", 1, "staged", needs_recheck=False, recheck_reason=None)
+                q_rec = ctrl.get_attention_queue()
+                self.assertEqual(q_rec["next_action"]["action"], "reconcile_staged_draft")
+
+                # Pending outbox overrides draft reconciliation -> flush_pending_export_outbox
+                with store._conn:
+                    store._conn.execute(
+                        """
+                        INSERT INTO export_outbox (
+                            scope_key, mode, record_id, rel_path, record_json,
+                            snapshot_revision, after_cursor_seq, target_cursor_seq, change_count, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (f"{GUILD_ID}:{FORUM_ID}", "delta", "chg-outbox-test", "changes/test.json", "{}", 1, 1, 2, 1, "2026-11-19T12:12:00Z"),
+                    )
+                self.assertEqual(ctrl.get_attention_queue()["next_action"]["action"], "flush_pending_export_outbox")
+
+                # Active review hold overrides everything -> complete_or_release_active_review
+                sess_ctrl.acquire_for_staging()
+                sess_ctrl.transition_staging_to_review("draft-queue-1", 1, reason="in_owner_review")
+                q_hold = ctrl.get_attention_queue()
+                self.assertEqual(q_hold["next_action"]["action"], "complete_or_release_active_review")
+                self.assertEqual(q_hold["next_action"]["correlation_id"], "draft-queue-1")
+                sess_ctrl.release_review()
+                with store._conn:
+                    store._conn.execute("DELETE FROM export_outbox WHERE record_id = 'chg-outbox-test'")
+                # Clean up synthetic bundle/draft for sync test
+                import shutil
+                shutil.rmtree(bad_bdir)
+                shutil.rmtree(bdir)
+                with store._conn:
+                    store._conn.execute("DELETE FROM drafts WHERE draft_id = 'draft-queue-1'")
+            finally:
+                store.close()
+
+            # 3. CLI `search --limit --max-body-chars`, `queue`, and `sync --stage-pending --refresh-before-stage`
+            s_buf = io.StringIO()
+            with redirect_stdout(s_buf):
+                rc_s = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "search", "--profile", prof.profile_id,
+                    "--limit", "1", "--max-body-chars", "15",
+                    "Marker phrase",
+                ])
+            self.assertEqual(rc_s, 0)
+            s_out = json.loads(s_buf.getvalue())
+            self.assertEqual(len(s_out["messages"]), 1)
+            self.assertTrue(s_out["truncated"])
+            self.assertTrue(s_out["messages"][0]["body_truncated"])
+
+            # Silently edit starter before CLI `sync --stage-pending --refresh-before-stage` -> needs_review, 0 stage calls
+            store2 = ForumStore(prof.db_path)
+            try:
+                snap2 = store2.export_snapshot()
+            finally:
+                store2.close()
+            draft_sync = validate_exchange_record({
+                "schema": "draft.request.v1",
+                "record_id": "drec-sync-refresh-1",
+                "producer_id": "external-tool",
+                "created_at": "2026-11-19T12:15:00Z",
+                "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": provider.actor},
+                "draft_id": "draft-sync-refresh-1",
+                "revision": 1,
+                "action": "reply_existing",
+                "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1, "message_id": None, "source_url": build_discord_channel_url(GUILD_ID, THREAD_1)},
+                "body": "Sync pre-stage refresh test",
+                "title": None,
+                "tags": [],
+                "evidence": [],
+                "baseline": {
+                    "snapshot_id": snap2["snapshot_id"],
+                    "snapshot_revision": snap2["revision"],
+                    "requirements": [
+                        {"requirement_id": r["requirement_id"], "revision": r["revision"], "content_hash": r["content_hash"]}
+                        for r in snap2["requirements"]
+                    ],
+                    "message_content_hash": None,
+                },
+            })
+            sync_bdir = Path(prof.exchange_dir) / "bundles" / canonical_record_digest(draft_sync)
+            sync_bdir.mkdir(parents=True, exist_ok=True)
+            (sync_bdir / "draft.request.json").write_text(json.dumps(draft_sync), encoding="utf-8")
+
+            provider.histories[THREAD_1].messages[0].body = "Modified starter after bundle creation"
+            provider.topic_pages = [
+                TopicListObservation(topics=[provider.histories[THREAD_1].topic], next_cursor=None, complete=True)
+            ]
+            sync_buf = io.StringIO()
+            with patch.object(forums_cli, "DesktopDiscordProvider", lambda: provider), \
+                 redirect_stdout(sync_buf):
+                rc_sync = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "sync", "--profile", prof.profile_id,
+                    "--provider", "desktop",
+                    "--stage-pending", "--refresh-before-stage",
+                ])
+            self.assertEqual(rc_sync, 0)
+            sync_out = json.loads(sync_buf.getvalue())
+            self.assertEqual(sync_out["staged"][0]["status"], "needs_review")
+            self.assertIn(topic_starter_requirement_id(THREAD_1), sync_out["staged"][0]["reason"])
+            self.assertEqual(provider.stage_calls, [])
+
+            q_buf = io.StringIO()
+            with patch.object(forums_cli, "DesktopDiscordProvider", side_effect=AssertionError("queue must not call Discord")), \
+                 redirect_stdout(q_buf):
+                rc_q = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "queue", "--profile", prof.profile_id, "--limit", "10",
+                ])
+            self.assertEqual(rc_q, 0)
+            q_cli_out = json.loads(q_buf.getvalue())
+            self.assertEqual(q_cli_out["next_action"]["action"], "recheck_conflicted_draft")
+            self.assertEqual(q_cli_out["next_action"]["correlation_id"], "draft-sync-refresh-1")
 
 
 if __name__ == "__main__":

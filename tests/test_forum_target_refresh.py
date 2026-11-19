@@ -234,3 +234,69 @@ class TestTargetRefresh(unittest.TestCase):
         self.assertEqual(f_status["counts"]["topics_deep_read"], 1)
         self.assertEqual(f_status["counts"]["topics_pending_history"], 1)
         self.assertIn("exported_checkpoint", f_status)
+
+    def test_guidance_thread_target_and_cli_guidance_only_refresh(self):
+        from contextlib import redirect_stderr
+        from src.forums.__main__ import build_parser, cmd_refresh
+        from src.forums.models import build_discord_channel_url
+        from src.forums.providers.base import RequirementObservation
+
+        guide_tid = "100000000000000089"
+        guide_url = build_discord_channel_url(self.profile.guild_id, guide_tid)
+        self.store.upsert_forum(
+            forum_id=FORUM_ID,
+            name=self.provider.forum.name,
+            source_url=self.provider.forum.source_url,
+            tags=self.provider.forum.tags,
+            guidelines_text=self.provider.forum.guidelines_text,
+        )
+        self.store.upsert_requirement(
+            requirement_id="guidance-fixture-ref",
+            forum_id=FORUM_ID,
+            body="Guidelines v1",
+            source_entity_ref=None,
+            source_url=guide_url,
+            complete=True,
+        )
+
+        updated_req = RequirementObservation(
+            requirement_id="guidance-fixture-ref",
+            forum_id=FORUM_ID,
+            body="Guidelines v2 updated",
+            source_entity_ref=None,
+            source_url=guide_url,
+            complete=True,
+        )
+        with patch.object(self.provider, "list_topics", side_effect=AssertionError("directory scan")), \
+             patch.object(self.provider, "read_topic", side_effect=AssertionError("not a mirrored topic")), \
+             patch.object(self.provider, "read_requirements", return_value=[updated_req]):
+            res = self.reader.refresh_topic(guide_tid)
+
+        self.assertFalse(res["paused"])
+        self.assertEqual(res["target_kind"], "requirement_reference")
+        self.assertTrue(res["requirements_complete"])
+        self.assertTrue(res["topic_complete"])
+        self.assertTrue(str(res["metrics"]["correlation_id"]).startswith("run-"))
+        self.assertEqual(len(res["metrics"]["changed_items"]), 1)
+        self.assertEqual(res["metrics"]["changed_items"][0]["entity_ref"], "guidance-fixture-ref")
+        self.assertNotIn("body", res["metrics"]["changed_items"][0])
+
+        # CLI --guidance-only works with --export and rejects incompatible mode flags
+        parser = build_parser()
+        with patch("src.forums.__main__._load_profile_or_exit", return_value=self.profile), \
+             patch("src.forums.__main__._select_provider", return_value=(self.provider, False)), \
+             patch.object(self.provider, "read_requirements", return_value=[updated_req]), \
+             redirect_stdout(io.StringIO()) as out:
+            rc = cmd_refresh(parser.parse_args(["refresh", "--profile", "fixture", "--provider", "seed", "--guidance-only", "--export"]))
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload["result"]["requirements_complete"])
+        self.assertTrue(payload["exported"])
+
+        for bad_args in (
+            ["refresh", "--profile", "fixture", "--guidance-only", "--thread", guide_tid],
+            ["refresh", "--profile", "fixture", "--guidance-only", "--backfill"],
+            ["refresh", "--profile", "fixture", "--guidance-only", "--thread", guide_tid, "--discover"],
+        ):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(cmd_refresh(parser.parse_args(bad_args)), 2)

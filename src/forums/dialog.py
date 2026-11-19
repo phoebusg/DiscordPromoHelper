@@ -9,12 +9,13 @@ from typing import Any, Callable, Optional
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
     _HAS_TK = True
 except Exception:  # pragma: no cover - headless Python builds without _tkinter
     tk = None  # type: ignore[assignment]
     filedialog = None  # type: ignore[assignment]
     messagebox = None  # type: ignore[assignment]
+    simpledialog = None  # type: ignore[assignment]
     ttk = None  # type: ignore[assignment]
     _HAS_TK = False
 
@@ -192,6 +193,92 @@ class ForumMirrorController:
             return result
         finally:
             store.close()
+
+    def refresh_guidance_only(
+        self,
+        *,
+        profile_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        prof = self.current_profile(profile_id)
+        if prof is None:
+            raise ValueError("No forum profile selected")
+        store = ForumStore(prof.db_path)
+        try:
+            provider = self.make_provider(prof)
+            reader = ForumReader(prof, store, provider, session_controller=self.session_controller)
+            result = reader.refresh_guidance_only()
+            if prof.exchange_dir and not result.get("paused"):
+                store.export_exchange_dir(
+                    prof.exchange_dir,
+                    guild_id=prof.guild_id,
+                    forum_id=prof.forum_id,
+                )
+            return result
+        finally:
+            store.close()
+
+    def get_attention_queue(
+        self,
+        *,
+        profile_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        prof = self.current_profile(profile_id)
+        if prof is None:
+            raise ValueError("No forum profile selected")
+        store = ForumStore(prof.db_path)
+        try:
+            return store.get_attention_queue(
+                guild_id=prof.guild_id,
+                forum_id=prof.forum_id,
+                session_state=self.session_controller.status(),
+                exchange_dir=prof.exchange_dir,
+                limit=limit,
+            )
+        finally:
+            store.close()
+
+    @staticmethod
+    def format_attention_queue(queue: dict[str, Any]) -> str:
+        nxt = queue.get("next_action") or {}
+        cnt = queue.get("counts") or {}
+        lines = [
+            f"Next action: {nxt.get('action')} ({nxt.get('reason') or '-'})",
+            f"Correlation ID: {nxt.get('correlation_id') or '-'} | Thread ID: {nxt.get('thread_id') or '-'}",
+        ]
+        ar = queue.get("active_review")
+        if ar:
+            rd = ar.get("review_draft") if isinstance(ar.get("review_draft"), dict) else {}
+            lines.append(
+                f"Active session hold: mode={ar.get('mode')} draft={rd.get('draft_id') or '-'} reason={rd.get('reason') or '-'}"
+            )
+        lines.append(
+            "Counts: "
+            + f"drafts_attention={cnt.get('drafts_attention', 0)}, "
+            + f"pending_bundles={cnt.get('pending_bundles', 0)}, "
+            + f"invalid_bundles={cnt.get('invalid_bundles', 0)}, "
+            + f"pending_outbox={cnt.get('pending_outbox', 0)}, "
+            + f"pending_histories={cnt.get('pending_histories', 0)}, "
+            + f"unresolved={cnt.get('unresolved_topics', 0)}, "
+            + f"errors={cnt.get('coverage_errors', 0)}"
+        )
+        for d in queue.get("drafts_attention", []):
+            lines.append(
+                f"- Draft {d.get('draft_id')}@r{d.get('draft_revision')} status={d.get('status')} thread={d.get('thread_id')} reason={d.get('reason') or '-'}"
+            )
+        for b in queue.get("pending_bundles", []):
+            if b.get("status") == "invalid_bundle":
+                lines.append(f"- Invalid bundle {b.get('path')}: {b.get('error')}")
+            else:
+                lines.append(
+                    f"- Pending bundle {b.get('draft_id')}@r{b.get('draft_revision')} thread={b.get('thread_id')} path={b.get('path')}"
+                )
+        for u in queue.get("unresolved_topics", []):
+            lines.append(f"- Unresolved {u.get('observation_ref')}: {u.get('title')} ({u.get('reason')})")
+        for e in queue.get("coverage_errors", []):
+            if isinstance(e, dict):
+                lines.append(f"- Error [{e.get('code')}]: {e.get('message')}")
+        return "\n".join(lines)
 
     def search(self, query: str) -> dict[str, Any]:
         prof = self.current_profile()
@@ -446,6 +533,8 @@ class ForumMirrorDialog(_TOPLEVEL_BASE):
 
         ttk.Button(top, text="Refresh Mirror", command=self._refresh_mirror).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="Refresh Topic", command=self._refresh_selected_topic).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Discover URL/ID...", command=self._discover_topic_prompt).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Queue", command=self._show_attention_queue).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="Load Draft JSON...", command=self._load_draft_file).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="Load Bundle Dir...", command=self._load_draft_bundle_dir).pack(side=tk.LEFT, padx=4)
 
@@ -716,6 +805,51 @@ class ForumMirrorDialog(_TOPLEVEL_BASE):
                 self.after(0, lambda err=str(exc): messagebox.showerror("Topic Refresh Error", err))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _discover_topic_prompt(self, target: Optional[str] = None) -> None:
+        prof = self._current_profile()
+        if prof is None:
+            return
+        raw_target = target if target is not None else simpledialog.askstring(
+            "Discover Topic",
+            "Enter Discord thread URL or ID:",
+            parent=self,
+        )
+        if not raw_target or not raw_target.strip():
+            return
+        cleaned = raw_target.strip()
+
+        def worker() -> None:
+            try:
+                res = self.controller.discover_topic(cleaned, profile_id=prof.profile_id)
+
+                def _finish() -> None:
+                    self._load_selected_profile()
+                    tid = res.get("thread_id")
+                    if tid and self.topics_tree.exists(tid):
+                        self.topics_tree.selection_set(tid)
+                    lines = [
+                        f"Discover target: {cleaned}",
+                        f"Discovered: {res.get('discovered')} | Paused: {res.get('paused')} | Reason: {res.get('reason') or 'ok'}",
+                        f"Thread ID: {tid or '-'} | Parent Forum: {res.get('observed_parent_forum_id') or '-'}",
+                        f"Metrics: {res.get('metrics')}",
+                    ]
+                    self._set_detail_text("\n".join(lines))
+
+                self.after(0, _finish)
+            except Exception as exc:
+                self.after(0, lambda err=str(exc): messagebox.showerror("Discover Error", err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_attention_queue(self) -> None:
+        if self._current_profile() is None:
+            return
+        try:
+            q = self.controller.get_attention_queue()
+            self._set_detail_text(self.controller.format_attention_queue(q))
+        except Exception as exc:
+            messagebox.showerror("Queue Error", str(exc))
 
     def _load_draft_file(self, path: Optional[str | Path] = None) -> Optional[dict[str, Any]]:
         selected = str(path) if path is not None else filedialog.askopenfilename(
