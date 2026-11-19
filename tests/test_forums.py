@@ -3856,5 +3856,320 @@ class TestPromotionRoutingAndDialogAndBenchmark(unittest.TestCase):
             self.assertLess(case["cached_ms"], case["cold_ms"], msg=case["name"])
 
 
+class TestAXExtractionAndReconcileHardening(unittest.TestCase):
+    def test_discord_snowflake_to_utc_iso(self):
+        from src.forums.models import discord_snowflake_to_utc_iso, is_valid_rfc3339_utc
+
+        ts = discord_snowflake_to_utc_iso("1300000000000000000")
+        self.assertIsNotNone(ts)
+        self.assertTrue(is_valid_rfc3339_utc(ts))
+        self.assertTrue(ts.startswith("2024-"))
+
+        self.assertIsNone(discord_snowflake_to_utc_iso("1"))
+        self.assertIsNone(discord_snowflake_to_utc_iso("not-an-id"))
+        self.assertIsNone(discord_snowflake_to_utc_iso(None))
+
+    def test_ax_message_content_dfs_headings_edited_and_snowflake_backfill(self):
+        from src.forums.models import discord_snowflake_to_utc_iso
+        from src.forums.providers import desktop as desktop_mod
+
+        class _FakeAX:
+            def __init__(
+                self,
+                role: str = "",
+                *,
+                title: str = "",
+                description: str = "",
+                value: str = "",
+                url: str = "",
+                dom_id: str = "",
+                children: Optional[list[Any]] = None,
+            ) -> None:
+                self.attrs: dict[str, Any] = {
+                    "AXRole": role,
+                    "AXTitle": title,
+                    "AXDescription": description,
+                    "AXValue": value,
+                    "AXURL": url,
+                    "AXDOMIdentifier": dom_id,
+                    "AXChildren": list(children or []),
+                    "AXParent": None,
+                }
+                for ch in self.attrs["AXChildren"]:
+                    ch.attrs["AXParent"] = self
+
+        msg_id = "1300000000000000000"
+        msg_node = _FakeAX(
+            "AXGroup",
+            dom_id=f"chat-messages-{THREAD_1}-{msg_id}",
+            children=[
+                _FakeAX(
+                    "AXGroup",
+                    dom_id=f"message-username-{msg_id}",
+                    children=[_FakeAX("AXButton", title="ExampleAuthor")],
+                ),
+                _FakeAX(
+                    "AXGroup",
+                    dom_id=f"message-content-{msg_id}",
+                    children=[
+                        _FakeAX(
+                            "AXHeading",
+                            value="2",
+                            children=[
+                                _FakeAX(
+                                    "AXGroup",
+                                    children=[_FakeAX("AXStaticText", value="Section Header")],
+                                )
+                            ],
+                        ),
+                        _FakeAX(
+                            "AXList",
+                            children=[
+                                _FakeAX(
+                                    "AXGroup",
+                                    children=[_FakeAX("AXStaticText", value="First bullet")],
+                                ),
+                                _FakeAX(
+                                    "AXGroup",
+                                    children=[_FakeAX("AXStaticText", value="Second bullet")],
+                                ),
+                            ],
+                        ),
+                        _FakeAX("AXHeading", value="3", title="Fallback Heading"),
+                        _FakeAX(
+                            "AXGroup",
+                            dom_id=f"message-timestamp-{msg_id}",
+                            children=[
+                                _FakeAX("AXStaticText", value="(edited)"),
+                                _FakeAX("AXStaticText", value="Wednesday, November 18, 2026"),
+                            ],
+                        ),
+                        _FakeAX("AXStaticText", value="(edited)"),
+                    ],
+                ),
+                _FakeAX("AXGroup", dom_id=f"message-accessories-{msg_id}"),
+            ],
+        )
+        msg_list = _FakeAX("AXList", description="Messages in Topic One", children=[msg_node])
+        provider = desktop_mod.DesktopDiscordProvider()
+        with patch.object(
+            desktop_mod,
+            "_ax_attr",
+            side_effect=lambda el, attr: el.attrs.get(attr) if hasattr(el, "attrs") else None,
+        ):
+            _, _, msgs = provider._parse_messages_from_ax_list(msg_list, GUILD_ID, THREAD_1)
+
+        obs = msgs[msg_id]
+        expected_lines = ["Section Header", "First bullet", "Second bullet", "Fallback Heading"]
+        self.assertEqual(obs.body, "\n".join(expected_lines))
+        self.assertTrue(obs.explicit_edited_marker)
+        self.assertEqual(obs.remote_created_at, discord_snowflake_to_utc_iso(msg_id))
+
+        # Repeated parse must produce identical body and deterministic order; Store backfills remote_created_at cleanly.
+        with tempfile.TemporaryDirectory() as td:
+            store = ForumStore(Path(td) / "mirror.sqlite3")
+            try:
+                store.ensure_scope(GUILD_ID, FORUM_ID, snapshot_id="snap-ax")
+                store.upsert_forum(forum_id=FORUM_ID, name="Forum")
+                store.upsert_topic(thread_id=THREAD_1, forum_id=FORUM_ID, title="Topic One")
+                chg1 = store.upsert_message(
+                    entity_ref=obs.entity_ref,
+                    message_id=obs.message_id,
+                    thread_id=THREAD_1,
+                    author=obs.author,
+                    body=obs.body,
+                    attachments=obs.attachments,
+                )
+                self.assertIsNotNone(chg1)
+                self.assertIsNone(store.get_topic_status(THREAD_1)["latest_messages"][0]["remote_created_at"])
+
+                chg_backfill = store.upsert_message(
+                    entity_ref=obs.entity_ref,
+                    message_id=obs.message_id,
+                    thread_id=THREAD_1,
+                    author=obs.author,
+                    body=obs.body,
+                    remote_created_at=obs.remote_created_at,
+                    attachments=obs.attachments,
+                )
+                self.assertIsNone(chg_backfill)
+                self.assertEqual(
+                    store.get_topic_status(THREAD_1)["latest_messages"][0]["remote_created_at"],
+                    obs.remote_created_at,
+                )
+            finally:
+                store.close()
+
+    def test_observe_submission_scope_actor_check_and_fallback_message_url(self):
+        from src.forums.providers import desktop as desktop_mod
+
+        provider = desktop_mod.DesktopDiscordProvider()
+        session = SessionDescription(
+            actor={"user_id": None, "label": "CurrentUser"},
+            app_name="Discord",
+            window_title="Topic One",
+            window_bbox=(0, 0, 1280, 800),
+            capabilities={"can_read_semantic": True, "can_read_ocr": False},
+        )
+        draft_req = {
+            "draft_id": "d-obs-1",
+            "action": "reply_existing",
+            "created_at": "2026-11-18T10:00:00Z",
+            "destination": {
+                "guild_id": GUILD_ID,
+                "forum_id": FORUM_ID,
+                "thread_id": THREAD_1,
+            },
+            "body": "Consolidated summary report.",
+            "evidence": [],
+        }
+
+        with patch.object(provider, "describe_session", return_value=session):
+            mismatch = provider.observe_submission(
+                draft_req,
+                {"scope": {"actor": {"user_id": None, "label": "OtherUser"}}},
+            )
+            self.assertEqual(mismatch.status, "unresolved")
+            self.assertEqual(mismatch.reason, "actor_mismatch")
+
+            hist = TopicHistoryObservation(
+                topic=TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_1, title="Topic One"),
+                messages=[
+                    MessageObservation(
+                        thread_id=THREAD_1,
+                        entity_ref="msg:1300000000000000123",
+                        message_id="1300000000000000123",
+                        author={"user_id": None, "label": "CurrentUser"},
+                        body="Consolidated summary report.",
+                        remote_created_at="2026-11-18T10:05:00Z",
+                        source_url=None,
+                    )
+                ],
+                complete=True,
+            )
+            with patch.object(provider, "read_topic", return_value=hist):
+                matched = provider.observe_submission(
+                    draft_req,
+                    {"scope": {"actor": {"user_id": None, "label": "CurrentUser"}}},
+                )
+        self.assertEqual(matched.status, "submission_observed")
+        self.assertEqual(matched.message_id, "1300000000000000123")
+        self.assertEqual(
+            matched.message_url,
+            build_discord_channel_url(GUILD_ID, THREAD_1, "1300000000000000123"),
+        )
+
+    def test_reconcile_preserves_user_confirmed_and_upgrades_when_observed(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=True)
+            provider = FakeForumProvider()
+            topic_obs = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_1,
+                title="Topic One",
+                source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                starter_message_id="200000000000000001",
+            )
+            provider.topic_pages = [TopicListObservation(topics=[topic_obs], complete=True)]
+            provider.histories[THREAD_1] = TopicHistoryObservation(
+                topic=topic_obs,
+                messages=[
+                    MessageObservation(
+                        entity_ref="msg:200000000000000001",
+                        message_id="200000000000000001",
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Author"},
+                        body="Starter text",
+                        remote_created_at="2026-11-18T09:00:00Z",
+                    )
+                ],
+                complete=True,
+            )
+
+            store = ForumStore(prof.db_path)
+            try:
+                sess = SessionController(state_path=tmp / "session.json")
+                ForumReader(prof, store, provider, session_controller=sess).incremental_refresh()
+                snap = store.export_snapshot()
+                draft = validate_exchange_record(
+                    {
+                        "schema": "draft.request.v1",
+                        "record_id": "draft-rec-confirm-1",
+                        "producer_id": "external-tool",
+                        "created_at": "2026-11-18T10:00:00Z",
+                        "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": provider.actor},
+                        "draft_id": "confirm-keep-1",
+                        "revision": 1,
+                        "action": "reply_existing",
+                        "destination": {
+                            "guild_id": GUILD_ID,
+                            "forum_id": FORUM_ID,
+                            "thread_id": THREAD_1,
+                            "message_id": None,
+                            "source_url": build_discord_channel_url(GUILD_ID, THREAD_1),
+                        },
+                        "body": "Confirmed text-only observation.",
+                        "title": None,
+                        "tags": [],
+                        "evidence": [],
+                        "baseline": {
+                            "snapshot_id": snap["snapshot_id"],
+                            "snapshot_revision": snap["revision"],
+                            "requirements": [
+                                {
+                                    "requirement_id": r["requirement_id"],
+                                    "revision": r["revision"],
+                                    "content_hash": r["content_hash"],
+                                }
+                                for r in snap["requirements"]
+                            ],
+                            "message_content_hash": None,
+                        },
+                    }
+                )
+                mgr = HandoffManager(store, provider, session_controller=sess, exchange_dir=prof.exchange_dir)
+                staged = mgr.stage_draft_request(draft, prof, source_kind="external")
+                self.assertEqual(staged["status"], "staged")
+
+                confirmed = mgr.reconcile_submission("confirm-keep-1", draft_revision=1, profile=prof, user_confirmed=True)
+                self.assertEqual(confirmed["status"], "user_confirmed_submitted")
+                self.assertFalse(sess.is_review_active())
+
+                # Subsequent non-confirmed reconcile before remote message visibility preserves user_confirmed_submitted
+                provider.next_submission = SubmissionObservation(
+                    status="unresolved",
+                    observed_actor=provider.actor,
+                    reason="matching_submission_not_observed_yet",
+                )
+                kept = mgr.reconcile_submission("confirm-keep-1", draft_revision=1, profile=prof, user_confirmed=False)
+                self.assertEqual(kept["status"], "user_confirmed_submitted")
+                self.assertEqual(kept["receipt_id"], confirmed["receipt_id"])
+
+                # Once observed, it upgrades cleanly to submission_observed and remains sticky
+                provider.next_submission = SubmissionObservation(
+                    status="submission_observed",
+                    observed_actor=provider.actor,
+                    message_id="200000000000000055",
+                    message_url=build_discord_channel_url(GUILD_ID, THREAD_1, "200000000000000055"),
+                    observed_body="Confirmed text-only observation.",
+                    reason="matched_posted_message",
+                )
+                upgraded = mgr.reconcile_submission("confirm-keep-1", draft_revision=1, profile=prof, user_confirmed=False)
+                self.assertEqual(upgraded["status"], "submission_observed")
+                self.assertEqual(upgraded["message_id"], "200000000000000055")
+
+                # Re-reconcile after submission_observed stays idempotent
+                provider.next_submission = SubmissionObservation(
+                    status="unresolved",
+                    observed_actor=provider.actor,
+                    reason="should_not_overwrite_observed",
+                )
+                sticky = mgr.reconcile_submission("confirm-keep-1", draft_revision=1, profile=prof, user_confirmed=False)
+                self.assertEqual(sticky["receipt_id"], upgraded["receipt_id"])
+            finally:
+                store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,9 @@ import hashlib
 import re
 from typing import Any, Optional
 
+DISCORD_EPOCH_MS = 1420070400000
+_MAX_DISCORD_TS_MS = 4102444800000
+
 _DISCORD_CHANNEL_URL_RE = re.compile(
     r"(?:https://(?:(?:ptb|canary)\.)?discord\.com|discord://-)/channels/(\d+)/(\d+)(?:/(\d+))?"
 )
@@ -78,6 +81,23 @@ def is_valid_rfc3339_utc(val: Any) -> bool:
         return True
     except ValueError:
         return False
+
+
+def discord_snowflake_to_utc_iso(snowflake: Optional[str]) -> Optional[str]:
+    """Derive RFC 3339 UTC timestamp from a canonical Discord Snowflake ID, if plausible."""
+    if not is_valid_discord_id(snowflake):
+        return None
+    val = int(snowflake)
+    if val < (1 << 22):
+        return None
+    ts_ms = (val >> 22) + DISCORD_EPOCH_MS
+    if ts_ms < DISCORD_EPOCH_MS or ts_ms > _MAX_DISCORD_TS_MS:
+        return None
+    return (
+        datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def parse_discord_channel_url(url: Optional[str]) -> Optional[tuple[str, str, Optional[str]]]:

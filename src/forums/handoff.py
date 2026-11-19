@@ -710,6 +710,14 @@ class HandoffManager:
         prior_receipts = [
             r for r in self.store.list_receipts(draft_id=draft_id) if int(r["draft_revision"]) == rev
         ]
+        prior_observed = next(
+            (r for r in reversed(prior_receipts) if r.get("status") == "submission_observed"),
+            None,
+        )
+        prior_confirmed = next(
+            (r for r in reversed(prior_receipts) if r.get("status") == "user_confirmed_submitted"),
+            None,
+        )
         latest_receipt = dict(prior_receipts[-1]) if prior_receipts else {}
         review_info = self.session.active_review_info() or {}
         if review_info.get("draft_id") == draft_id and int(review_info.get("draft_revision") or -1) == rev:
@@ -762,6 +770,9 @@ class HandoffManager:
                 exchange_dir=ex_dir,
             )
 
+        if not user_confirmed and prior_observed is not None:
+            return prior_observed
+
         sub_obs = self.provider.observe_submission(draft_record, latest_receipt)
         if sub_obs.status == "submission_observed" and sub_obs.message_id:
             obs_hash = (
@@ -789,6 +800,10 @@ class HandoffManager:
                 reason=sub_obs.reason,
                 exchange_dir=ex_dir,
             )
+
+        if prior_confirmed is not None:
+            self.session.release_review()
+            return prior_confirmed
 
         # Ambiguous/unconfirmed submission stays unresolved without duplicate staging
         return self._make_receipt(

@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from ..models import (
     build_discord_channel_url,
+    discord_snowflake_to_utc_iso,
     normalize_text_for_hash,
     parse_discord_channel_url,
     utc_now_iso,
@@ -825,6 +826,63 @@ class DesktopDiscordProvider(DiscordViewProvider):
             source_method="unavailable",
         )
 
+    @staticmethod
+    def _extract_message_content_ax(
+        content_elem: Any,
+        *,
+        max_nodes: int = 2000,
+        max_depth: int = 16,
+    ) -> tuple[list[str], list[str], bool]:
+        """Extract text blocks, links, and edited state from a message-content AX node in DFS document order."""
+        body_parts: list[str] = []
+        links: list[str] = []
+        seen_links: set[str] = set()
+        edited = False
+        visited = 0
+
+        def _visit(elem: Any, depth: int) -> None:
+            nonlocal edited, visited
+            if visited >= max_nodes or depth > max_depth:
+                return
+            visited += 1
+
+            dom_id = str(_ax_attr(elem, "AXDOMIdentifier") or "")
+            if dom_id.startswith("message-timestamp-"):
+                edited = True
+                return
+
+            role = str(_ax_attr(elem, "AXRole") or "")
+            if role == "AXLink":
+                url = str(_ax_attr(elem, "AXURL") or "").strip()
+                if url and url not in seen_links:
+                    seen_links.add(url)
+                    links.append(url)
+            elif role == "AXStaticText":
+                val = str(_ax_attr(elem, "AXValue") or _ax_attr(elem, "AXTitle") or "").strip()
+                if val in ("edited", "(edited)"):
+                    edited = True
+                    return
+                if val and val not in ("(", ")"):
+                    body_parts.append(val)
+                return
+            elif role == "AXHeading":
+                # Chromium sets AXHeading.AXValue to the heading level ("1".."6");
+                # traverse children for heading text and only fall back to AXTitle if empty.
+                before_len = len(body_parts)
+                for child in (_ax_attr(elem, "AXChildren") or []):
+                    _visit(child, depth + 1)
+                if len(body_parts) == before_len:
+                    title_val = str(_ax_attr(elem, "AXTitle") or "").strip()
+                    if title_val and title_val not in ("(", ")", "edited", "(edited)"):
+                        body_parts.append(title_val)
+                return
+
+            for child in (_ax_attr(elem, "AXChildren") or []):
+                _visit(child, depth + 1)
+
+        _visit(content_elem, 0)
+        return body_parts, links, edited
+
     def _parse_messages_from_ax_list(
         self,
         chosen_list: Any,
@@ -882,17 +940,11 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             break
                 elif s["dom_id"] == f"message-content-{mid}":
                     entry["has_content_node"] = True
-                    c_sub = _walk_ax_tree(s["element"], max_nodes=180, max_depth=10)
-                    for c in c_sub:
-                        if c["role"] == "AXStaticText" and c["value"] == "edited":
-                            entry["edited"] = True
-                            continue
-                        if c["role"] in ("AXStaticText", "AXHeading"):
-                            val = (c["value"] or c["title"]).strip()
-                            if val and val not in ("(", ")"):
-                                entry["body_parts"].append(val)
-                        elif c["role"] == "AXLink" and c["url"]:
-                            entry["links"].append(c["url"])
+                    c_parts, c_links, c_edited = self._extract_message_content_ax(s["element"])
+                    entry["body_parts"].extend(c_parts)
+                    entry["links"].extend(c_links)
+                    if c_edited:
+                        entry["edited"] = True
                 elif s["dom_id"] == f"message-timestamp-{mid}":
                     t_sub = _walk_ax_tree(s["element"], max_nodes=15, max_depth=4)
                     for t in t_sub:
@@ -953,6 +1005,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 message_id=mid,
                 author={"user_id": None, "label": ent["author"] or "Unknown"},
                 body=body,
+                remote_created_at=discord_snowflake_to_utc_iso(mid),
                 source_url=build_discord_channel_url(guild_id, thread_id, mid),
                 identity_verified=False,
                 attachments=obs_attachments,
@@ -1823,7 +1876,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 reason="; ".join(e["code"] for e in session.errors),
             )
 
-        receipt_actor = receipt.get("actor")
+        receipt_actor = receipt.get("actor") or (receipt.get("scope") or {}).get("actor")
         if receipt_actor and not self._actors_compatible(receipt_actor, session.actor):
             return SubmissionObservation(
                 status="unresolved",
@@ -1903,7 +1956,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     status="submission_observed",
                     observed_actor=session.actor,
                     message_id=target_msg.message_id,
-                    message_url=target_msg.source_url or build_discord_channel_url(guild_id, thread_id),
+                    message_url=target_msg.source_url or build_discord_channel_url(guild_id, thread_id, target_msg.message_id),
                     observed_body=target_msg.body,
                     reason="edited_target_message_observed",
                 )
@@ -1962,7 +2015,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 status="submission_observed",
                 observed_actor=session.actor,
                 message_id=top_msg.message_id,
-                message_url=top_msg.source_url or build_discord_channel_url(guild_id, thread_id),
+                message_url=top_msg.source_url or build_discord_channel_url(guild_id, thread_id, top_msg.message_id),
                 observed_body=top_msg.body,
                 reason="matched_posted_message",
             )

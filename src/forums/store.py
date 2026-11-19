@@ -1106,10 +1106,21 @@ class ForumStore:
             atts_changed = atts_norm is not None and old_atts != atts_norm
 
             if not body_changed and not atts_changed:
-                if eff_mid and not row["message_id"]:
+                new_mid = eff_mid if (eff_mid and not row["message_id"]) else row["message_id"]
+                new_url = (eff_url or row["source_url"]) if (eff_mid and not row["message_id"]) else row["source_url"]
+                new_verified = int(bool(identity_verified)) if (eff_mid and not row["message_id"]) else row["identity_verified"]
+                new_rc = remote_created_at if (remote_created_at and not row["remote_created_at"]) else row["remote_created_at"]
+                if (
+                    new_mid != row["message_id"]
+                    or new_rc != row["remote_created_at"]
+                ):
                     self._conn.execute(
-                        "UPDATE messages SET message_id = ?, source_url = ?, identity_verified = ? WHERE entity_ref = ?",
-                        (eff_mid, eff_url or row["source_url"], int(bool(identity_verified)), resolved_ref),
+                        """
+                        UPDATE messages
+                        SET message_id = ?, source_url = ?, identity_verified = ?, remote_created_at = ?
+                        WHERE entity_ref = ?
+                        """,
+                        (new_mid, new_url, new_verified, new_rc, resolved_ref),
                     )
                 return None
 
@@ -1118,6 +1129,8 @@ class ForumStore:
             entity["revision"] = rev
             entity["message_id"] = eff_mid
             entity["source_url"] = eff_url or row["source_url"]
+            entity["remote_created_at"] = remote_created_at or row["remote_created_at"]
+            entity["remote_edited_at"] = remote_edited_at or row["remote_edited_at"]
             prev_rec = json.loads(row["recognition_json"]) if row["recognition_json"] else None
 
             if body_changed:
