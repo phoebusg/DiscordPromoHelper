@@ -4171,5 +4171,326 @@ class TestAXExtractionAndReconcileHardening(unittest.TestCase):
                 store.close()
 
 
+class TestBackfillPaginationAndTopicFilters(unittest.TestCase):
+    def test_initial_backfill_skips_already_deep_read_unchanged_topics(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=False)
+            provider = FakeForumProvider()
+            t1 = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_1,
+                title="Topic 1",
+                source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                remote_last_activity_at="2026-11-18T09:00:00Z",
+                starter_message_id="200000000000000001",
+            )
+            t2 = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_2,
+                title="Topic 2",
+                source_url=build_discord_channel_url(GUILD_ID, THREAD_2),
+                remote_last_activity_at="2026-11-18T09:05:00Z",
+                starter_message_id="200000000000000002",
+            )
+            t_changed = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_A,
+                title="Topic A",
+                source_url=build_discord_channel_url(GUILD_ID, THREAD_A),
+                remote_last_activity_at="2026-11-18T08:00:00Z",
+                starter_message_id="200000000000000003",
+            )
+            provider.topic_pages = [TopicListObservation(topics=[t1, t_changed], next_cursor="1", complete=False)]
+            provider.histories[THREAD_1] = TopicHistoryObservation(
+                topic=t1,
+                messages=[
+                    MessageObservation(
+                        entity_ref="msg:200000000000000001",
+                        message_id="200000000000000001",
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                        body="Topic 1 body",
+                    )
+                ],
+                complete=True,
+            )
+            provider.histories[THREAD_A] = TopicHistoryObservation(
+                topic=t_changed,
+                messages=[
+                    MessageObservation(
+                        entity_ref="msg:200000000000000003",
+                        message_id="200000000000000003",
+                        thread_id=THREAD_A,
+                        author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                        body="Topic A body",
+                    )
+                ],
+                complete=True,
+            )
+
+            store = ForumStore(prof.db_path)
+            try:
+                reader = ForumReader(prof, store, provider)
+                # Page 1 read with budget=2 covers THREAD_1 and THREAD_A, leaving cursor='1'
+                res1 = reader.initial_backfill(max_topics_per_run=2)
+                self.assertEqual(res1["threads_read"], 2)
+
+                # Now page 2 adds THREAD_2; THREAD_1 is unchanged, THREAD_A has newer remote activity
+                t_changed_v2 = TopicObservation(
+                    forum_id=FORUM_ID,
+                    thread_id=THREAD_A,
+                    title="Topic A",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_A),
+                    remote_last_activity_at="2026-11-18T10:00:00Z",
+                    starter_message_id="200000000000000003",
+                )
+                provider.topic_pages = [
+                    TopicListObservation(topics=[t1, t_changed], next_cursor="1", complete=False),
+                    TopicListObservation(topics=[t1, t_changed_v2, t2], next_cursor=None, complete=True),
+                ]
+                provider.histories[THREAD_2] = TopicHistoryObservation(
+                    topic=t2,
+                    messages=[
+                        MessageObservation(
+                            entity_ref="msg:200000000000000002",
+                            message_id="200000000000000002",
+                            thread_id=THREAD_2,
+                            author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                            body="Topic 2 body",
+                        )
+                    ],
+                    complete=True,
+                )
+
+                read_calls: list[str] = []
+                orig_read = provider.read_topic
+
+                def spy_read(gid, fid, tid, cursor=None):
+                    read_calls.append(tid)
+                    return orig_read(gid, fid, tid, cursor=cursor)
+
+                with patch.object(provider, "read_topic", side_effect=spy_read):
+                    res2 = reader.initial_backfill(max_topics_per_run=5)
+
+                self.assertEqual(res2["coverage"]["topics"], "complete")
+                self.assertEqual(res2["coverage"]["histories"], "complete")
+                self.assertNotIn(THREAD_1, read_calls)
+                self.assertIn(THREAD_2, read_calls)
+                self.assertIn(THREAD_A, read_calls)
+            finally:
+                store.close()
+
+    def test_desktop_list_topics_navigates_wrong_forum_seeks_deep_and_never_false_completes(self):
+        from src.forums.providers import desktop as desktop_mod
+
+        provider = desktop_mod.DesktopDiscordProvider()
+        other_forum_session = SessionDescription(
+            actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+            app_name="Discord",
+            window_title="#other-forum - Discord",
+            window_bbox=(0, 0, 1280, 800),
+            current_url=build_discord_channel_url(GUILD_ID, "999999999999999999"),
+            capabilities={"can_read_semantic": True, "can_read_ocr": True},
+        )
+        all_cards = [
+            TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=str(400000000000000000 + i),
+                title=f"Directory Post {i}",
+                source_url=build_discord_channel_url(GUILD_ID, str(400000000000000000 + i)),
+                source_method="accessibility",
+            )
+            for i in range(60)
+        ]
+        scroll_pos = {"idx": 0}
+        list_sentinel = object()
+
+        def fake_extract(_nodes, _gid, _fid):
+            start = scroll_pos["idx"]
+            return all_cards[start : min(60, start + 6)], [], list_sentinel
+
+        def fake_scroll(_x, _y, delta_lines):
+            if delta_lines > 0:
+                scroll_pos["idx"] = max(0, scroll_pos["idx"] - 8)
+            else:
+                # Deliberately small step (3 items/scroll) so seeking past 45 exceeds 15 scrolls
+                scroll_pos["idx"] = min(54, scroll_pos["idx"] + 3)
+            return True
+
+        fake_win_nodes = [{"role": "AXButton", "description": "Post 0", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()}]
+        with patch.object(provider, "describe_session", return_value=other_forum_session), \
+             patch.object(provider, "_get_ax_window", return_value=object()), \
+             patch.object(provider, "navigate_to_url", return_value=True) as mock_nav, \
+             patch.object(provider, "_extract_post_cards_and_links", side_effect=fake_extract), \
+             patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_win_nodes), \
+             patch.object(desktop_mod, "_ax_bounds", return_value=(100.0, 150.0, 360.0, 600.0)), \
+             patch.object(desktop_mod, "_scroll_at_point", side_effect=fake_scroll), \
+             patch.object(desktop_mod.time, "sleep"):
+            # 1. Even with 'Post 0' on screen, wrong forum URL triggers navigate_to_url when cursor=None
+            page1 = provider.list_topics(GUILD_ID, FORUM_ID, limit=10)
+            mock_nav.assert_called_once_with(build_discord_channel_url(GUILD_ID, FORUM_ID))
+            self.assertEqual(len(page1.topics), 10)
+            self.assertFalse(page1.complete)
+
+            # 2. Seeking past deep anchor (index 45 = >15 scroll steps) succeeds instead of aborting or returning complete=True
+            scroll_pos["idx"] = 0
+            deep_anchor = f"dirscroll:{all_cards[45].thread_id}"
+            page_deep = provider.list_topics(GUILD_ID, FORUM_ID, cursor=deep_anchor, limit=25)
+            self.assertEqual([t.thread_id for t in page_deep.topics], [t.thread_id for t in all_cards[46:]])
+            self.assertTrue(page_deep.complete)
+
+            # 3. Exhausting seek steps on a missing anchor returns complete=False (never false complete=True)
+            scroll_pos["idx"] = 0
+            fake_inf_extract = lambda _n, _g, _f: (all_cards[:6], [], list_sentinel)
+            with patch.object(provider, "_extract_post_cards_and_links", side_effect=fake_inf_extract):
+                # Force monotonic card stream that never contains missing anchor and never hits bottom
+                step_counter = {"n": 0}
+                def sliding_never_matching(_n, _g, _f):
+                    base = step_counter["n"] * 2
+                    step_counter["n"] += 1
+                    batch = [
+                        TopicObservation(
+                            forum_id=FORUM_ID,
+                            thread_id=str(500000000000000000 + base + k),
+                            title=f"Moving {base + k}",
+                            source_url=build_discord_channel_url(GUILD_ID, str(500000000000000000 + base + k)),
+                        )
+                        for k in range(3)
+                    ]
+                    return batch, [], list_sentinel
+                with patch.object(provider, "_extract_post_cards_and_links", side_effect=sliding_never_matching):
+                    page_miss = provider.list_topics(GUILD_ID, FORUM_ID, cursor="dirscroll:999999999999999999", limit=20)
+            self.assertEqual(page_miss.topics, [])
+            self.assertFalse(page_miss.complete)
+            self.assertEqual(page_miss.next_cursor, "dirscroll:999999999999999999")
+
+            # 4. Active forum search or tag filter never falsely marks directory complete
+            filtered_card = [all_cards[0]]
+            search_nodes = [
+                {"role": "AXButton", "description": "Post Directory Post 0", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()},
+                {"role": "AXHeading", "description": "", "title": '1 post with "Directory Post 0"', "value": "2", "url": "", "dom_id": "", "depth": 1, "element": object()},
+            ]
+            with patch.object(provider, "_extract_post_cards_and_links", return_value=(filtered_card, [], list_sentinel)), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=search_nodes):
+                filtered_res = provider.list_topics(GUILD_ID, FORUM_ID, limit=10)
+            self.assertEqual(len(filtered_res.topics), 1)
+            self.assertFalse(filtered_res.complete)
+            self.assertIsNone(filtered_res.next_cursor)
+            self.assertEqual(filtered_res.errors[0]["code"], "directory_filtered")
+
+            tag_nodes = [
+                {"role": "AXButton", "description": "Post Directory Post 0", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()},
+                {"role": "AXCheckBox", "description": "Filter by tag, ZoneA", "title": "", "value": "1", "url": "", "dom_id": "", "depth": 1, "element": object()},
+            ]
+            with patch.object(provider, "_extract_post_cards_and_links", return_value=(filtered_card, [], list_sentinel)), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=tag_nodes):
+                tag_res = provider.list_topics(GUILD_ID, FORUM_ID, limit=10)
+            self.assertFalse(tag_res.complete)
+            self.assertEqual(tag_res.errors[0]["code"], "directory_filtered")
+
+    def test_store_list_topics_filters_and_cli(self):
+        import io
+        from contextlib import redirect_stdout
+        from src.forums import __main__ as forums_cli
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profiles_path = tmp / "profiles.json"
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=False)
+            upsert_forum_profile(prof, profiles_path)
+
+            provider = FakeForumProvider()
+            t1 = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_1,
+                title="Topic One Deep With Reply",
+                tags=[{"tag_id": None, "name": "ZoneA"}],
+                starter_message_id="200000000000000001",
+            )
+            t2 = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_2,
+                title="Topic Two Deep No Reply",
+                tags=[{"tag_id": None, "name": "ZoneB"}],
+                starter_message_id="200000000000000003",
+            )
+            t3 = TopicObservation(
+                forum_id=FORUM_ID,
+                thread_id=THREAD_A,
+                title="Topic A Pending Unread",
+                tags=[{"tag_id": None, "name": "ZoneA"}],
+            )
+            provider.topic_pages = [TopicListObservation(topics=[t1, t2, t3], complete=True)]
+            provider.histories[THREAD_1] = TopicHistoryObservation(
+                topic=t1,
+                messages=[
+                    MessageObservation(
+                        entity_ref="msg:200000000000000001",
+                        message_id="200000000000000001",
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                        body="Starter body",
+                        remote_created_at="2026-11-18T09:00:00Z",
+                    ),
+                    MessageObservation(
+                        entity_ref="msg:200000000000000002",
+                        message_id="200000000000000002",
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Responder"},
+                        body="Reply body",
+                        remote_created_at="2026-11-18T10:00:00Z",
+                    ),
+                ],
+                complete=True,
+            )
+            provider.histories[THREAD_2] = TopicHistoryObservation(
+                topic=t2,
+                messages=[
+                    MessageObservation(
+                        entity_ref="msg:200000000000000003",
+                        message_id="200000000000000003",
+                        thread_id=THREAD_2,
+                        author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                        body="Starter only",
+                        remote_created_at="2026-11-18T09:30:00Z",
+                    )
+                ],
+                complete=True,
+            )
+            store = ForumStore(prof.db_path)
+            try:
+                ForumReader(prof, store, provider).initial_backfill(max_topics_per_run=2)
+                pending = store.list_topics(pending_only=True)
+                self.assertEqual([t["thread_id"] for t in pending["topics"]], [THREAD_A])
+                self.assertEqual(pending["topics"][0]["pending_reason"], "history_unread")
+
+                with_replies = store.list_topics(deep_read_only=True, has_replies=True)
+                self.assertEqual([t["thread_id"] for t in with_replies["topics"]], [THREAD_1])
+                self.assertEqual(with_replies["topics"][0]["reply_count"], 1)
+                self.assertTrue(with_replies["topics"][0]["history_complete"])
+
+                no_replies = store.list_topics(deep_read_only=True, has_replies=False)
+                self.assertEqual([t["thread_id"] for t in no_replies["topics"]], [THREAD_2])
+
+                by_tag = store.list_topics(tag="zonea", limit=1, offset=1)
+                self.assertEqual(by_tag["total_matching"], 2)
+                self.assertEqual(by_tag["returned"], 1)
+            finally:
+                store.close()
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "topics", "--profile", prof.profile_id,
+                    "--has-replies", "--tag", "ZoneA",
+                ])
+            self.assertEqual(rc, 0)
+            cli_out = json.loads(buf.getvalue())
+            self.assertEqual(cli_out["total_matching"], 1)
+            self.assertEqual(cli_out["topics"][0]["thread_id"], THREAD_1)
+
+
 if __name__ == "__main__":
     unittest.main()

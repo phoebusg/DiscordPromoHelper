@@ -647,6 +647,25 @@ class DesktopDiscordProvider(DiscordViewProvider):
         cards, links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
         return cards + links
 
+    @staticmethod
+    def _detect_directory_filter(nodes: list[dict[str, Any]]) -> Optional[str]:
+        """Detect active Discord forum search or tag filters in AX nodes."""
+        for n in nodes:
+            role = n.get("role") or ""
+            if role in ("AXHeading", "AXStaticText"):
+                text = str(n.get("title") or n.get("value") or "").strip()
+                if text and (
+                    re.match(r"^\d+\s+posts?\s+with\s+", text, re.IGNORECASE)
+                    or text.lower() == "no posts found"
+                ):
+                    return text
+            elif role == "AXCheckBox":
+                desc = str(n.get("description") or "").strip()
+                val = str(n.get("value") or "").strip()
+                if desc.startswith("Filter by tag,") and val in ("1", "true", "True"):
+                    return desc
+        return None
+
     def list_topics(
         self,
         guild_id: str,
@@ -656,6 +675,10 @@ class DesktopDiscordProvider(DiscordViewProvider):
     ) -> TopicListObservation:
         session = self.describe_session()
         if session.capabilities.get("can_read_semantic"):
+            anchor_tid: Optional[str] = None
+            if cursor and cursor.startswith("dirscroll:"):
+                anchor_tid = cursor.split(":", 1)[1].strip() or None
+
             ax_win = self._get_ax_window()
             if ax_win is not None:
                 nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
@@ -664,7 +687,12 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     for n in nodes
                 )
                 parsed_cur = parse_discord_channel_url(session.current_url)
-                if not has_cards and (not parsed_cur or parsed_cur[1] != forum_id):
+                wrong_target = (
+                    not parsed_cur
+                    or parsed_cur[0] != guild_id
+                    or (parsed_cur[1] != forum_id and not (has_cards and anchor_tid is not None))
+                )
+                if wrong_target:
                     self.navigate_to_url(build_discord_channel_url(guild_id, forum_id))
                     time.sleep(1.5)
                     ax_win = self._get_ax_window()
@@ -678,11 +706,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         )
                     nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
 
-                anchor_tid: Optional[str] = None
-                if cursor and cursor.startswith("dirscroll:"):
-                    anchor_tid = cursor.split(":", 1)[1].strip() or None
-
                 cards, links, list_elem = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                active_filter = self._detect_directory_filter(nodes)
                 bounds = _ax_bounds(list_elem) if list_elem is not None else None
                 if bounds is not None:
                     scroll_x = bounds[0] + (bounds[2] * 0.5)
@@ -694,8 +719,12 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 else:
                     scroll_x, scroll_y = 560.0, 500.0
 
-                # Starting fresh from the top of the directory if user scrolled previously
-                if anchor_tid is None and cards and list_elem is not None:
+                # Starting fresh from the top of the directory, or nudge up if anchor sits just above viewport
+                visible_on_entry = {c.thread_id for c in cards if c.thread_id}
+                if list_elem is not None and (
+                    (anchor_tid is None and cards)
+                    or (anchor_tid is not None and anchor_tid not in visible_on_entry)
+                ):
                     _scroll_at_point(scroll_x, scroll_y, 28)
                     time.sleep(0.25)
                     _scroll_at_point(scroll_x, scroll_y, 28)
@@ -705,14 +734,19 @@ class DesktopDiscordProvider(DiscordViewProvider):
 
                 collected_cards: dict[str, TopicObservation] = {}
                 collected_links: dict[str, TopicObservation] = {t.thread_id: t for t in links if t.thread_id}
+                seen_pre_anchor: set[str] = {anchor_tid} if anchor_tid else set()
                 past_anchor = anchor_tid is None
                 reached_bottom = False
                 stagnant_steps = 0
                 prev_last_tid: Optional[str] = None
-                max_steps = max(4, (max(1, limit) // 3) + 12)
+                max_collect_steps = max(4, (max(1, limit) // 3) + 12)
+                max_seek_steps = 40
+                seek_steps = 0
+                collect_steps = 0
+                iter_idx = 0
 
-                for step in range(max_steps):
-                    if step > 0:
+                while True:
+                    if iter_idx > 0:
                         nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
                         cards, step_links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
                         for lt in step_links:
@@ -725,36 +759,42 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         if not c.thread_id:
                             continue
                         if not past_anchor:
+                            seen_pre_anchor.add(c.thread_id)
                             if c.thread_id == anchor_tid:
                                 past_anchor = True
+                            continue
+                        if c.thread_id in seen_pre_anchor:
                             continue
                         if c.thread_id not in collected_cards:
                             collected_cards[c.thread_id] = c
 
                     last_visible = visible_tids[-1] if visible_tids else None
-                    if not past_anchor and anchor_tid and step >= 2 and not cards:
+                    if not past_anchor and anchor_tid and iter_idx >= 2 and not cards:
                         # Anchor card not in active cards (e.g. only link topics present)
                         past_anchor = True
 
                     if len(collected_cards) >= limit:
                         break
 
-                    if step > 0 and len(collected_cards) == before_count and last_visible == prev_last_tid:
-                        if not past_anchor and anchor_tid:
-                            # If seeking failed after reaching bottom/stagnation, avoid infinite loop
-                            stagnant_steps += 1
-                            if stagnant_steps >= 2:
-                                reached_bottom = True
-                                break
-                        else:
-                            stagnant_steps += 1
-                            if stagnant_steps >= 2:
-                                reached_bottom = True
-                                break
+                    if iter_idx > 0 and len(collected_cards) == before_count and last_visible == prev_last_tid:
+                        stagnant_steps += 1
+                        if stagnant_steps >= 2:
+                            reached_bottom = True
+                            break
                     else:
                         stagnant_steps = 0
                     prev_last_tid = last_visible
 
+                    if not past_anchor:
+                        seek_steps += 1
+                        if seek_steps >= max_seek_steps:
+                            break
+                    else:
+                        collect_steps += 1
+                        if collect_steps >= max_collect_steps:
+                            break
+
+                    iter_idx += 1
                     if not _scroll_at_point(scroll_x, scroll_y, -18):
                         break
                     time.sleep(0.4)
@@ -762,8 +802,25 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 ordered_out: list[TopicObservation] = list(collected_cards.values())
                 if reached_bottom and len(ordered_out) < limit:
                     for tid, lt in collected_links.items():
-                        if tid not in collected_cards:
+                        if tid not in collected_cards and tid not in seen_pre_anchor:
                             ordered_out.append(lt)
+
+                if active_filter:
+                    return TopicListObservation(
+                        topics=ordered_out[:limit],
+                        next_cursor=None,
+                        complete=False,
+                        errors=[
+                            {
+                                "code": "directory_filtered",
+                                "message": (
+                                    f"Forum directory filter is active ({active_filter}); "
+                                    "clear search/tag filters for complete enumeration"
+                                ),
+                            }
+                        ],
+                        source_method="accessibility",
+                    )
 
                 if len(ordered_out) > limit:
                     page_topics = ordered_out[:limit]
@@ -786,8 +843,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 last_tid = ordered_out[-1].thread_id if ordered_out else anchor_tid
                 return TopicListObservation(
                     topics=ordered_out,
-                    next_cursor=f"dirscroll:{last_tid}" if (last_tid and len(ordered_out) >= limit) else None,
-                    complete=(len(ordered_out) == 0),
+                    next_cursor=f"dirscroll:{last_tid}" if last_tid else None,
+                    complete=False,
                     source_method="accessibility",
                 )
 

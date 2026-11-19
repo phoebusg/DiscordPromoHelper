@@ -237,6 +237,32 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_topics(args: argparse.Namespace) -> int:
+    prof = _load_profile_or_exit(args.profile, args.profiles_path)
+    has_replies: Optional[bool] = None
+    if getattr(args, "has_replies", False):
+        has_replies = True
+    elif getattr(args, "no_replies", False):
+        has_replies = False
+    store = ForumStore(prof.db_path)
+    try:
+        store.ensure_scope(prof.guild_id, prof.forum_id)
+        res = store.list_topics(
+            guild_id=prof.guild_id,
+            forum_id=prof.forum_id,
+            pending_only=bool(getattr(args, "pending_only", False)),
+            deep_read_only=bool(getattr(args, "deep_read_only", False)),
+            has_replies=has_replies,
+            tag=getattr(args, "tag", None),
+            limit=args.limit,
+            offset=args.offset,
+        )
+        _print_json(res)
+    finally:
+        store.close()
+    return 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     prof = _load_profile_or_exit(args.profile, args.profiles_path)
     store = ForumStore(prof.db_path)
@@ -553,6 +579,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_stat.add_argument("--thread")
     p_stat.add_argument("--since-position")
 
+    p_top = sub.add_parser("topics", help="List mirrored topics filtered by completion, replies, or tag")
+    p_top.add_argument("--profile", required=True)
+    p_top.add_argument("--pending-only", action="store_true")
+    p_top.add_argument("--deep-read-only", action="store_true")
+    grp_rep = p_top.add_mutually_exclusive_group()
+    grp_rep.add_argument("--has-replies", action="store_true")
+    grp_rep.add_argument("--no-replies", action="store_true")
+    p_top.add_argument("--tag")
+    p_top.add_argument("--limit", type=int, default=50)
+    p_top.add_argument("--offset", type=int, default=0)
+
     p_search = sub.add_parser("search", help="Search mirrored topics, messages, and requirements")
     p_search.add_argument("--profile", required=True)
     p_search.add_argument("query")
@@ -608,6 +645,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "seed-index": cmd_seed_index,
         "refresh": cmd_refresh,
         "status": cmd_status,
+        "topics": cmd_topics,
         "search": cmd_search,
         "changes": cmd_changes,
         "stage": cmd_stage,

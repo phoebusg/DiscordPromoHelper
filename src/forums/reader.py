@@ -328,13 +328,28 @@ class ForumReader:
                         cursor=dir_cursor,
                     )
                     for tobs in tlist.topics:
+                        before_topic = (
+                            self.store.get_topic_status(tobs.thread_id)
+                            if tobs.thread_id
+                            else None
+                        )
                         tid = self._ingest_topic_obs(tobs)
                         if tid:
                             discovered_tids.append(tid)
-                            if tid not in pending_known_map:
+                            activity_changed = bool(
+                                tobs.remote_last_activity_at
+                                and before_topic is not None
+                                and tobs.remote_last_activity_at != before_topic.get("remote_last_activity_at")
+                            )
+                            needs_history = (
+                                before_topic is None
+                                or before_topic.get("last_deep_read_at") is None
+                                or activity_changed
+                            )
+                            if tid not in pending_known_map and needs_history:
                                 pending_known_map[tid] = {
                                     "thread_id": tid,
-                                    "reason": "history_unread",
+                                    "reason": "activity_or_new" if activity_changed else "history_unread",
                                     "resume_token": f"thread:{tid}",
                                 }
                     if tlist.errors:

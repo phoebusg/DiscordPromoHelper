@@ -2504,3 +2504,142 @@ class ForumStore:
             "coverage": cov,
             "updated_at": meta["updated_at"],
         }
+
+    def list_topics(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+        pending_only: bool = False,
+        deep_read_only: bool = False,
+        has_replies: Optional[bool] = None,
+        tag: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return filtered, paginated topic mirror summaries with completion and reply evidence."""
+        eff_limit = max(1, int(limit))
+        eff_offset = max(0, int(offset))
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        gid = meta["guild_id"]
+        fid = meta["forum_id"]
+        cov = self.get_coverage(guild_id=gid, forum_id=fid)
+        pending_by_tid = {
+            p["thread_id"]: p.get("reason")
+            for p in cov.get("pending", [])
+            if p.get("thread_id")
+        }
+        error_tids = {e["thread_id"] for e in cov.get("errors", []) if e.get("thread_id")}
+
+        msgs_by_tid: dict[str, list[sqlite3.Row]] = {}
+        msg_rows = self._conn.execute(
+            """
+            SELECT m.thread_id, m.entity_ref, m.message_id
+            FROM messages m
+            JOIN topics t ON t.thread_id = m.thread_id
+            WHERE t.forum_id = ?
+            ORDER BY ts_sort_key(COALESCE(m.remote_created_at, m.observed_at)), m.entity_ref
+            """,
+            (fid,),
+        ).fetchall()
+        for mr in msg_rows:
+            msgs_by_tid.setdefault(mr["thread_id"], []).append(mr)
+
+        topic_rows = self._conn.execute(
+            """
+            SELECT * FROM topics
+            WHERE forum_id = ?
+            ORDER BY CASE WHEN last_deep_read_at IS NULL THEN 1 ELSE 0 END,
+                     last_deep_read_at DESC,
+                     thread_id ASC
+            """,
+            (fid,),
+        ).fetchall()
+
+        tag_needle = tag.strip().lower() if isinstance(tag, str) and tag.strip() else None
+        matched: list[dict[str, Any]] = []
+        for t in topic_rows:
+            tid = t["thread_id"]
+            tags = json.loads(t["tags_json"])
+            if tag_needle is not None and not any(
+                (tg.get("name") or "").strip().lower() == tag_needle for tg in tags
+            ):
+                continue
+
+            t_msgs = msgs_by_tid.get(tid, [])
+            starter_ref = t_msgs[0]["entity_ref"] if t_msgs else None
+            starter_mid = t["starter_message_id"]
+            reply_count = (
+                sum(
+                    1
+                    for m in t_msgs
+                    if (
+                        m["message_id"] != starter_mid
+                        if starter_mid
+                        else m["entity_ref"] != starter_ref
+                    )
+                )
+                if t_msgs
+                else 0
+            )
+            has_non_starter = reply_count > 0
+            if has_replies is True and not has_non_starter:
+                continue
+            if has_replies is False and has_non_starter:
+                continue
+
+            deep_ts = t["last_deep_read_at"]
+            if deep_read_only and deep_ts is None:
+                continue
+
+            history_complete = (
+                deep_ts is not None
+                and tid not in pending_by_tid
+                and tid not in error_tids
+            )
+            if pending_only and history_complete:
+                continue
+
+            pending_reason = pending_by_tid.get(tid)
+            if pending_reason is None and not history_complete:
+                pending_reason = "history_error" if tid in error_tids else "history_not_fetched"
+
+            matched.append(
+                {
+                    "thread_id": tid,
+                    "forum_id": fid,
+                    "title": t["title"],
+                    "source_url": t["source_url"],
+                    "tags": tags,
+                    "archived": None if t["archived"] is None else bool(t["archived"]),
+                    "locked": None if t["locked"] is None else bool(t["locked"]),
+                    "revision": int(t["revision"]),
+                    "observed_at": t["observed_at"],
+                    "last_deep_read_at": deep_ts,
+                    "remote_last_activity_at": t["remote_last_activity_at"],
+                    "starter_message_id": starter_mid,
+                    "message_count": len(t_msgs),
+                    "reply_count": int(reply_count),
+                    "has_non_starter_replies": bool(has_non_starter),
+                    "history_complete": bool(history_complete),
+                    "pending_reason": pending_reason,
+                }
+            )
+
+        page = matched[eff_offset : eff_offset + eff_limit]
+        return {
+            "guild_id": gid,
+            "forum_id": fid,
+            "total_matching": len(matched),
+            "returned": len(page),
+            "offset": eff_offset,
+            "limit": eff_limit,
+            "filters": {
+                "pending_only": bool(pending_only),
+                "deep_read_only": bool(deep_read_only),
+                "has_replies": has_replies,
+                "tag": tag,
+            },
+            "coverage": cov,
+            "topics": page,
+        }

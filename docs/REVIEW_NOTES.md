@@ -178,3 +178,14 @@
 - **Read-only live verification & private mirror sync**:
   - Ran two consecutive strictly read-only refreshes (`refresh --thread <tid> --provider desktop --export`, no composer staging or Send) on the configured submitted topic: pass 1 exported `<CHANGE_BATCH_01>` (`requirements_changed` `5 -> 6` in clean DFS text order + submitted `added` reply with Snowflake `remote_created_at`); pass 2 returned `exported.mode == "quiet_noop"` (`change_count=0`, `topic_complete=True`, `requirements_complete=True`). A third read-only refresh on another prioritized topic also returned `quiet_noop` (`topic_complete=True`).
   - Imported all pending incremental batches (`91 -> 94`, `94 -> 95`, `95 -> 97`) into the external strict consumer mirror (`<EXT_INBOX_01>` -> `<EXT_STORE_01>`), bringing all 5 deeply-read destinations up to date (`guidance rev 6`).
+
+## Directory pagination, filtered-view guard & topic listing query — 19 November 2026
+
+- **Backfill resume & directory pagination (`src/forums/reader.py`, `src/forums/providers/desktop.py`)**:
+  - Updated `ForumReader.initial_backfill` to skip already-deep-read unchanged topics when resuming partial runs while still queueing newly discovered or remote-activity-changed topics.
+  - Hardened `DesktopDiscordProvider.list_topics`: tightened wrong-forum/guild navigation when resuming without an anchor, tracked `seen_pre_anchor` across overlapping virtualized directory scrolls to eliminate anchor/duplicate leakage, added dedicated `max_seek_steps=40` when seeking deep `dirscroll:<thread_id>` cursors, ensured step-budget exhaustion before reaching the bottom always returns `complete=False`, and added `_detect_directory_filter` so filtered forum views (active search summary or checked tag checkbox) fail closed with `complete=False` and `errors=[{"code": "directory_filtered", ...}]` without clearing user filters.
+- **Filtered mirror query & CLI (`src/forums/store.py`, `src/forums/__main__.py`)**:
+  - Added `ForumStore.list_topics(...)` and `python -m src.forums topics --profile ... [--pending-only] [--deep-read-only] [--has-replies | --no-replies] [--tag TAG] [--limit N] [--offset M]` returning completion status, pending reasons, and non-starter reply counts.
+- **Read-only live & local verification**:
+  - Verified live `directory_filtered` fail-closed guard (`complete=False`, `next_cursor=None`, `errors[0].code == "directory_filtered"`) on the active filtered forum view, then cleared only the read-only forum search filter and verified live two-page `DesktopDiscordProvider.list_topics` enumeration (`limit=8`, page 1 `next_cursor="dirscroll:..."`, page 2 returned `8` disjoint subsequent topics with zero overlap and zero errors).
+  - Verified `python -m src.forums topics` against the local configured mirror (`--deep-read-only` returning 5 deeply-read topics; `--pending-only --limit 5` reporting `total_matching=72`).
