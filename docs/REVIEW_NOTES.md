@@ -189,3 +189,20 @@
 - **Read-only live & local verification**:
   - Verified live `directory_filtered` fail-closed guard (`complete=False`, `next_cursor=None`, `errors[0].code == "directory_filtered"`) on the active filtered forum view, then cleared only the read-only forum search filter and verified live two-page `DesktopDiscordProvider.list_topics` enumeration (`limit=8`, page 1 `next_cursor="dirscroll:..."`, page 2 returned `8` disjoint subsequent topics with zero overlap and zero errors).
   - Verified `python -m src.forums topics` against the local configured mirror (`--deep-read-only` returning 5 deeply-read topics; `--pending-only --limit 5` reporting `total_matching=72`).
+
+## Explicit thread discovery, foreground directory guards, starter requirements & metrics — 19 November 2026
+
+- **Explicit thread discovery (`ForumReader.discover_topic`, `ForumMirrorController.discover_topic`, CLI `refresh --thread URL_OR_ID --discover`)**:
+  - Verifies observed guild and single unambiguous parent forum from AX tree/URL (`DesktopDiscordProvider._observe_thread_parent_from_ax`) before ingesting or refreshing requirements, rejecting wrong-guild, unverified-guild, wrong-parent, unverified-parent, ambiguous-parent, and unavailable targets (including when Discord stays on another channel's message list) while honoring `catalog_enabled` and persistent `SessionController` review holds.
+  - Returns compact `identity`, `completeness`, `source_observations`, and `metrics`.
+- **Foreground & scroll-root directory guards (`DesktopDiscordProvider.list_topics`, `ForumStore.not_found_cache`)**:
+  - Requires foreground Discord window verification (`_ensure_discord_foreground_for_input` / `_scroll_discord_at_point`) and window-bounded scroll root validation (`scroll_root_unverified`) before emitting scroll input; stabilizes directory top before scanning; retains `filter_state` on `TopicListObservation` and fails closed on empty/filtered or non-converging views.
+  - Added scope-, filter-, and directory-revision-bound `not_found_cache` in `ForumStore`, invalidated on directory changes (`upsert_topic`) and explicit discovery (`discover_topic`).
+- **Per-topic starter requirements, pre-stage refresh & structured metrics (`src/forums/models.py`, `src/forums/reader.py`, `src/forums/handoff.py`, `src/forums/dialog.py`, `src/forums/__main__.py`)**:
+  - Exports normalized topic starter forms as `topic-starter:<thread_id>` linked via `source_entity_ref=msg:<starter_id>` (stripping trailing Discord UI timestamp/`(edited)` decorations while preserving raw source and protecting complete requirements across partial reads).
+  - Added `refresh_before_stage` (default `True` on CLI `stage` `--refresh-before-stage` / `--no-refresh-before-stage` and `ForumMirrorController.stage_current_draft`) clearing cached session TTL state before refreshing target/guidance and running `check_draft_conflicts` prior to any composer action.
+  - Emits compact `metrics` (`elapsed_ms`, `desktop_reads`, `pages_read`, `cache_hits`, `changed_entities`, `ui_actions`, `reasons`) across `ForumReader` operations and CLI JSON outputs.
+- **Offline verification (live Discord intentionally untouched during active external review hold)**:
+  - `.venv/bin/python -m unittest tests.test_forums tests.test_forum_target_refresh -q` -> **55 tests OK**.
+  - `.venv/bin/python -m pytest tests/ --ignore=tests/test_channel_nav.py -q` -> **69 passed, 5 subtests passed**.
+  - Verified unmodified external strict v1 consumer interop in an isolated temp dir covering `discover_topic`, automatic `topic-starter:<thread_id>` selection into target status & draft baseline, UI-decoration tolerance, and `needs_review` block with zero composer calls after a silent post-bundle starter edit.

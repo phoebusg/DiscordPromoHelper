@@ -1,13 +1,23 @@
 """Forum backfill, resumable traversal, incremental refresh, and deep-history rotation."""
 from __future__ import annotations
 
+import json
+import time
 import uuid
 from typing import Any, Optional
 
 from .config import ForumProfile
 from .handoff import SessionController
-from .models import require_discord_id, utc_now_iso
-from .providers.base import DiscordViewProvider, TopicObservation
+from .models import (
+    build_discord_channel_url,
+    is_valid_discord_id,
+    normalize_starter_requirement_body,
+    parse_discord_channel_url,
+    require_discord_id,
+    topic_starter_requirement_id,
+    utc_now_iso,
+)
+from .providers.base import DiscordViewProvider, TopicHistoryObservation, TopicObservation
 from .store import ForumStore
 
 
@@ -124,17 +134,108 @@ class ForumReader:
             )
         return bool(reqs), req_errors, req_complete
 
-    def _read_single_topic_history(self, thread_id: str) -> tuple[bool, list[dict[str, Any]]]:
-        """Read accessible message history for one verified thread_id."""
+    def _begin_run_metrics(self) -> tuple[float, dict[str, int], int]:
+        t0 = time.perf_counter()
+        snap_fn = getattr(self.provider, "metrics_snapshot", None)
+        start_prov = dict(snap_fn()) if callable(snap_fn) else {}
+        start_seq = self.store.current_change_seq(
+            guild_id=self.profile.guild_id,
+            forum_id=self.profile.forum_id,
+        )
+        return t0, start_prov, start_seq
+
+    def _finish_run_metrics(
+        self,
+        run_state: tuple[float, dict[str, int], int],
+        *,
+        reasons: Optional[list[str]] = None,
+        fallback_pages: int = 0,
+        extra_cache_hits: int = 0,
+    ) -> dict[str, Any]:
+        t0, start_prov, start_seq = run_state
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        snap_fn = getattr(self.provider, "metrics_snapshot", None)
+        end_prov = dict(snap_fn()) if callable(snap_fn) else {}
+        end_seq = self.store.current_change_seq(
+            guild_id=self.profile.guild_id,
+            forum_id=self.profile.forum_id,
+        )
+        pages_delta = int(end_prov.get("pages_read", 0)) - int(start_prov.get("pages_read", 0))
+        return {
+            "elapsed_ms": elapsed_ms,
+            "desktop_reads": max(0, int(end_prov.get("desktop_reads", 0)) - int(start_prov.get("desktop_reads", 0))),
+            "pages_read": max(fallback_pages, max(0, pages_delta)),
+            "cache_hits": (
+                max(0, int(end_prov.get("cache_hits", 0)) - int(start_prov.get("cache_hits", 0)))
+                + max(0, int(extra_cache_hits))
+            ),
+            "changed_entities": max(0, int(end_seq) - int(start_seq)),
+            "ui_actions": max(0, int(end_prov.get("ui_actions", 0)) - int(start_prov.get("ui_actions", 0))),
+            "reasons": list(dict.fromkeys(r for r in (reasons or []) if r)),
+        }
+
+    def _sync_topic_starter_requirement(self, thread_id: str, *, history_complete: bool) -> bool:
+        """Export the mirrored topic starter's form/body as a topic-bound requirement."""
+        starter = self.store.get_topic_starter_message(thread_id)
+        if starter is None:
+            return False
+        raw_body = starter.get("body") or ""
+        clean_body = normalize_starter_requirement_body(raw_body)
+        if not clean_body:
+            return False
+        req_id = topic_starter_requirement_id(thread_id)
+        src_url = starter.get("source_url") or build_discord_channel_url(
+            self.profile.guild_id,
+            thread_id,
+            starter.get("message_id") or thread_id,
+        )
+        rec_raw = starter.get("recognition_json")
+        if isinstance(rec_raw, str) and rec_raw.strip():
+            try:
+                rec_obj = json.loads(rec_raw)
+            except Exception:
+                rec_obj = None
+        elif isinstance(starter.get("recognition"), dict):
+            rec_obj = starter.get("recognition")
+        else:
+            rec_obj = None
+        src_method = rec_obj.get("method", "semantic") if isinstance(rec_obj, dict) else "semantic"
+        self.store.upsert_requirement(
+            requirement_id=req_id,
+            forum_id=self.profile.forum_id,
+            body=clean_body,
+            source_entity_ref=starter["entity_ref"],
+            source_url=src_url,
+            observed_at=starter.get("observed_at"),
+            source_method=src_method,
+            complete=bool(history_complete),
+            raw_observation={
+                "raw_body": raw_body,
+                "normalized_body": clean_body,
+                "starter_message_id": starter.get("message_id"),
+                "thread_id": thread_id,
+            },
+            extra={"kind": "topic_starter_form", "thread_id": thread_id},
+        )
+        return True
+
+    def _ingest_history_pages(
+        self,
+        thread_id: str,
+        *,
+        initial_hist: Optional[TopicHistoryObservation] = None,
+    ) -> tuple[bool, list[dict[str, Any]], int, Optional[TopicObservation]]:
+        """Read and ingest all accessible history pages for one verified thread_id."""
         cursor: Optional[str] = None
         seen_cursors: set[str] = set()
         all_errors: list[dict[str, Any]] = []
         complete = True
         max_pages = 500
         pages = 0
+        latest_topic: Optional[TopicObservation] = None
 
         while True:
-            if not self.session.can_navigate():
+            if pages > 0 and not self.session.can_navigate():
                 complete = False
                 break
             if pages >= max_pages:
@@ -148,24 +249,30 @@ class ForumReader:
                 )
                 break
             pages += 1
-            hist = self.provider.read_topic(
-                self.profile.guild_id,
-                self.profile.forum_id,
-                thread_id,
-                cursor=cursor,
-            )
+            if pages == 1 and initial_hist is not None:
+                hist = initial_hist
+            else:
+                hist = self.provider.read_topic(
+                    self.profile.guild_id,
+                    self.profile.forum_id,
+                    thread_id,
+                    cursor=cursor,
+                )
             if (
                 hist.topic.thread_id != thread_id
                 or hist.topic.forum_id != self.profile.forum_id
                 or any(msg.thread_id not in (None, thread_id) for msg in hist.messages)
             ):
-                all_errors.append({
-                    "code": "history_target_mismatch",
-                    "message": "Observed history does not match the requested topic and forum",
-                    "thread_id": thread_id,
-                })
+                all_errors.append(
+                    {
+                        "code": "history_target_mismatch",
+                        "message": "Observed history does not match the requested topic and forum",
+                        "thread_id": thread_id,
+                    }
+                )
                 complete = False
                 break
+            latest_topic = hist.topic
             if hist.topic.thread_id:
                 self._ingest_topic_obs(hist.topic)
             for msg in hist.messages:
@@ -199,59 +306,441 @@ class ForumReader:
             complete = bool(hist.complete) and not bool(hist.next_cursor)
             break
 
-        if complete and not all_errors:
+        is_complete = complete and not all_errors
+        if is_complete:
             self.store.mark_topic_deep_read(thread_id)
-        return complete and not all_errors, all_errors
+        self._sync_topic_starter_requirement(thread_id, history_complete=is_complete)
+        return is_complete, all_errors, pages, latest_topic
 
-    def refresh_topic(self, thread_id: str) -> dict[str, Any]:
-        """Refresh one known destination and guidance without enumerating the forum."""
-        thread_id = require_discord_id(thread_id, "thread_id")
+    def _read_single_topic_history(self, thread_id: str) -> tuple[bool, list[dict[str, Any]]]:
+        """Read accessible message history for one verified thread_id."""
+        ok, errs, _pages, _top = self._ingest_history_pages(thread_id)
+        return ok, errs
+
+    def _update_single_topic_coverage(
+        self,
+        coverage: dict[str, Any],
+        thread_id: str,
+        *,
+        complete: bool,
+        has_reqs: bool,
+        req_complete: bool,
+        req_errors: list[dict[str, Any]],
+        history_errors: list[dict[str, Any]],
+        session_errors: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        errors = list(session_errors) + req_errors + history_errors
+        pending = [
+            dict(p)
+            for p in coverage.get("pending", [])
+            if p.get("thread_id") not in (None, thread_id)
+        ]
+        if not complete:
+            pending.append(
+                {
+                    "thread_id": thread_id,
+                    "reason": history_errors[0]["code"] if history_errors else "history_partial",
+                    "resume_token": f"thread:{thread_id}",
+                }
+            )
+        retained_errors = [
+            e for e in coverage.get("errors", []) if e.get("thread_id") not in (None, thread_id)
+        ]
+        histories = coverage.get("histories", "not_started")
+        if histories != "complete" or not complete:
+            histories = "partial"
+        cov = self.store.update_coverage(
+            histories=histories,
+            requirements="complete"
+            if req_complete
+            else ("partial" if has_reqs or errors else coverage.get("requirements", "not_started")),
+            pending_known=pending,
+            errors=retained_errors + errors,
+        )
+        return cov, errors
+
+    def refresh_guidance_only(self) -> dict[str, Any]:
+        """Refresh forum metadata and forum-wide guidance requirements without directory/topic reads."""
         self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
         coverage = self.store.get_coverage()
+        run_state = self._begin_run_metrics()
         if not self.profile.catalog_enabled:
-            return {"paused": True, "reason": "catalog_disabled", "coverage": coverage}
-        topic = self.store.get_topic_status(thread_id)
-        if topic is None or topic["forum_id"] != self.profile.forum_id:
-            return {"paused": True, "reason": "topic_not_in_configured_mirror", "coverage": coverage}
+            return {
+                "paused": True,
+                "reason": "catalog_disabled",
+                "coverage": coverage,
+                "metrics": self._finish_run_metrics(run_state, reasons=["catalog_disabled"]),
+            }
         if not self.session.acquire_for_read():
-            return {"paused": True, "reason": "session_in_review_or_staging", "coverage": coverage}
+            return {
+                "paused": True,
+                "reason": "session_in_review_or_staging",
+                "coverage": coverage,
+                "metrics": self._finish_run_metrics(run_state, reasons=["session_in_review_or_staging"]),
+            }
         try:
             session = self.provider.describe_session()
             self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id, actor=session.actor)
             if not self.session.can_navigate():
-                return {"paused": True, "reason": "session_paused", "coverage": coverage}
+                return {
+                    "paused": True,
+                    "reason": "session_paused",
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(run_state, reasons=["session_paused"]),
+                }
             has_reqs, req_errors, req_complete = self._sync_forum_and_requirements(session.errors)
-            complete, history_errors = self._read_single_topic_history(thread_id)
-            errors = list(session.errors) + req_errors + history_errors
-            pending = [
-                dict(p) for p in coverage.get("pending", [])
-                if p.get("thread_id") not in (None, thread_id)
-            ]
-            if not complete:
-                pending.append({
-                    "thread_id": thread_id,
-                    "reason": history_errors[0]["code"] if history_errors else "history_partial",
-                    "resume_token": f"thread:{thread_id}",
-                })
-            retained_errors = [
-                e for e in coverage.get("errors", []) if e.get("thread_id") not in (None, thread_id)
-            ]
-            # Reading one destination cannot establish freshness/completeness of the whole forum.
-            histories = coverage.get("histories", "not_started")
-            if histories != "complete" or not complete:
-                histories = "partial"
+            errors = list(session.errors) + req_errors
+            retained_errors = [e for e in coverage.get("errors", []) if e.get("thread_id") is not None]
             cov = self.store.update_coverage(
-                histories=histories,
-                requirements="complete" if req_complete else (
-                    "partial" if has_reqs or errors else coverage.get("requirements", "not_started")
-                ),
-                pending_known=pending,
+                requirements="complete"
+                if req_complete
+                else ("partial" if has_reqs or errors else coverage.get("requirements", "not_started")),
                 errors=retained_errors + errors,
             )
+            reasons = [e.get("code") for e in errors if e.get("code")] or ["ok"]
             return {
-                "paused": False, "thread_id": thread_id, "threads_read": 1,
-                "topic_complete": complete, "requirements_complete": req_complete,
-                "errors": errors, "coverage": cov,
+                "paused": False,
+                "requirements_complete": req_complete,
+                "errors": errors,
+                "coverage": cov,
+                "metrics": self._finish_run_metrics(run_state, reasons=reasons),
+            }
+        finally:
+            self.session.release_read()
+
+    def discover_topic(
+        self,
+        target: str,
+        *,
+        refresh_requirements: bool = True,
+    ) -> dict[str, Any]:
+        """Discover and verify one explicitly supplied topic URL/ID against observed guild/parent forum."""
+        self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
+        coverage = self.store.get_coverage()
+        run_state = self._begin_run_metrics()
+        raw_target = str(target or "").strip()
+        if is_valid_discord_id(raw_target):
+            thread_id = raw_target
+            supplied_guild_id: Optional[str] = None
+        else:
+            parsed = parse_discord_channel_url(raw_target)
+            if parsed is None:
+                return {
+                    "paused": False,
+                    "discovered": False,
+                    "reason": "invalid_target",
+                    "target": raw_target,
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(run_state, reasons=["invalid_target"]),
+                }
+            supplied_guild_id, thread_id, _ = parsed
+            if supplied_guild_id != self.profile.guild_id:
+                return {
+                    "paused": False,
+                    "discovered": False,
+                    "reason": "wrong_guild",
+                    "thread_id": thread_id,
+                    "observed_guild_id": supplied_guild_id,
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(run_state, reasons=["wrong_guild"]),
+                }
+            if thread_id == self.profile.forum_id:
+                return {
+                    "paused": False,
+                    "discovered": False,
+                    "reason": "target_is_forum_root",
+                    "thread_id": thread_id,
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(run_state, reasons=["target_is_forum_root"]),
+                }
+
+        if not self.profile.catalog_enabled:
+            return {
+                "paused": True,
+                "discovered": False,
+                "reason": "catalog_disabled",
+                "thread_id": thread_id,
+                "coverage": coverage,
+                "metrics": self._finish_run_metrics(run_state, reasons=["catalog_disabled"]),
+            }
+        if not self.session.acquire_for_read():
+            return {
+                "paused": True,
+                "discovered": False,
+                "reason": "session_in_review_or_staging",
+                "thread_id": thread_id,
+                "coverage": coverage,
+                "metrics": self._finish_run_metrics(run_state, reasons=["session_in_review_or_staging"]),
+            }
+
+        try:
+            self.store.invalidate_not_found_cache(
+                target_key=thread_id,
+                guild_id=self.profile.guild_id,
+                forum_id=self.profile.forum_id,
+            )
+            session = self.provider.describe_session()
+            self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id, actor=session.actor)
+            if not self.session.can_navigate():
+                return {
+                    "paused": True,
+                    "discovered": False,
+                    "reason": "session_paused",
+                    "thread_id": thread_id,
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(run_state, reasons=["session_paused"]),
+                }
+
+            first_hist = self.provider.read_topic(
+                self.profile.guild_id,
+                self.profile.forum_id,
+                thread_id,
+            )
+            parent_meta = (first_hist.topic.raw or {}).get("parent_verification") or {}
+            obs_guild_id = first_hist.topic.observed_guild_id or parent_meta.get("observed_guild_id")
+            obs_parent_fid = (
+                first_hist.topic.observed_parent_forum_id
+                or parent_meta.get("observed_parent_forum_id")
+            )
+            parent_ambiguous = bool(parent_meta.get("parent_ambiguous"))
+
+            reject_reason: Optional[str] = None
+            if (
+                any(e.get("code") == "topic_unavailable" for e in (first_hist.errors or []))
+                or (
+                    not first_hist.messages
+                    and first_hist.topic.starter_message_id is None
+                    and not first_hist.complete
+                )
+                or (first_hist.topic.source_method == "unavailable" and not first_hist.messages)
+            ):
+                reject_reason = "topic_unavailable"
+            elif first_hist.errors and not first_hist.messages:
+                reject_reason = first_hist.errors[0].get("code") or "topic_read_failed"
+            elif obs_guild_id is None:
+                reject_reason = "unverified_guild"
+            elif obs_guild_id != self.profile.guild_id:
+                reject_reason = "wrong_guild"
+            elif parent_ambiguous:
+                reject_reason = "ambiguous_parent_forum"
+            elif obs_parent_fid is not None and obs_parent_fid != self.profile.forum_id:
+                reject_reason = "wrong_parent_forum"
+            elif obs_parent_fid is None:
+                reject_reason = "unverified_parent_forum"
+            elif (
+                first_hist.topic.thread_id != thread_id
+                or any(m.thread_id not in (None, thread_id) for m in first_hist.messages)
+            ):
+                reject_reason = "history_target_mismatch"
+
+            if reject_reason is not None:
+                if reject_reason in ("topic_unavailable", "topic_read_failed"):
+                    self.store.record_not_found_observation(
+                        target_key=thread_id,
+                        reason=reject_reason,
+                        guild_id=self.profile.guild_id,
+                        forum_id=self.profile.forum_id,
+                        extra={
+                            "observed_guild_id": obs_guild_id,
+                            "observed_parent_forum_id": obs_parent_fid,
+                            "parent_verification": parent_meta,
+                        },
+                    )
+                return {
+                    "paused": False,
+                    "discovered": False,
+                    "reason": reject_reason,
+                    "thread_id": thread_id,
+                    "observed_guild_id": obs_guild_id,
+                    "observed_parent_forum_id": obs_parent_fid,
+                    "identity": {
+                        "thread_id": thread_id,
+                        "title": first_hist.topic.title,
+                        "guild_id": obs_guild_id,
+                        "parent_forum_id": obs_parent_fid,
+                        "locked": first_hist.topic.locked,
+                        "archived": first_hist.topic.archived,
+                    },
+                    "completeness": {
+                        "topic_complete": False,
+                        "requirements_complete": False,
+                        "coverage": coverage,
+                    },
+                    "source_observations": {
+                        "message_count": len(first_hist.messages),
+                        "parent_verification": parent_meta,
+                        "locked": first_hist.topic.locked,
+                        "archived": first_hist.topic.archived,
+                    },
+                    "errors": list(session.errors) + list(first_hist.errors or []),
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(
+                        run_state,
+                        reasons=[reject_reason],
+                        fallback_pages=1,
+                    ),
+                }
+
+            has_reqs = False
+            req_errors: list[dict[str, Any]] = []
+            req_complete = True
+            if refresh_requirements:
+                has_reqs, req_errors, req_complete = self._sync_forum_and_requirements(session.errors)
+            else:
+                req_complete = coverage.get("requirements") == "complete"
+
+            complete, history_errors, pages_read, latest_topic = self._ingest_history_pages(
+                thread_id,
+                initial_hist=first_hist,
+            )
+            cov, errors = self._update_single_topic_coverage(
+                coverage,
+                thread_id,
+                complete=complete,
+                has_reqs=has_reqs,
+                req_complete=req_complete,
+                req_errors=req_errors,
+                history_errors=history_errors,
+                session_errors=session.errors,
+            )
+            eff_topic = latest_topic or first_hist.topic
+            reasons = [e.get("code") for e in errors if e.get("code")] or ["discovered"]
+            return {
+                "paused": False,
+                "discovered": True,
+                "thread_id": thread_id,
+                "title": eff_topic.title,
+                "observed_guild_id": obs_guild_id,
+                "observed_parent_forum_id": obs_parent_fid,
+                "locked": eff_topic.locked,
+                "archived": eff_topic.archived,
+                "threads_read": 1,
+                "topic_complete": complete,
+                "requirements_complete": req_complete,
+                "identity": {
+                    "thread_id": thread_id,
+                    "title": eff_topic.title,
+                    "guild_id": obs_guild_id,
+                    "parent_forum_id": obs_parent_fid,
+                    "locked": eff_topic.locked,
+                    "archived": eff_topic.archived,
+                },
+                "completeness": {
+                    "topic_complete": complete,
+                    "requirements_complete": req_complete,
+                    "coverage": cov,
+                },
+                "source_observations": {
+                    "starter_message_id": eff_topic.starter_message_id,
+                    "parent_verification": parent_meta,
+                    "topic_starter_requirement_id": topic_starter_requirement_id(thread_id),
+                },
+                "errors": errors,
+                "coverage": cov,
+                "metrics": self._finish_run_metrics(
+                    run_state,
+                    reasons=reasons,
+                    fallback_pages=pages_read,
+                ),
+            }
+        finally:
+            self.session.release_read()
+
+    def refresh_topic(
+        self,
+        thread_id: str,
+        *,
+        allow_discover: bool = False,
+    ) -> dict[str, Any]:
+        """Refresh one known destination and guidance without enumerating the forum."""
+        thread_id = require_discord_id(thread_id, "thread_id")
+        self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
+        coverage = self.store.get_coverage()
+        run_state = self._begin_run_metrics()
+        if not self.profile.catalog_enabled:
+            return {
+                "paused": True,
+                "reason": "catalog_disabled",
+                "coverage": coverage,
+                "metrics": self._finish_run_metrics(run_state, reasons=["catalog_disabled"]),
+            }
+        topic = self.store.get_topic_status(thread_id)
+        if topic is None or topic["forum_id"] != self.profile.forum_id:
+            if allow_discover and topic is None:
+                return self.discover_topic(thread_id, refresh_requirements=True)
+            active_filter: Optional[str] = None
+            for err in coverage.get("errors", []):
+                if isinstance(err, dict) and err.get("filter_state"):
+                    active_filter = str(err["filter_state"])
+                    break
+            nf_cached = self.store.get_not_found_observation(
+                target_key=thread_id,
+                filter_state=active_filter,
+                guild_id=self.profile.guild_id,
+                forum_id=self.profile.forum_id,
+            )
+            extra_hits = 1 if nf_cached is not None else 0
+            nf_obs = nf_cached or self.store.record_not_found_observation(
+                target_key=thread_id,
+                reason="topic_not_in_configured_mirror",
+                filter_state=active_filter,
+                guild_id=self.profile.guild_id,
+                forum_id=self.profile.forum_id,
+            )
+            return {
+                "paused": True,
+                "reason": "topic_not_in_configured_mirror",
+                "coverage": coverage,
+                "not_found_observation": nf_obs,
+                "metrics": self._finish_run_metrics(
+                    run_state,
+                    reasons=["topic_not_in_configured_mirror"],
+                    extra_cache_hits=extra_hits,
+                ),
+            }
+        if not self.session.acquire_for_read():
+            return {
+                "paused": True,
+                "reason": "session_in_review_or_staging",
+                "coverage": coverage,
+                "metrics": self._finish_run_metrics(run_state, reasons=["session_in_review_or_staging"]),
+            }
+        try:
+            session = self.provider.describe_session()
+            self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id, actor=session.actor)
+            if not self.session.can_navigate():
+                return {
+                    "paused": True,
+                    "reason": "session_paused",
+                    "coverage": coverage,
+                    "metrics": self._finish_run_metrics(run_state, reasons=["session_paused"]),
+                }
+            has_reqs, req_errors, req_complete = self._sync_forum_and_requirements(session.errors)
+            complete, history_errors, pages_read, _top = self._ingest_history_pages(thread_id)
+            cov, errors = self._update_single_topic_coverage(
+                coverage,
+                thread_id,
+                complete=complete,
+                has_reqs=has_reqs,
+                req_complete=req_complete,
+                req_errors=req_errors,
+                history_errors=history_errors,
+                session_errors=session.errors,
+            )
+            reasons = [e.get("code") for e in errors if e.get("code")] or ["ok"]
+            return {
+                "paused": False,
+                "thread_id": thread_id,
+                "threads_read": 1,
+                "topic_complete": complete,
+                "requirements_complete": req_complete,
+                "errors": errors,
+                "coverage": cov,
+                "metrics": self._finish_run_metrics(
+                    run_state,
+                    reasons=reasons,
+                    fallback_pages=pages_read,
+                ),
             }
         finally:
             self.session.release_read()
@@ -263,6 +752,7 @@ class ForumReader:
     ) -> dict[str, Any]:
         """Run or resume initial backfill of forum guidance, topics, and accessible histories."""
         self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
+        run_state = self._begin_run_metrics()
         if not self.profile.catalog_enabled:
             return {
                 "paused": True,
@@ -270,6 +760,7 @@ class ForumReader:
                 "coverage": self.store.get_coverage(
                     guild_id=self.profile.guild_id, forum_id=self.profile.forum_id
                 ),
+                "metrics": self._finish_run_metrics(run_state, reasons=["catalog_disabled"]),
             }
         if not self.session.acquire_for_read():
             return {
@@ -278,6 +769,7 @@ class ForumReader:
                 "coverage": self.store.get_coverage(
                     guild_id=self.profile.guild_id, forum_id=self.profile.forum_id
                 ),
+                "metrics": self._finish_run_metrics(run_state, reasons=["session_in_review_or_staging"]),
             }
 
         try:
@@ -353,7 +845,15 @@ class ForumReader:
                                     "resume_token": f"thread:{tid}",
                                 }
                     if tlist.errors:
-                        dir_and_hist_errors.extend(tlist.errors)
+                        for err in tlist.errors:
+                            e_copy = dict(err)
+                            if (
+                                getattr(tlist, "filter_state", None)
+                                and e_copy.get("code") == "directory_filtered"
+                                and not e_copy.get("filter_state")
+                            ):
+                                e_copy["filter_state"] = tlist.filter_state
+                            dir_and_hist_errors.append(e_copy)
                         topics_complete = False
                         break
                     if (
@@ -430,10 +930,12 @@ class ForumReader:
                 errors=all_errors,
                 last_success_at=utc_now_iso() if not all_errors else None,
             )
+            reasons = [e.get("code") for e in all_errors if e.get("code")] or ["ok"]
             return {
                 "paused": False,
                 "threads_read": threads_read,
                 "coverage": cov,
+                "metrics": self._finish_run_metrics(run_state, reasons=reasons),
             }
         finally:
             self.session.release_read()
@@ -446,6 +948,7 @@ class ForumReader:
     ) -> dict[str, Any]:
         """Refresh requirements, new/active topics, unread histories, and rotate deep history rereads."""
         self.store.ensure_scope(self.profile.guild_id, self.profile.forum_id)
+        run_state = self._begin_run_metrics()
         if not self.profile.catalog_enabled:
             return {
                 "paused": True,
@@ -453,6 +956,7 @@ class ForumReader:
                 "coverage": self.store.get_coverage(
                     guild_id=self.profile.guild_id, forum_id=self.profile.forum_id
                 ),
+                "metrics": self._finish_run_metrics(run_state, reasons=["catalog_disabled"]),
             }
         if not self.session.acquire_for_read():
             return {
@@ -461,6 +965,7 @@ class ForumReader:
                 "coverage": self.store.get_coverage(
                     guild_id=self.profile.guild_id, forum_id=self.profile.forum_id
                 ),
+                "metrics": self._finish_run_metrics(run_state, reasons=["session_in_review_or_staging"]),
             }
 
         try:
@@ -511,7 +1016,15 @@ class ForumReader:
                                 {"thread_id": tid, "reason": "activity_or_new", "resume_token": f"thread:{tid}"},
                             )
                 if tlist.errors:
-                    dir_and_hist_errors.extend(tlist.errors)
+                    for err in tlist.errors:
+                        e_copy = dict(err)
+                        if (
+                            getattr(tlist, "filter_state", None)
+                            and e_copy.get("code") == "directory_filtered"
+                            and not e_copy.get("filter_state")
+                        ):
+                            e_copy["filter_state"] = tlist.filter_state
+                        dir_and_hist_errors.append(e_copy)
                     topics_complete = False
                     break
                 if tlist.next_cursor and tlist.next_cursor != cursor and tlist.next_cursor not in seen_cursors:
@@ -577,10 +1090,12 @@ class ForumReader:
                 errors=all_errors,
                 last_success_at=utc_now_iso() if not all_errors else None,
             )
+            reasons = [e.get("code") for e in all_errors if e.get("code")] or ["ok"]
             return {
                 "paused": False,
                 "threads_read": threads_read,
                 "coverage": cov,
+                "metrics": self._finish_run_metrics(run_state, reasons=reasons),
             }
         finally:
             self.session.release_read()

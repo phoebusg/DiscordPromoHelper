@@ -223,6 +223,17 @@ class DesktopDiscordProvider(DiscordViewProvider):
         self._session_cache: Optional[tuple[float, SessionDescription]] = None
         self._ocr_probe_cache: Optional[tuple[float, bool]] = None
         self._unverified_attachment_filenames: list[str] = []
+        self._metrics: dict[str, int] = {
+            "desktop_reads": 0,
+            "pages_read": 0,
+            "cache_hits": 0,
+            "ui_actions": 0,
+        }
+        self._last_scroll_error: Optional[str] = None
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        """Return copy of compact provider operation counters."""
+        return dict(self._metrics)
 
     def _safe_key_press(self, key: str) -> None:
         if key.lower() in self._FORBIDDEN_SEND_KEYS:
@@ -237,6 +248,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
             and self._session_cache is not None
             and (now_mono - self._session_cache[0]) < 2.0
         ):
+            self._metrics["cache_hits"] += 1
             return self._session_cache[1]
 
         pid = _find_discord_pid()
@@ -412,6 +424,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         gid, cid, mid = parsed
         deep = f"discord://-/channels/{gid}/{cid}" + (f"/{mid}" if mid else "")
         try:
+            self._metrics["ui_actions"] += 1
             if sys.platform.startswith("darwin"):
                 subprocess.run(["open", deep], check=True)
             elif sys.platform.startswith("win32"):
@@ -425,6 +438,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
             return False
 
     def describe_forum(self, guild_id: str, forum_id: str) -> ForumObservation:
+        self._metrics["desktop_reads"] += 1
         url = build_discord_channel_url(guild_id, forum_id)
         session = self.describe_session()
         if session.capabilities.get("can_read_semantic"):
@@ -510,6 +524,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         )
 
     def _activate_discord_window(self) -> None:
+        self._metrics["ui_actions"] += 1
         if sys.platform.startswith("darwin"):
             try:
                 subprocess.run(["open", "-a", "Discord"], check=False)
@@ -524,6 +539,60 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     AS.AXUIElementPerformAction(ax_win, "AXRaise")
                 except Exception:
                     pass
+
+    def _is_discord_frontmost(self) -> bool:
+        """Verify Discord owns the current foreground window before sending scroll/focus input."""
+        pid = _find_discord_pid()
+        if sys.platform.startswith("darwin"):
+            try:
+                from AppKit import NSWorkspace  # type: ignore
+
+                front = NSWorkspace.sharedWorkspace().frontmostApplication()
+                if front is not None:
+                    if pid is not None and int(front.processIdentifier()) == int(pid):
+                        return True
+                    name = str(front.localizedName() or "").strip().lower()
+                    if "discord" in name:
+                        return True
+                    return False
+            except Exception:
+                pass
+        if utils is not None and hasattr(utils, "get_foreground_window_info"):
+            try:
+                _, fg_title, _ = utils.get_foreground_window_info()
+                return bool(fg_title and "discord" in fg_title.lower())
+            except Exception:
+                return False
+        return pid is not None
+
+    def _ensure_discord_foreground_for_input(self) -> bool:
+        """Ensure Discord is frontmost before posting wheel/mouse input; activate once if needed."""
+        if self._is_discord_frontmost():
+            return True
+        self._activate_discord_window()
+        time.sleep(0.15)
+        return self._is_discord_frontmost()
+
+    def _scroll_discord_at_point(
+        self,
+        x: float,
+        y: float,
+        delta_lines: int,
+        *,
+        window_bbox: Optional[tuple[int, int, int, int]] = None,
+    ) -> bool:
+        """Post scroll input strictly to the foregrounded Discord window inside its bounds."""
+        self._last_scroll_error = None
+        if not self._ensure_discord_foreground_for_input():
+            self._last_scroll_error = "window_not_foreground"
+            return False
+        if window_bbox is not None:
+            wx, wy, ww, wh = window_bbox
+            if ww <= 0 or wh <= 0 or not (wx <= x <= wx + ww and wy <= y <= wy + wh):
+                self._last_scroll_error = "scroll_point_outside_window"
+                return False
+        self._metrics["ui_actions"] += 1
+        return _scroll_at_point(x, y, delta_lines)
 
     def _extract_post_cards_and_links(
         self,
@@ -673,6 +742,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
         cursor: Optional[str] = None,
         limit: int = 50,
     ) -> TopicListObservation:
+        self._metrics["desktop_reads"] += 1
+        self._metrics["pages_read"] += 1
         session = self.describe_session()
         if session.capabilities.get("can_read_semantic"):
             anchor_tid: Optional[str] = None
@@ -695,6 +766,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 if wrong_target:
                     self.navigate_to_url(build_discord_channel_url(guild_id, forum_id))
                     time.sleep(1.5)
+                    session = self.describe_session(force_refresh=True)
                     ax_win = self._get_ax_window()
                     if ax_win is None:
                         return TopicListObservation(
@@ -709,6 +781,30 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 cards, links, list_elem = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
                 active_filter = self._detect_directory_filter(nodes)
                 bounds = _ax_bounds(list_elem) if list_elem is not None else None
+                scroll_root_ok = True
+                if list_elem is None or bounds is None or bounds[2] <= 20 or bounds[3] <= 20:
+                    scroll_root_ok = False
+                elif session.window_bbox is not None:
+                    wx, wy, ww, wh = session.window_bbox
+                    cx = bounds[0] + (bounds[2] * 0.5)
+                    cy = bounds[1] + (bounds[3] * 0.5)
+                    if not (wx <= cx <= wx + ww and wy <= cy <= wy + wh):
+                        scroll_root_ok = False
+                if not scroll_root_ok:
+                    return TopicListObservation(
+                        topics=cards[:limit],
+                        next_cursor=None,
+                        complete=False,
+                        filter_state=active_filter,
+                        errors=[
+                            {
+                                "code": "scroll_root_unverified",
+                                "message": "Forum directory scroll root could not be verified inside Discord window",
+                            }
+                        ],
+                        source_method="accessibility",
+                    )
+
                 if bounds is not None:
                     scroll_x = bounds[0] + (bounds[2] * 0.5)
                     scroll_y = bounds[1] + (bounds[3] * 0.5)
@@ -719,18 +815,65 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 else:
                     scroll_x, scroll_y = 560.0, 500.0
 
+                dir_errors: list[dict[str, Any]] = []
                 # Starting fresh from the top of the directory, or nudge up if anchor sits just above viewport
                 visible_on_entry = {c.thread_id for c in cards if c.thread_id}
-                if list_elem is not None and (
-                    (anchor_tid is None and cards)
-                    or (anchor_tid is not None and anchor_tid not in visible_on_entry)
-                ):
-                    _scroll_at_point(scroll_x, scroll_y, 28)
-                    time.sleep(0.25)
-                    _scroll_at_point(scroll_x, scroll_y, 28)
-                    time.sleep(0.35)
-                    nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
-                    cards, links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                if not active_filter and list_elem is not None:
+                    if anchor_tid is None and cards:
+                        prev_top = cards[0].thread_id
+                        top_stable = 0
+                        reached_top = False
+                        for _ in range(20):
+                            if not self._scroll_discord_at_point(
+                                scroll_x, scroll_y, 28, window_bbox=session.window_bbox
+                            ):
+                                if self._last_scroll_error:
+                                    dir_errors.append(
+                                        {
+                                            "code": self._last_scroll_error,
+                                            "message": f"Discord directory scroll aborted ({self._last_scroll_error})",
+                                        }
+                                    )
+                                break
+                            time.sleep(0.25)
+                            nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
+                            cards, links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                            active_filter = active_filter or self._detect_directory_filter(nodes)
+                            if cards:
+                                cur_top = cards[0].thread_id
+                                if cur_top == prev_top:
+                                    top_stable += 1
+                                    if top_stable >= 2:
+                                        reached_top = True
+                                        break
+                                else:
+                                    top_stable = 0
+                                    prev_top = cur_top
+                        if not dir_errors and not reached_top and not active_filter:
+                            dir_errors.append(
+                                {
+                                    "code": "directory_top_unverified",
+                                    "message": "Could not verify directory top before scanning",
+                                }
+                            )
+                    elif anchor_tid is not None and anchor_tid not in visible_on_entry:
+                        for _ in range(2):
+                            if not self._scroll_discord_at_point(
+                                scroll_x, scroll_y, 28, window_bbox=session.window_bbox
+                            ):
+                                if self._last_scroll_error:
+                                    dir_errors.append(
+                                        {
+                                            "code": self._last_scroll_error,
+                                            "message": f"Discord directory scroll aborted ({self._last_scroll_error})",
+                                        }
+                                    )
+                                break
+                            time.sleep(0.25)
+                        if not dir_errors:
+                            nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
+                            cards, links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                            active_filter = active_filter or self._detect_directory_filter(nodes)
 
                 collected_cards: dict[str, TopicObservation] = {}
                 collected_links: dict[str, TopicObservation] = {t.thread_id: t for t in links if t.thread_id}
@@ -745,10 +888,13 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 collect_steps = 0
                 iter_idx = 0
 
-                while True:
+                while not dir_errors and not active_filter:
                     if iter_idx > 0:
                         nodes = _walk_ax_tree(ax_win, max_nodes=4500, max_depth=35)
                         cards, step_links, _ = self._extract_post_cards_and_links(nodes, guild_id, forum_id)
+                        active_filter = active_filter or self._detect_directory_filter(nodes)
+                        if active_filter:
+                            break
                         for lt in step_links:
                             if lt.thread_id and lt.thread_id not in collected_links:
                                 collected_links[lt.thread_id] = lt
@@ -779,7 +925,10 @@ class DesktopDiscordProvider(DiscordViewProvider):
                     if iter_idx > 0 and len(collected_cards) == before_count and last_visible == prev_last_tid:
                         stagnant_steps += 1
                         if stagnant_steps >= 2:
-                            reached_bottom = True
+                            if not past_anchor:
+                                break
+                            if collected_cards or cards or collected_links:
+                                reached_bottom = True
                             break
                     else:
                         stagnant_steps = 0
@@ -795,12 +944,27 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             break
 
                     iter_idx += 1
-                    if not _scroll_at_point(scroll_x, scroll_y, -18):
+                    if not self._scroll_discord_at_point(
+                        scroll_x, scroll_y, -18, window_bbox=session.window_bbox
+                    ):
+                        if self._last_scroll_error:
+                            dir_errors.append(
+                                {
+                                    "code": self._last_scroll_error,
+                                    "message": f"Discord directory scroll aborted ({self._last_scroll_error})",
+                                }
+                            )
                         break
                     time.sleep(0.4)
 
+                if dir_errors or active_filter:
+                    # Include at least visible card items when aborted before downward scan
+                    for c in cards:
+                        if c.thread_id and c.thread_id not in collected_cards and c.thread_id not in seen_pre_anchor:
+                            collected_cards[c.thread_id] = c
+
                 ordered_out: list[TopicObservation] = list(collected_cards.values())
-                if reached_bottom and len(ordered_out) < limit:
+                if reached_bottom and len(ordered_out) < limit and not dir_errors and not active_filter:
                     for tid, lt in collected_links.items():
                         if tid not in collected_cards and tid not in seen_pre_anchor:
                             ordered_out.append(lt)
@@ -810,6 +974,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         topics=ordered_out[:limit],
                         next_cursor=None,
                         complete=False,
+                        filter_state=active_filter,
                         errors=[
                             {
                                 "code": "directory_filtered",
@@ -817,8 +982,21 @@ class DesktopDiscordProvider(DiscordViewProvider):
                                     f"Forum directory filter is active ({active_filter}); "
                                     "clear search/tag filters for complete enumeration"
                                 ),
+                                "filter_state": active_filter,
                             }
                         ],
+                        source_method="accessibility",
+                    )
+
+                if dir_errors:
+                    last_tid = ordered_out[-1].thread_id if ordered_out else anchor_tid
+                    return TopicListObservation(
+                        topics=ordered_out[:limit],
+                        next_cursor=f"dirscroll:{last_tid}" if (last_tid and ordered_out) else (
+                            f"dirscroll:{anchor_tid}" if anchor_tid else None
+                        ),
+                        complete=False,
+                        errors=dir_errors,
                         source_method="accessibility",
                     )
 
@@ -829,6 +1007,20 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         topics=page_topics,
                         next_cursor=f"dirscroll:{last_tid}" if last_tid else None,
                         complete=False,
+                        source_method="accessibility",
+                    )
+
+                if not ordered_out and anchor_tid is None:
+                    return TopicListObservation(
+                        topics=[],
+                        next_cursor=None,
+                        complete=False,
+                        errors=[
+                            {
+                                "code": "directory_empty_unverified",
+                                "message": "Forum directory returned no topics; cannot establish completeness",
+                            }
+                        ],
                         source_method="accessibility",
                     )
 
@@ -1074,6 +1266,77 @@ class DesktopDiscordProvider(DiscordViewProvider):
             )
         return list_title, topic_tags, msgs_by_mid
 
+    @staticmethod
+    def _observe_thread_parent_from_ax(
+        nodes: list[dict[str, Any]],
+        current_url: Optional[str],
+        thread_id: str,
+    ) -> tuple[Optional[str], Optional[str], dict[str, Any]]:
+        """Observe actual guild_id and parent forum_id from AX tree/URL without trusting caller args."""
+        obs_guild_id: Optional[str] = None
+        for n in nodes:
+            if n.get("role") == "AXWebArea" and n.get("url"):
+                p = parse_discord_channel_url(n["url"])
+                if p:
+                    obs_guild_id = p[0]
+                    break
+        if obs_guild_id is None and current_url:
+            p = parse_discord_channel_url(current_url)
+            if p:
+                obs_guild_id = p[0]
+
+        def _in_sidebar_or_messages(elem: Any) -> bool:
+            cur = elem
+            for _ in range(16):
+                if cur is None:
+                    break
+                role = str(_ax_attr(cur, "AXRole") or "")
+                desc = str(_ax_attr(cur, "AXDescription") or "")
+                dom_id = str(_ax_attr(cur, "AXDOMIdentifier") or "")
+                if desc in ("Channels", "Members", "Private channels", "Servers"):
+                    return True
+                if role == "AXList" and desc.startswith("Messages in "):
+                    return True
+                if dom_id.startswith(("chat-messages-", "message-content-", "message-accessories-")):
+                    return True
+                cur = _ax_attr(cur, "AXParent")
+            return False
+
+        parent_candidates: list[str] = []
+        seen_candidates: set[str] = set()
+        for n in nodes:
+            if n.get("role") != "AXLink":
+                continue
+            elem = n.get("element")
+            if elem is not None and _in_sidebar_or_messages(elem):
+                continue
+            desc_lower = str(n.get("description") or "").lower()
+            if "channel)" in desc_lower or "private channel" in desc_lower:
+                continue
+            for cand in (n.get("url"), n.get("value"), n.get("description")):
+                parsed = parse_discord_channel_url(cand)
+                if not parsed or parsed[2] is not None:
+                    continue
+                if obs_guild_id and parsed[0] != obs_guild_id:
+                    continue
+                cid = parsed[1]
+                if cid == thread_id:
+                    continue
+                if obs_guild_id is None:
+                    obs_guild_id = parsed[0]
+                if cid not in seen_candidates:
+                    seen_candidates.add(cid)
+                    parent_candidates.append(cid)
+
+        ambiguous = len(parent_candidates) > 1
+        obs_parent_fid = parent_candidates[0] if len(parent_candidates) == 1 else None
+        return obs_guild_id, obs_parent_fid, {
+            "observed_guild_id": obs_guild_id,
+            "observed_parent_forum_id": obs_parent_fid,
+            "parent_candidates": parent_candidates,
+            "parent_ambiguous": ambiguous,
+        }
+
     def read_topic(
         self,
         guild_id: str,
@@ -1081,6 +1344,8 @@ class DesktopDiscordProvider(DiscordViewProvider):
         thread_id: str,
         cursor: Optional[str] = None,
     ) -> TopicHistoryObservation:
+        self._metrics["desktop_reads"] += 1
+        self._metrics["pages_read"] += 1
         session = self.describe_session()
         url = build_discord_channel_url(guild_id, thread_id)
         topic = TopicObservation(
@@ -1099,6 +1364,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 if not any(n["dom_id"].startswith(target_prefix) for n in nodes):
                     self.navigate_to_url(url)
                     time.sleep(1.8)
+                    session = self.describe_session(force_refresh=True)
                     ax_win = self._get_ax_window()
                     if ax_win is None:
                         return TopicHistoryObservation(
@@ -1106,9 +1372,32 @@ class DesktopDiscordProvider(DiscordViewProvider):
                             messages=[],
                             next_cursor=None,
                             complete=False,
-                            errors=session.errors,
+                            errors=session.errors or [
+                                {"code": "topic_unavailable", "message": f"Window unavailable for {thread_id}", "thread_id": thread_id}
+                            ],
                         )
                     nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
+
+                obs_guild_id, obs_parent_fid, parent_meta = self._observe_thread_parent_from_ax(
+                    nodes, session.current_url, thread_id
+                )
+                topic.observed_guild_id = obs_guild_id
+                topic.observed_parent_forum_id = obs_parent_fid
+                topic.raw = {"parent_verification": parent_meta}
+
+                obs_channel_id: Optional[str] = None
+                for n in nodes:
+                    if n.get("role") == "AXWebArea" and n.get("url"):
+                        parsed_wa = parse_discord_channel_url(n["url"])
+                        if parsed_wa:
+                            obs_channel_id = parsed_wa[1]
+                            break
+                if obs_channel_id is None and session.current_url:
+                    parsed_cur = parse_discord_channel_url(session.current_url)
+                    if parsed_cur:
+                        obs_channel_id = parsed_cur[1]
+
+                has_target_msgs = any(n["dom_id"].startswith(target_prefix) for n in nodes)
 
                 def _find_msg_list(cur_nodes: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
                     msg_lists = [
@@ -1116,16 +1405,32 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         if n["role"] == "AXList" and (n["description"] or "").startswith("Messages in ")
                     ]
                     for ml in msg_lists:
+                        if str(ml.get("dom_id") or "").startswith(target_prefix):
+                            return ml
                         children = _ax_attr(ml["element"], "AXChildren") or []
                         if any(str(_ax_attr(c, "AXDOMIdentifier") or "").startswith(target_prefix) for c in children):
                             return ml
-                    return msg_lists[0] if msg_lists else None
+                    if msg_lists and (has_target_msgs or obs_channel_id == thread_id):
+                        return msg_lists[0]
+                    return None
 
                 chosen_list = _find_msg_list(nodes)
                 locked = any(
-                    "you do not have permission to send messages" in (n["description"] or "").lower()
+                    marker in (n["description"] or "").lower()
+                    or marker in (n["value"] or "").lower()
+                    or marker in (n["title"] or "").lower()
                     for n in nodes
+                    for marker in ("you do not have permission to send messages", "this post is locked")
                 )
+                archived = any(
+                    marker in (n["description"] or "").lower()
+                    or marker in (n["value"] or "").lower()
+                    or marker in (n["title"] or "").lower()
+                    for n in nodes
+                    for marker in ("this thread is archived", "this post is archived")
+                )
+                topic.locked = locked
+                topic.archived = archived
 
                 if chosen_list is None:
                     return TopicHistoryObservation(
@@ -1133,6 +1438,13 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         messages=[],
                         next_cursor=None,
                         complete=False,
+                        errors=[
+                            {
+                                "code": "topic_unavailable",
+                                "message": f"Topic {thread_id} message list not present or accessible",
+                                "thread_id": thread_id,
+                            }
+                        ],
                     )
 
                 bounds = _ax_bounds(chosen_list["element"])
@@ -1169,12 +1481,23 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 stagnant_up = 0
                 prev_oldest: Optional[int] = int(cur_mids[0]) if cur_mids else None
                 scrolled_up = False
+                hist_errors: list[dict[str, Any]] = []
 
                 max_up_steps = 6
                 for _step in range(max_up_steps):
                     if top_reached:
                         break
-                    if not _scroll_at_point(scroll_x, scroll_y, 20):
+                    if not self._scroll_discord_at_point(
+                        scroll_x, scroll_y, 20, window_bbox=session.window_bbox
+                    ):
+                        if self._last_scroll_error:
+                            hist_errors.append(
+                                {
+                                    "code": self._last_scroll_error,
+                                    "message": f"History scroll aborted ({self._last_scroll_error})",
+                                    "thread_id": thread_id,
+                                }
+                            )
                         break
                     scrolled_up = True
                     time.sleep(0.4)
@@ -1198,10 +1521,10 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         prev_oldest = cur_oldest if prev_oldest is None else min(prev_oldest, cur_oldest)
 
                 # Return to bottom if we scrolled up so newest messages aren't missed
-                if scrolled_up:
-                    _scroll_at_point(scroll_x, scroll_y, -35)
+                if scrolled_up and not hist_errors:
+                    self._scroll_discord_at_point(scroll_x, scroll_y, -35, window_bbox=session.window_bbox)
                     time.sleep(0.25)
-                    _scroll_at_point(scroll_x, scroll_y, -35)
+                    self._scroll_discord_at_point(scroll_x, scroll_y, -35, window_bbox=session.window_bbox)
                     time.sleep(0.3)
                     end_nodes = _walk_ax_tree(ax_win, max_nodes=3500, max_depth=28)
                     ml_end = _find_msg_list(end_nodes)
@@ -1224,17 +1547,25 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         if thread_id in merged_msgs
                         else (ordered_mids[0] if (top_reached and ordered_mids) else None)
                     ),
+                    archived=archived,
                     locked=locked,
+                    observed_guild_id=obs_guild_id,
+                    observed_parent_forum_id=obs_parent_fid,
                     source_method="accessibility",
                     confidence=0.98,
-                    raw={"visible_message_count": len(ordered_msgs), "top_reached": top_reached},
+                    raw={
+                        "visible_message_count": len(ordered_msgs),
+                        "top_reached": top_reached,
+                        "parent_verification": parent_meta,
+                    },
                 )
 
                 return TopicHistoryObservation(
                     topic=topic,
                     messages=ordered_msgs,
                     next_cursor=None if top_reached or not ordered_mids else f"msgscroll:up:{ordered_mids[0]}",
-                    complete=bool(top_reached),
+                    complete=bool(top_reached and not hist_errors),
+                    errors=hist_errors,
                 )
 
         return TopicHistoryObservation(
@@ -1242,7 +1573,9 @@ class DesktopDiscordProvider(DiscordViewProvider):
             messages=[],
             next_cursor=None,
             complete=False,
-            errors=session.errors,
+            errors=session.errors or [
+                {"code": "topic_unavailable", "message": f"Topic {thread_id} semantic tree unavailable", "thread_id": thread_id}
+            ],
         )
 
     def read_requirements(
@@ -1251,6 +1584,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         forum_id: str,
         references: Optional[list[dict[str, str]]] = None,
     ) -> list[RequirementObservation]:
+        self._metrics["desktop_reads"] += 1
         reqs: list[RequirementObservation] = []
         ax_win = self._get_ax_window()
         if ax_win is None:
@@ -1618,6 +1952,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
     ) -> ComposerStageObservation:
         """Stage multiline Unicode text and evidence into Discord without ever pressing Send."""
         self._unverified_attachment_filenames = []
+        self._metrics["ui_actions"] += 1
         session = self.describe_session()
         dest = dict(draft_request["destination"])
         action = draft_request.get("action")

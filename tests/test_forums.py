@@ -1096,6 +1096,7 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
 
         fake_win_nodes = [{"role": "AXButton", "description": "Post 0", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()}]
         with patch.object(provider, "describe_session", return_value=session), \
+             patch.object(provider, "_is_discord_frontmost", return_value=True), \
              patch.object(provider, "_get_ax_window", return_value=object()), \
              patch.object(provider, "navigate_to_url", return_value=True), \
              patch.object(provider, "_extract_post_cards_and_links", side_effect=fake_extract), \
@@ -1177,6 +1178,7 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             return slices[idx]
 
         with patch.object(provider, "describe_session", return_value=session), \
+             patch.object(provider, "_is_discord_frontmost", return_value=True), \
              patch.object(provider, "_get_ax_window", return_value=object()), \
              patch.object(desktop_mod, "_walk_ax_tree", return_value=msg_win_nodes), \
              patch.object(desktop_mod, "_ax_attr", return_value=[]), \
@@ -2445,6 +2447,7 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
             }
         ]
         with patch.object(provider, "describe_session", return_value=good_session), \
+             patch.object(provider, "_is_discord_frontmost", return_value=True), \
              patch.object(provider, "_get_ax_window", return_value=object()), \
              patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_msg_win_nodes), \
              patch.object(desktop_mod, "_ax_bounds", return_value=(0.0, 0.0, 500.0, 400.0)), \
@@ -2556,6 +2559,7 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                         "--profiles-path", str(profiles_path),
                         "stage", "--profile", prof.profile_id,
                         "--bundle-dir", str(bundle_dir),
+                        "--no-refresh-before-stage",
                         "--receipt-out", str(receipt_out),
                     ])
                 self.assertEqual(rc1, 0)
@@ -2582,6 +2586,7 @@ class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
                         "--profiles-path", str(profiles_path),
                         "stage", "--profile", prof.profile_id,
                         "--bundle-dir", str(bundle_dir),
+                        "--no-refresh-before-stage",
                         "--receipt-out", str(receipt_out),
                     ])
                 self.assertEqual(rc2, 0)
@@ -4320,6 +4325,7 @@ class TestBackfillPaginationAndTopicFilters(unittest.TestCase):
 
         fake_win_nodes = [{"role": "AXButton", "description": "Post 0", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()}]
         with patch.object(provider, "describe_session", return_value=other_forum_session), \
+             patch.object(provider, "_is_discord_frontmost", return_value=True), \
              patch.object(provider, "_get_ax_window", return_value=object()), \
              patch.object(provider, "navigate_to_url", return_value=True) as mock_nav, \
              patch.object(provider, "_extract_post_cards_and_links", side_effect=fake_extract), \
@@ -4490,6 +4496,711 @@ class TestBackfillPaginationAndTopicFilters(unittest.TestCase):
             cli_out = json.loads(buf.getvalue())
             self.assertEqual(cli_out["total_matching"], 1)
             self.assertEqual(cli_out["topics"][0]["thread_id"], THREAD_1)
+
+    def test_discover_topic_verification_guards_and_cli(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from src.forums import __main__ as forums_cli
+        from src.forums.config import upsert_forum_profile
+        from src.forums.dialog import ForumMirrorController
+        from src.forums.providers import desktop as desktop_mod
+
+        THREAD_NEW = "900000000000000101"
+        THREAD_LOCKED = "900000000000000102"
+        THREAD_UNAVAIL = "900000000000000103"
+        OTHER_GUILD = "900000000000000888"
+        OTHER_FORUM = "900000000000000999"
+
+        class InstrumentedDiscoverProvider(FakeForumProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.counters = {"desktop_reads": 0, "pages_read": 0, "cache_hits": 0, "ui_actions": 0}
+                self.read_topic_calls = 0
+
+            def metrics_snapshot(self) -> dict[str, int]:
+                return dict(self.counters)
+
+            def describe_forum(self, guild_id: str, forum_id: str) -> ForumObservation:
+                self.counters["desktop_reads"] += 1
+                return super().describe_forum(guild_id, forum_id)
+
+            def read_requirements(
+                self,
+                guild_id: str,
+                forum_id: str,
+                references: list[dict[str, str]] | None = None,
+            ) -> list[RequirementObservation]:
+                self.counters["desktop_reads"] += 1
+                return super().read_requirements(guild_id, forum_id, references=references)
+
+            def read_topic(self, guild_id: str, forum_id: str, thread_id: str, cursor: Optional[str] = None) -> TopicHistoryObservation:
+                self.read_topic_calls += 1
+                self.counters["desktop_reads"] += 1
+                self.counters["pages_read"] += 1
+                if thread_id not in self.histories:
+                    return TopicHistoryObservation(
+                        topic=TopicObservation(
+                            forum_id=forum_id,
+                            thread_id=thread_id,
+                            title=f"Missing {thread_id}",
+                            source_url=build_discord_channel_url(guild_id, thread_id),
+                            source_method="unavailable",
+                        ),
+                        messages=[],
+                        complete=False,
+                        errors=[{"code": "topic_unavailable", "message": "Not available", "thread_id": thread_id}],
+                    )
+                return self.histories[thread_id]
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profiles_path = tmp / "profiles.json"
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=True)
+            upsert_forum_profile(prof, profiles_path)
+            provider = InstrumentedDiscoverProvider()
+            sess_ctrl = SessionController(Path(prof.db_path).with_suffix(".session.json"))
+            store = ForumStore(prof.db_path)
+            try:
+                reader = ForumReader(prof, store, provider, session_controller=sess_ctrl)
+
+                # 1. URL guild mismatch fails before any read_topic call
+                r_bad_url = reader.discover_topic(build_discord_channel_url(OTHER_GUILD, THREAD_NEW))
+                self.assertFalse(r_bad_url["discovered"])
+                self.assertEqual(r_bad_url["reason"], "wrong_guild")
+                self.assertEqual(provider.read_topic_calls, 0)
+
+                # 2. Observed guild / parent mismatches & ambiguities do not ingest even when caller passes configured forum_id
+                cases = [
+                    ("unverified_guild", TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_NEW, title="No Guild", source_url=build_discord_channel_url(GUILD_ID, THREAD_NEW), observed_guild_id=None, observed_parent_forum_id=FORUM_ID), {}),
+                    ("wrong_guild", TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_NEW, title="Other Guild", source_url=build_discord_channel_url(OTHER_GUILD, THREAD_NEW), observed_guild_id=OTHER_GUILD, observed_parent_forum_id=FORUM_ID), {}),
+                    ("wrong_parent_forum", TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_NEW, title="Wrong Parent", source_url=build_discord_channel_url(GUILD_ID, THREAD_NEW), observed_guild_id=GUILD_ID, observed_parent_forum_id=OTHER_FORUM), {}),
+                    ("unverified_parent_forum", TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_NEW, title="Missing Parent", source_url=build_discord_channel_url(GUILD_ID, THREAD_NEW), observed_guild_id=GUILD_ID, observed_parent_forum_id=None), {}),
+                    ("ambiguous_parent_forum", TopicObservation(forum_id=FORUM_ID, thread_id=THREAD_NEW, title="Ambig Parent", source_url=build_discord_channel_url(GUILD_ID, THREAD_NEW), observed_guild_id=GUILD_ID, observed_parent_forum_id=None, raw={"parent_verification": {"parent_ambiguous": True}}), {}),
+                ]
+                for expected_reason, bad_topic, _extra in cases:
+                    provider.histories[THREAD_NEW] = TopicHistoryObservation(
+                        topic=bad_topic,
+                        messages=[
+                            MessageObservation(
+                                entity_ref=f"msg:{THREAD_NEW}",
+                                message_id=THREAD_NEW,
+                                thread_id=THREAD_NEW,
+                                author={"user_id": ACTOR_USER_ID, "label": "Author"},
+                                body="Template body",
+                                remote_created_at="2026-11-19T09:00:00Z",
+                            )
+                        ],
+                        complete=True,
+                    )
+                    res_rej = reader.discover_topic(THREAD_NEW)
+                    self.assertFalse(res_rej["discovered"], msg=expected_reason)
+                    self.assertEqual(res_rej["reason"], expected_reason)
+                    self.assertIsNone(store.get_topic_status(THREAD_NEW))
+                    self.assertIn("metrics", res_rej)
+
+                # 3. DesktopDiscordProvider fails closed with topic_unavailable & zero scrolls when Discord stays on another thread
+                desk = desktop_mod.DesktopDiscordProvider()
+                other_sess = SessionDescription(
+                    actor=dict(provider.actor),
+                    app_name="Discord",
+                    window_title="Other Thread",
+                    window_bbox=(0, 0, 1280, 800),
+                    current_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                    capabilities={"can_read_semantic": True, "can_stage_composer": False},
+                )
+                wrong_thread_nodes = [
+                    {"role": "AXWebArea", "url": build_discord_channel_url(GUILD_ID, THREAD_1), "description": "", "title": "", "value": "", "dom_id": "", "depth": 1, "element": object()},
+                    {"role": "AXLink", "url": build_discord_channel_url(GUILD_ID, FORUM_ID), "description": "example-forum", "title": "", "value": "", "dom_id": "", "depth": 2, "element": None},
+                    {"role": "AXList", "url": "", "description": "Messages in Wrong Thread", "title": "", "value": "", "dom_id": f"chat-messages-{THREAD_1}-111", "depth": 3, "element": object()},
+                ]
+                with patch.object(desk, "describe_session", return_value=other_sess), \
+                     patch.object(desk, "_get_ax_window", return_value=object()), \
+                     patch.object(desk, "navigate_to_url", return_value=True), \
+                     patch.object(desktop_mod, "_walk_ax_tree", return_value=wrong_thread_nodes), \
+                     patch.object(desktop_mod, "_ax_attr", return_value=[]), \
+                     patch.object(desktop_mod, "_scroll_at_point") as mock_scroll, \
+                     patch.object(desktop_mod.time, "sleep"):
+                    unavail_obs = desk.read_topic(GUILD_ID, FORUM_ID, THREAD_UNAVAIL)
+                self.assertFalse(unavail_obs.complete)
+                self.assertEqual(unavail_obs.errors[0]["code"], "topic_unavailable")
+                mock_scroll.assert_not_called()
+
+                # Also verify DesktopDiscordProvider._observe_thread_parent_from_ax detects multiple parents as ambiguous
+                amb_nodes = [
+                    {"role": "AXWebArea", "url": build_discord_channel_url(GUILD_ID, THREAD_NEW), "description": "", "title": "", "value": "", "dom_id": "", "depth": 1, "element": object()},
+                    {"role": "AXLink", "url": build_discord_channel_url(GUILD_ID, FORUM_ID), "description": "forum-a", "title": "", "value": "", "dom_id": "", "depth": 2, "element": None},
+                    {"role": "AXLink", "url": build_discord_channel_url(GUILD_ID, OTHER_FORUM), "description": "forum-b", "title": "", "value": "", "dom_id": "", "depth": 2, "element": None},
+                ]
+                obs_gid, obs_fid, pmeta = desktop_mod.DesktopDiscordProvider._observe_thread_parent_from_ax(amb_nodes, None, THREAD_NEW)
+                self.assertEqual(obs_gid, GUILD_ID)
+                self.assertIsNone(obs_fid)
+                self.assertTrue(pmeta["parent_ambiguous"])
+
+                # 4. Locked topic is discovered accurately but blocked from staging
+                provider.histories[THREAD_LOCKED] = TopicHistoryObservation(
+                    topic=TopicObservation(
+                        forum_id=FORUM_ID,
+                        thread_id=THREAD_LOCKED,
+                        title="Locked Sector",
+                        source_url=build_discord_channel_url(GUILD_ID, THREAD_LOCKED),
+                        starter_message_id=THREAD_LOCKED,
+                        locked=True,
+                        observed_guild_id=GUILD_ID,
+                        observed_parent_forum_id=FORUM_ID,
+                    ),
+                    messages=[
+                        MessageObservation(
+                            entity_ref=f"msg:{THREAD_LOCKED}",
+                            message_id=THREAD_LOCKED,
+                            thread_id=THREAD_LOCKED,
+                            author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                            body="Checklist Item 1",
+                            remote_created_at="2026-11-19T09:05:00Z",
+                        )
+                    ],
+                    complete=True,
+                )
+                r_locked = reader.discover_topic(THREAD_LOCKED)
+                self.assertTrue(r_locked["discovered"])
+                self.assertTrue(r_locked["locked"])
+                self.assertEqual(r_locked["identity"]["parent_forum_id"], FORUM_ID)
+                self.assertTrue(r_locked["completeness"]["topic_complete"])
+                self.assertIn("topic_starter_requirement_id", r_locked["source_observations"])
+
+                snap_now = store.export_snapshot()
+                locked_draft = validate_exchange_record({
+                    "schema": "draft.request.v1",
+                    "record_id": "draft-rec-locked-1",
+                    "producer_id": "external-tool",
+                    "created_at": "2026-11-19T10:00:00Z",
+                    "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": provider.actor},
+                    "draft_id": "draft-locked-1",
+                    "revision": 1,
+                    "action": "reply_existing",
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_LOCKED, "message_id": None, "source_url": build_discord_channel_url(GUILD_ID, THREAD_LOCKED)},
+                    "body": "Attempt reply",
+                    "title": None,
+                    "tags": [],
+                    "evidence": [],
+                    "baseline": {
+                        "snapshot_id": snap_now["snapshot_id"],
+                        "snapshot_revision": snap_now["revision"],
+                        "requirements": [{"requirement_id": r["requirement_id"], "revision": r["revision"], "content_hash": r["content_hash"]} for r in snap_now["requirements"]],
+                        "message_content_hash": None,
+                    },
+                })
+                mgr = HandoffManager(store, provider, sess_ctrl, exchange_dir=prof.exchange_dir)
+                rcpt_locked = mgr.stage_draft_request(locked_draft, prof)
+                self.assertEqual(rcpt_locked["status"], "needs_review")
+                self.assertIn("locked", rcpt_locked["reason"])
+                self.assertEqual(provider.stage_calls, [])
+
+                # 5. Active review lock causes zero provider calls on discover_topic
+                sess_ctrl.acquire_for_staging()
+                sess_ctrl.transition_staging_to_review("active-hall-draft", 1, reason="in_owner_review")
+                calls_before = provider.read_topic_calls
+                with patch.object(provider, "describe_session", side_effect=AssertionError("must not touch UI during review")), \
+                     patch.object(provider, "read_topic", side_effect=AssertionError("must not navigate during review")):
+                    r_paused = reader.discover_topic(build_discord_channel_url(GUILD_ID, THREAD_NEW))
+                self.assertTrue(r_paused["paused"])
+                self.assertFalse(r_paused["discovered"])
+                self.assertEqual(r_paused["reason"], "session_in_review_or_staging")
+                self.assertEqual(provider.read_topic_calls, calls_before)
+                sess_ctrl.release_review()
+
+                # 6. Catalog disabled preserves guard
+                prof_disabled = ForumProfile(**{**prof.to_dict(), "catalog_enabled": False})
+                r_cat = ForumReader(prof_disabled, store, provider, session_controller=sess_ctrl).discover_topic(THREAD_NEW)
+                self.assertTrue(r_cat["paused"])
+                self.assertEqual(r_cat["reason"], "catalog_disabled")
+            finally:
+                store.close()
+
+            # 7. CLI `refresh --thread <URL> --discover --export` and Controller.discover_topic
+            provider.histories[THREAD_NEW] = TopicHistoryObservation(
+                topic=TopicObservation(
+                    forum_id=FORUM_ID,
+                    thread_id=THREAD_NEW,
+                    title="Fictional Valley Route",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_NEW),
+                    starter_message_id=THREAD_NEW,
+                    observed_guild_id=GUILD_ID,
+                    observed_parent_forum_id=FORUM_ID,
+                ),
+                messages=[
+                    MessageObservation(
+                        entity_ref=f"msg:{THREAD_NEW}",
+                        message_id=THREAD_NEW,
+                        thread_id=THREAD_NEW,
+                        author={"user_id": ACTOR_USER_ID, "label": "Creator"},
+                        body="Sector Form:\nCondition: Clear",
+                        remote_created_at="2026-11-19T10:00:00Z",
+                    )
+                ],
+                complete=True,
+            )
+            fake_desktop_cls = lambda: provider  # noqa: E731
+            buf = io.StringIO()
+            with patch.object(forums_cli, "DesktopDiscordProvider", fake_desktop_cls), \
+                 redirect_stdout(buf):
+                rc = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "refresh", "--profile", prof.profile_id,
+                    "--provider", "desktop",
+                    "--thread", build_discord_channel_url(GUILD_ID, THREAD_NEW),
+                    "--discover", "--export",
+                ])
+            self.assertEqual(rc, 0)
+            cli_payload = json.loads(buf.getvalue())
+            self.assertTrue(cli_payload["result"]["discovered"])
+            self.assertEqual(cli_payload["result"]["identity"]["parent_forum_id"], FORUM_ID)
+            self.assertGreaterEqual(cli_payload["result"]["metrics"]["desktop_reads"], 2)
+            self.assertGreaterEqual(cli_payload["result"]["metrics"]["changed_entities"], 1)
+            self.assertTrue(cli_payload["exported"])
+
+            ctrl = ForumMirrorController(profiles_path=profiles_path, provider_factory=lambda _p: provider, handoff_provider_factory=lambda: provider)
+            ctrl_res = ctrl.discover_topic(build_discord_channel_url(GUILD_ID, THREAD_LOCKED), profile_id=prof.profile_id)
+            self.assertTrue(ctrl_res["discovered"])
+
+    def test_desktop_directory_foreground_scroll_root_and_not_found_cache(self) -> None:
+        from src.forums.config import upsert_forum_profile
+        from src.forums.providers import desktop as desktop_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=False)
+            upsert_forum_profile(prof, tmp / "profiles.json")
+            provider = desktop_mod.DesktopDiscordProvider()
+            same_url_sess = SessionDescription(
+                actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                app_name="Discord",
+                window_title="Example Supply Forum",
+                window_bbox=(0, 0, 1280, 800),
+                current_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                capabilities={"can_read_semantic": True, "can_stage_composer": False},
+            )
+            all_cards = [
+                TopicObservation(
+                    forum_id=FORUM_ID,
+                    thread_id=str(700000000000000000 + i),
+                    title=f"Directory Item {i}",
+                    source_url=build_discord_channel_url(GUILD_ID, str(700000000000000000 + i)),
+                )
+                for i in range(24)
+            ]
+            list_sentinel = object()
+            fake_win_nodes = [{"role": "AXButton", "description": "Post Directory Item", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()}]
+
+            # 1. Foreground refusal sends zero scroll inputs to another app
+            with patch.object(provider, "describe_session", return_value=same_url_sess), \
+                 patch.object(provider, "_is_discord_frontmost", return_value=False), \
+                 patch.object(provider, "_activate_discord_window") as mock_act, \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_extract_post_cards_and_links", return_value=(all_cards[:6], [], list_sentinel)), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_win_nodes), \
+                 patch.object(desktop_mod, "_ax_bounds", return_value=(100.0, 150.0, 360.0, 600.0)), \
+                 patch.object(desktop_mod, "_scroll_at_point") as mock_scroll, \
+                 patch.object(desktop_mod.time, "sleep"):
+                fg_fail = provider.list_topics(GUILD_ID, FORUM_ID, limit=50)
+            self.assertFalse(fg_fail.complete)
+            self.assertEqual(fg_fail.errors[0]["code"], "window_not_foreground")
+            mock_act.assert_called()
+            mock_scroll.assert_not_called()
+
+            # 2. Invalid/empty scroll root & empty stagnant directory fail closed
+            with patch.object(provider, "describe_session", return_value=same_url_sess), \
+                 patch.object(provider, "_is_discord_frontmost", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_extract_post_cards_and_links", return_value=([], [], None)), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=[]):
+                bad_root = provider.list_topics(GUILD_ID, FORUM_ID, limit=50)
+            self.assertFalse(bad_root.complete)
+            self.assertEqual(bad_root.errors[0]["code"], "scroll_root_unverified")
+
+            with patch.object(provider, "describe_session", return_value=same_url_sess), \
+                 patch.object(provider, "_is_discord_frontmost", return_value=True), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_extract_post_cards_and_links", return_value=([], [], list_sentinel)), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=[]), \
+                 patch.object(desktop_mod, "_ax_bounds", return_value=(100.0, 150.0, 360.0, 600.0)), \
+                 patch.object(desktop_mod, "_scroll_at_point", return_value=True), \
+                 patch.object(desktop_mod.time, "sleep"):
+                empty_dir = provider.list_topics(GUILD_ID, FORUM_ID, limit=50)
+            self.assertFalse(empty_dir.complete)
+            self.assertEqual(empty_dir.errors[0]["code"], "directory_empty_unverified")
+
+            # 3. Same-URL background window gets activated once, scrolls from bottom -> top before scanning all 24 items
+            scroll_pos = {"idx": 18}
+            front_seq = iter([False, True, True, True, True, True, True, True, True, True, True, True])
+            def fake_extract(_n, _g, _f):
+                s = scroll_pos["idx"]
+                return all_cards[s : min(24, s + 6)], [], list_sentinel
+            def fake_scroll(_x, _y, delta_lines):
+                if delta_lines > 0:
+                    scroll_pos["idx"] = max(0, scroll_pos["idx"] - 8)
+                else:
+                    scroll_pos["idx"] = min(18, scroll_pos["idx"] + 6)
+                return True
+
+            with patch.object(provider, "describe_session", return_value=same_url_sess), \
+                 patch.object(provider, "_is_discord_frontmost", side_effect=lambda: next(front_seq, True)), \
+                 patch.object(provider, "_activate_discord_window") as mock_act_bg, \
+                 patch.object(provider, "navigate_to_url", side_effect=AssertionError("same URL should not navigate")), \
+                 patch.object(provider, "_get_ax_window", return_value=object()), \
+                 patch.object(provider, "_extract_post_cards_and_links", side_effect=fake_extract), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=fake_win_nodes), \
+                 patch.object(desktop_mod, "_ax_bounds", return_value=(100.0, 150.0, 360.0, 600.0)), \
+                 patch.object(desktop_mod, "_scroll_at_point", side_effect=fake_scroll), \
+                 patch.object(desktop_mod.time, "sleep"):
+                full_res = provider.list_topics(GUILD_ID, FORUM_ID, limit=50)
+            mock_act_bg.assert_called_once()
+            self.assertTrue(full_res.complete)
+            self.assertEqual([t.thread_id for t in full_res.topics], [t.thread_id for t in all_cards])
+
+            # 4. Filtered listing preserves partial mirror & records filter-scoped not_found_cache invalidated on directory change/discover
+            fake_prov = FakeForumProvider()
+            fake_prov.topic_pages = [
+                TopicListObservation(
+                    topics=[all_cards[0]],
+                    next_cursor=None,
+                    complete=False,
+                    filter_state="tag:Pending",
+                    errors=[{"code": "directory_filtered", "message": "Filtered view", "filter_state": "tag:Pending"}],
+                )
+            ]
+            fake_prov.histories[all_cards[0].thread_id] = TopicHistoryObservation(
+                topic=all_cards[0],
+                messages=[
+                    MessageObservation(
+                        entity_ref=f"msg:{all_cards[0].thread_id}",
+                        message_id=all_cards[0].thread_id,
+                        thread_id=all_cards[0].thread_id,
+                        author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                        body="Visible starter",
+                        remote_created_at="2026-11-19T08:00:00Z",
+                    )
+                ],
+                complete=True,
+            )
+            store = ForumStore(prof.db_path)
+            try:
+                reader = ForumReader(prof, store, fake_prov)
+                backfill = reader.initial_backfill()
+                self.assertEqual(backfill["coverage"]["topics"], "partial")
+                self.assertEqual(backfill["coverage"]["errors"][0]["filter_state"], "tag:Pending")
+
+                unknown_tid = "700000000000000999"
+                miss1 = reader.refresh_topic(unknown_tid)
+                self.assertEqual(miss1["reason"], "topic_not_in_configured_mirror")
+                self.assertEqual(miss1["metrics"]["cache_hits"], 0)
+                self.assertEqual(miss1["not_found_observation"]["filter_state"], "tag:Pending")
+                self.assertIsNone(store.get_not_found_observation(target_key=unknown_tid, filter_state=None))
+
+                miss2 = reader.refresh_topic(unknown_tid)
+                self.assertEqual(miss2["metrics"]["cache_hits"], 1)
+
+                # Directory change invalidates cached not-found observations in the scope
+                store.upsert_topic(thread_id=all_cards[1].thread_id, forum_id=FORUM_ID, title=all_cards[1].title)
+                self.assertIsNone(store.get_not_found_observation(target_key=unknown_tid, filter_state="tag:Pending"))
+
+                # Discovering a supplied new link also invalidates target_key cache entry
+                miss3 = reader.refresh_topic(unknown_tid)
+                self.assertEqual(miss3["metrics"]["cache_hits"], 0)
+                fake_prov.histories[unknown_tid] = TopicHistoryObservation(
+                    topic=TopicObservation(
+                        forum_id=FORUM_ID,
+                        thread_id=unknown_tid,
+                        title="Supplied Unfiltered Thread",
+                        source_url=build_discord_channel_url(GUILD_ID, unknown_tid),
+                        starter_message_id=unknown_tid,
+                        observed_guild_id=GUILD_ID,
+                        observed_parent_forum_id=FORUM_ID,
+                    ),
+                    messages=[
+                        MessageObservation(
+                            entity_ref=f"msg:{unknown_tid}",
+                            message_id=unknown_tid,
+                            thread_id=unknown_tid,
+                            author={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                            body="Now discovered",
+                            remote_created_at="2026-11-19T10:15:00Z",
+                        )
+                    ],
+                    complete=True,
+                )
+                found = reader.discover_topic(unknown_tid)
+                self.assertTrue(found["discovered"])
+                self.assertIsNone(store.get_not_found_observation(target_key=unknown_tid, filter_state="tag:Pending"))
+            finally:
+                store.close()
+
+    def test_starter_requirement_normalization_and_pre_stage_refresh(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from src.forums import __main__ as forums_cli
+        from src.forums.config import upsert_forum_profile
+        from src.forums.exchange import canonical_record_digest
+        from src.forums.models import topic_starter_requirement_id
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            profiles_path = tmp / "profiles.json"
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=True)
+            upsert_forum_profile(prof, profiles_path)
+
+            provider = FakeForumProvider()
+            provider.topic_pages = [
+                TopicListObservation(
+                    topics=[
+                        TopicObservation(
+                            forum_id=FORUM_ID,
+                            thread_id=THREAD_1,
+                            title="Target Topic Form",
+                            source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                            starter_message_id=THREAD_1,
+                            observed_guild_id=GUILD_ID,
+                            observed_parent_forum_id=FORUM_ID,
+                        )
+                    ],
+                    next_cursor=None,
+                    complete=True,
+                )
+            ]
+            provider.histories[THREAD_1] = TopicHistoryObservation(
+                topic=TopicObservation(
+                    forum_id=FORUM_ID,
+                    thread_id=THREAD_1,
+                    title="Target Topic Form",
+                    source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                    starter_message_id=THREAD_1,
+                    observed_guild_id=GUILD_ID,
+                    observed_parent_forum_id=FORUM_ID,
+                ),
+                messages=[
+                    MessageObservation(
+                        entity_ref=f"msg:{THREAD_1}",
+                        message_id=THREAD_1,
+                        thread_id=THREAD_1,
+                        author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                        body="Sector Form:\r\nLocation: East Ridge\nStatus: Active\n\nToday at 4:15 PM\n(edited)\n",
+                        remote_created_at="2026-11-19T08:00:00Z",
+                    )
+                ],
+                complete=True,
+            )
+
+            store = ForumStore(prof.db_path)
+            try:
+                reader = ForumReader(prof, store, provider)
+                backfill = reader.initial_backfill()
+                self.assertIn("metrics", backfill)
+
+                snap1 = store.export_snapshot()
+                req_id = topic_starter_requirement_id(THREAD_1)
+                reqs1 = {r["requirement_id"]: r for r in snap1["requirements"]}
+                self.assertIn(req_id, reqs1)
+                self.assertEqual(reqs1[req_id]["body"], "Sector Form:\nLocation: East Ridge\nStatus: Active")
+                self.assertEqual(reqs1[req_id]["source_entity_ref"], f"msg:{THREAD_1}")
+                self.assertEqual(reqs1[req_id]["revision"], 1)
+
+                # UI timestamp decoration update only -> unchanged logical requirement hash & revision
+                provider.histories[THREAD_1].messages[0].body = (
+                    "Sector Form:\nLocation: East Ridge\nStatus: Active\n\nThursday, November 19, 2026 at 5:02 PM\n"
+                )
+                ref_ts = reader.refresh_topic(THREAD_1)
+                self.assertTrue(ref_ts["topic_complete"])
+                reqs2 = {r["requirement_id"]: r for r in store.export_snapshot()["requirements"]}
+                self.assertEqual(reqs2[req_id]["revision"], 1)
+                self.assertEqual(reqs2[req_id]["content_hash"], reqs1[req_id]["content_hash"])
+
+                # Interrupted partial read preserves prior complete starter requirement and records gap
+                provider.histories[THREAD_1] = TopicHistoryObservation(
+                    topic=TopicObservation(
+                        forum_id=FORUM_ID,
+                        thread_id=THREAD_1,
+                        title="Target Topic Form",
+                        source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                        starter_message_id=None,
+                    ),
+                    messages=[
+                        MessageObservation(
+                            entity_ref=f"msg:{THREAD_1}",
+                            message_id=THREAD_1,
+                            thread_id=THREAD_1,
+                            author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                            body="Truncated incomplete body",
+                        )
+                    ],
+                    next_cursor="msgscroll:up:1",
+                    complete=False,
+                    errors=[{"code": "history_scroll_interrupted", "message": "Scroll interrupted", "thread_id": THREAD_1}],
+                )
+                reader.session.release_read()
+                part_res = reader.refresh_topic(THREAD_1)
+                self.assertFalse(part_res["topic_complete"])
+                self.assertTrue(part_res["coverage"]["pending"])
+                reqs_after_part = {r["requirement_id"]: r for r in store.export_snapshot()["requirements"]}
+                self.assertEqual(reqs_after_part[req_id]["revision"], 1)
+                self.assertEqual(reqs_after_part[req_id]["body"], "Sector Form:\nLocation: East Ridge\nStatus: Active")
+
+                # Restore complete starter state and export exchange before bundle creation
+                provider.histories[THREAD_1] = TopicHistoryObservation(
+                    topic=TopicObservation(
+                        forum_id=FORUM_ID,
+                        thread_id=THREAD_1,
+                        title="Target Topic Form",
+                        source_url=build_discord_channel_url(GUILD_ID, THREAD_1),
+                        starter_message_id=THREAD_1,
+                    ),
+                    messages=[
+                        MessageObservation(
+                            entity_ref=f"msg:{THREAD_1}",
+                            message_id=THREAD_1,
+                            thread_id=THREAD_1,
+                            author={"user_id": ACTOR_USER_ID, "label": "Starter"},
+                            body="Sector Form:\nLocation: East Ridge\nStatus: Active",
+                            remote_created_at="2026-11-19T08:00:00Z",
+                        )
+                    ],
+                    complete=True,
+                )
+                reader.refresh_topic(THREAD_1)
+                snap_clean = store.export_snapshot()
+            finally:
+                store.close()
+
+            def make_bundle(draft_id: str, rev: int, body_text: str) -> Path:
+                draft = validate_exchange_record({
+                    "schema": "draft.request.v1",
+                    "record_id": f"drec-{draft_id}-{rev}",
+                    "producer_id": "external-tool",
+                    "created_at": "2026-11-19T11:00:00Z",
+                    "scope": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "actor": provider.actor},
+                    "draft_id": draft_id,
+                    "revision": rev,
+                    "action": "reply_existing",
+                    "destination": {"guild_id": GUILD_ID, "forum_id": FORUM_ID, "thread_id": THREAD_1, "message_id": None, "source_url": build_discord_channel_url(GUILD_ID, THREAD_1)},
+                    "body": body_text,
+                    "title": None,
+                    "tags": [],
+                    "evidence": [],
+                    "baseline": {
+                        "snapshot_id": snap_clean["snapshot_id"],
+                        "snapshot_revision": snap_clean["revision"],
+                        "requirements": [
+                            {"requirement_id": r["requirement_id"], "revision": r["revision"], "content_hash": r["content_hash"]}
+                            for r in snap_clean["requirements"]
+                        ],
+                        "message_content_hash": None,
+                    },
+                })
+                bdir = tmp / "bundles" / canonical_record_digest(draft)
+                bdir.mkdir(parents=True, exist_ok=True)
+                (bdir / "draft.request.json").write_text(json.dumps(draft), encoding="utf-8")
+                return bdir
+
+            # 1. Unchanged pre-stage refresh retains logical baseline & stages cleanly via default CLI `stage`
+            bundle_ok = make_bundle("ext-starter-check-ok", 1, "Verified update matching current starter")
+            buf_ok = io.StringIO()
+            with patch.object(forums_cli, "DesktopDiscordProvider", lambda: provider), \
+                 redirect_stdout(buf_ok):
+                rc_ok = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "stage", "--profile", prof.profile_id,
+                    "--bundle-dir", str(bundle_ok),
+                ])
+            self.assertEqual(rc_ok, 0)
+            rcpt_ok = json.loads(buf_ok.getvalue())
+            self.assertEqual(rcpt_ok["status"], "staged")
+            self.assertEqual(len(provider.stage_calls), 1)
+            self.assertEqual(provider.send_pressed_count, 0)
+            SessionController(Path(prof.db_path).with_suffix(".session.json")).release_review()
+
+            # 2. Silent starter form edit after bundle creation blocks staging with needs_review & zero composer touches
+            provider._session_cache = (9999999999.0, provider.describe_session())
+            provider.histories[THREAD_1].messages[0].body = "Sector Form:\nLocation: East Ridge\nStatus: Closed — New Format Required"
+            bundle_stale = make_bundle("ext-starter-check-stale", 1, "Written against old starter")
+            buf_stale = io.StringIO()
+            with patch.object(forums_cli, "DesktopDiscordProvider", lambda: provider), \
+                 redirect_stdout(buf_stale):
+                rc_stale = forums_cli.main([
+                    "--profiles-path", str(profiles_path),
+                    "stage", "--profile", prof.profile_id,
+                    "--bundle-dir", str(bundle_stale),
+                ])
+            self.assertEqual(rc_stale, 0)
+            self.assertIsNone(provider._session_cache)
+            rcpt_stale = json.loads(buf_stale.getvalue())
+            self.assertEqual(rcpt_stale["status"], "needs_review")
+            self.assertIn(f"topic-starter:{THREAD_1}", rcpt_stale["reason"])
+            self.assertEqual(len(provider.stage_calls), 1)
+            self.assertEqual(provider.send_pressed_count, 0)
+
+    def test_desktop_metrics_guidance_only_and_seek_incomplete(self) -> None:
+        import time
+        from src.forums.providers import desktop as desktop_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            prof = _make_profile(tmp, purpose="external_project", stage_enabled=False)
+
+            desk = desktop_mod.DesktopDiscordProvider()
+            good_sess = SessionDescription(
+                actor={"user_id": ACTOR_USER_ID, "label": "Tester"},
+                app_name="Discord",
+                window_title="Example Forum",
+                window_bbox=(0, 0, 1280, 800),
+                current_url=build_discord_channel_url(GUILD_ID, FORUM_ID),
+                capabilities={"can_read_semantic": True, "can_stage_composer": False},
+            )
+            # 1. Verify DesktopDiscordProvider metrics track cache_hits, desktop_reads, pages_read, ui_actions
+            desk._session_cache = (time.monotonic(), good_sess)
+            self.assertEqual(desk.describe_session().window_title, "Example Forum")
+            snap_m = desk.metrics_snapshot()
+            self.assertEqual(snap_m["cache_hits"], 1)
+
+            cards = [
+                TopicObservation(
+                    forum_id=FORUM_ID,
+                    thread_id=str(800000000000000000 + i),
+                    title=f"Item {i}",
+                    source_url=build_discord_channel_url(GUILD_ID, str(800000000000000000 + i)),
+                )
+                for i in range(4)
+            ]
+            list_sentinel = object()
+            win_nodes = [{"role": "AXButton", "description": "Post Item", "title": "", "value": "", "url": "", "dom_id": "", "depth": 1, "element": object()}]
+            # Seek cursor never appears in static viewport -> stagnant before anchor must return complete=False
+            with patch.object(desk, "describe_session", return_value=good_sess), \
+                 patch.object(desk, "_is_discord_frontmost", return_value=True), \
+                 patch.object(desk, "_get_ax_window", return_value=object()), \
+                 patch.object(desk, "_extract_post_cards_and_links", return_value=(cards, [], list_sentinel)), \
+                 patch.object(desktop_mod, "_walk_ax_tree", return_value=win_nodes), \
+                 patch.object(desktop_mod, "_ax_bounds", return_value=(100.0, 150.0, 360.0, 600.0)), \
+                 patch.object(desktop_mod, "_scroll_at_point", return_value=True), \
+                 patch.object(desktop_mod.time, "sleep"):
+                stagnant_seek = desk.list_topics(GUILD_ID, FORUM_ID, cursor="dirscroll:800000000000999999", limit=20)
+            self.assertFalse(stagnant_seek.complete)
+            self.assertEqual(stagnant_seek.next_cursor, "dirscroll:800000000000999999")
+            post_seek_m = desk.metrics_snapshot()
+            self.assertGreaterEqual(post_seek_m["desktop_reads"], 1)
+            self.assertGreaterEqual(post_seek_m["pages_read"], 1)
+            self.assertGreaterEqual(post_seek_m["ui_actions"], 1)
+
+            # 2. Verify refresh_guidance_only emits complete metrics keys and updates changed_entities cleanly
+            prov = FakeForumProvider()
+            store = ForumStore(prof.db_path)
+            try:
+                g_res = ForumReader(prof, store, prov).refresh_guidance_only()
+                self.assertFalse(g_res["paused"])
+                self.assertTrue(g_res["requirements_complete"])
+                m = g_res["metrics"]
+                for key in ("elapsed_ms", "desktop_reads", "pages_read", "cache_hits", "changed_entities", "ui_actions", "reasons"):
+                    self.assertIn(key, m)
+                self.assertGreaterEqual(m["changed_entities"], 1)
+                self.assertEqual(m["reasons"], ["ok"])
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

@@ -55,6 +55,8 @@ class TopicObservation:
     archived: Optional[bool] = None
     locked: Optional[bool] = None
     remote_last_activity_at: Optional[str] = None
+    observed_guild_id: Optional[str] = None
+    observed_parent_forum_id: Optional[str] = None
     source_method: str = "semantic"
     confidence: Optional[float] = 1.0
     observed_at: str = field(default_factory=utc_now_iso)
@@ -69,6 +71,7 @@ class TopicListObservation:
     next_cursor: Optional[str] = None
     complete: bool = False
     errors: list[dict[str, Any]] = field(default_factory=list)
+    filter_state: Optional[str] = None
     source_method: str = "semantic"
     observed_at: str = field(default_factory=utc_now_iso)
 

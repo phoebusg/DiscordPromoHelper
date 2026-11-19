@@ -168,6 +168,31 @@ class ForumMirrorController:
         finally:
             store.close()
 
+    def discover_topic(
+        self,
+        target: str,
+        *,
+        profile_id: Optional[str] = None,
+        refresh_requirements: bool = True,
+    ) -> dict[str, Any]:
+        prof = self.current_profile(profile_id)
+        if prof is None:
+            raise ValueError("No forum profile selected")
+        store = ForumStore(prof.db_path)
+        try:
+            provider = self.make_provider(prof)
+            reader = ForumReader(prof, store, provider, session_controller=self.session_controller)
+            result = reader.discover_topic(target, refresh_requirements=refresh_requirements)
+            if prof.exchange_dir and result.get("discovered") and not result.get("paused"):
+                store.export_exchange_dir(
+                    prof.exchange_dir,
+                    guild_id=prof.guild_id,
+                    forum_id=prof.forum_id,
+                )
+            return result
+        finally:
+            store.close()
+
     def search(self, query: str) -> dict[str, Any]:
         prof = self.current_profile()
         if prof is None:
@@ -297,7 +322,7 @@ class ForumMirrorController:
         self.current_source_kind = "promotion"
         return draft, conflicts
 
-    def stage_current_draft(self) -> dict[str, Any]:
+    def stage_current_draft(self, *, refresh_before_stage: bool = True) -> dict[str, Any]:
         prof = self.current_profile()
         if prof is None or self.current_draft is None:
             raise ValueError("Select a profile and load or build a draft first.")
@@ -316,12 +341,14 @@ class ForumMirrorController:
                     self.current_bundle_dir,
                     prof,
                     source_kind=self.current_source_kind,
+                    refresh_before_stage=refresh_before_stage,
                 )
             return mgr.stage_draft_request(
                 self.current_draft,
                 prof,
                 source_kind=self.current_source_kind,
                 transfer_root=self.current_transfer_root,
+                refresh_before_stage=refresh_before_stage,
             )
         finally:
             store.close()

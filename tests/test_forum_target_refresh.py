@@ -224,8 +224,13 @@ class TestTargetRefresh(unittest.TestCase):
         self.assertFalse(t2_status["history_complete"])
         self.assertEqual(t2_status["pending_reason"], "history_unread")
 
+        self.assertEqual(seen_refs[0], [{"requirement_id": "poi-guidance-custom", "thread_id": guide_tid, "source_entity_ref": None}])
+
         f_status = self.store.get_forum_status()
-        self.assertEqual(f_status["counts"]["requirements"], 1)
+        self.assertEqual(f_status["counts"]["requirements"], 2)
+        reqs_by_id = {r["requirement_id"]: r for r in self.store.export_snapshot()["requirements"]}
+        self.assertIn(f"topic-starter:{THREAD_1}", reqs_by_id)
+        self.assertEqual(reqs_by_id[f"topic-starter:{THREAD_1}"]["source_entity_ref"], "msg:100000000000000105")
         self.assertEqual(f_status["counts"]["topics_deep_read"], 1)
         self.assertEqual(f_status["counts"]["topics_pending_history"], 1)
         self.assertIn("exported_checkpoint", f_status)

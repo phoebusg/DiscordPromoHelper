@@ -124,6 +124,46 @@ def build_discord_channel_url(
     return f"https://discord.com/channels/{gid}/{cid}"
 
 
+TOPIC_STARTER_REQ_PREFIX = "topic-starter:"
+
+_TRAILING_UI_TS_PATTERNS = (
+    re.compile(r"^\(?edited\)?$", re.IGNORECASE),
+    re.compile(r"^(?:today|yesterday)\s+at\s+\d{1,2}:\d{2}(?:[\s\u202f]*[ap]m)?$", re.IGNORECASE),
+    re.compile(
+        r"^(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+[a-z]+\s+\d{1,2},\s+\d{4}(?:\s+at\s+|[\s,]+)\d{1,2}:\d{2}(?:[\s\u202f]*[ap]m)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:,?\s+(?:at\s+)?\d{1,2}:\d{2}(?:[\s\u202f]*[ap]m)?)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?z?$", re.IGNORECASE),
+)
+
+
+def topic_starter_requirement_id(thread_id: str) -> str:
+    """Return canonical namespaced requirement_id for a topic starter form."""
+    return f"{TOPIC_STARTER_REQ_PREFIX}{require_discord_id(thread_id, 'thread_id')}"
+
+
+def normalize_starter_requirement_body(raw_body: str) -> str:
+    """Normalize line endings/outer blanks and strip trailing Discord UI timestamp decorations."""
+    normalized = normalize_text_for_hash(raw_body or "")
+    lines = [ln.rstrip() for ln in normalized.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines:
+        tail = lines[-1].replace("\u202f", " ").replace("\u00a0", " ").strip()
+        if not tail:
+            lines.pop()
+            continue
+        if any(pat.match(tail) for pat in _TRAILING_UI_TS_PATTERNS):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines)
+
+
 def build_server_scan_coverage(
     servers: list[dict[str, Any]],
     stop_reason: str = "unknown",

@@ -16,6 +16,7 @@ from .changes import (
 )
 from .exchange import RecordConflictError, validate_exchange_record, write_record_atomic
 from .models import (
+    TOPIC_STARTER_REQ_PREFIX,
     build_discord_channel_url,
     compute_bytes_sha256,
     compute_content_hash,
@@ -231,6 +232,17 @@ class ForumStore:
                     target_cursor_seq INTEGER NOT NULL,
                     change_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS not_found_cache (
+                    scope_key TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    filter_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    directory_revision INTEGER NOT NULL,
+                    extra_json TEXT NOT NULL,
+                    PRIMARY KEY (scope_key, target_key, filter_key)
                 );
                 """
             )
@@ -686,6 +698,9 @@ class ForumStore:
                 chg = build_change_event(
                     "topic", tid, "added", None, rev, source_method, url, confidence, entity, observed_at=now
                 )
+                self._conn.execute(
+                    "DELETE FROM not_found_cache WHERE scope_key = ?", (meta["scope_key"],)
+                )
                 self._bump_snapshot_revision_and_append_change(meta, chg)
                 return chg
 
@@ -743,6 +758,9 @@ class ForumStore:
                 kind = "edited"
             chg = build_change_event(
                 "topic", tid, kind, before_rev, rev, source_method, url, confidence, entity, observed_at=now
+            )
+            self._conn.execute(
+                "DELETE FROM not_found_cache WHERE scope_key = ?", (meta["scope_key"],)
             )
             self._bump_snapshot_revision_and_append_change(meta, chg)
             return chg
@@ -1237,6 +1255,8 @@ class ForumStore:
         ).fetchall()
         refs: list[dict[str, Any]] = []
         for row in rows:
+            if str(row["requirement_id"] or "").startswith(TOPIC_STARTER_REQ_PREFIX):
+                continue
             tid: Optional[str] = None
             src_url = row["source_url"]
             if src_url:
@@ -2643,3 +2663,139 @@ class ForumStore:
             "coverage": cov,
             "topics": page,
         }
+
+    def current_change_seq(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> int:
+        """Return current change cursor sequence number for this mirror scope."""
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        return int(meta["cursor_seq"])
+
+    def get_topic_starter_message(self, thread_id: str) -> Optional[dict[str, Any]]:
+        """Return the starter message row for a mirrored topic when known or deeply read."""
+        tid = require_discord_id(thread_id, "thread_id")
+        topic = self._conn.execute("SELECT * FROM topics WHERE thread_id = ?", (tid,)).fetchone()
+        if topic is None:
+            return None
+        msgs = self._conn.execute(
+            "SELECT * FROM messages WHERE thread_id = ? ORDER BY ts_sort_key(COALESCE(remote_created_at, observed_at)), entity_ref",
+            (tid,),
+        ).fetchall()
+        if not msgs:
+            return None
+        starter_mid = topic["starter_message_id"]
+        if starter_mid:
+            for m in msgs:
+                if str(m["message_id"] or "") == str(starter_mid):
+                    return dict(m)
+        for m in msgs:
+            if str(m["message_id"] or "") == tid:
+                return dict(m)
+        if topic["last_deep_read_at"]:
+            return dict(msgs[0])
+        return None
+
+    def record_not_found_observation(
+        self,
+        *,
+        target_key: str,
+        reason: str,
+        filter_state: Optional[str] = None,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+        observed_at: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Cache an explicit missing/not-found observation bound to scope, filter, and directory revision."""
+        if not isinstance(target_key, str) or not target_key.strip():
+            raise ValueError("target_key must be a non-empty string")
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        now = observed_at or utc_now_iso()
+        f_key = (filter_state or "").strip()
+        dir_rev = int(meta["snapshot_revision"])
+        t_key = target_key.strip()
+        payload_extra = dict(extra or {})
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO not_found_cache (
+                    scope_key, target_key, filter_key, reason, observed_at, directory_revision, extra_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_key, target_key, filter_key) DO UPDATE SET
+                    reason = excluded.reason,
+                    observed_at = excluded.observed_at,
+                    directory_revision = excluded.directory_revision,
+                    extra_json = excluded.extra_json
+                """,
+                (meta["scope_key"], t_key, f_key, str(reason), now, dir_rev, json.dumps(payload_extra)),
+            )
+        return {
+            "scope_key": meta["scope_key"],
+            "guild_id": meta["guild_id"],
+            "forum_id": meta["forum_id"],
+            "target_key": t_key,
+            "filter_state": f_key or None,
+            "reason": str(reason),
+            "observed_at": now,
+            "directory_revision": dir_rev,
+            "extra": payload_extra,
+        }
+
+    def get_not_found_observation(
+        self,
+        *,
+        target_key: str,
+        filter_state: Optional[str] = None,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return a valid not-found observation only if the mirror directory revision is unchanged."""
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        f_key = (filter_state or "").strip()
+        row = self._conn.execute(
+            """
+            SELECT * FROM not_found_cache
+            WHERE scope_key = ? AND target_key = ? AND filter_key = ?
+            """,
+            (meta["scope_key"], target_key.strip(), f_key),
+        ).fetchone()
+        if row is None:
+            return None
+        if int(row["directory_revision"]) != int(meta["snapshot_revision"]):
+            return None
+        return {
+            "scope_key": row["scope_key"],
+            "guild_id": meta["guild_id"],
+            "forum_id": meta["forum_id"],
+            "target_key": row["target_key"],
+            "filter_state": row["filter_key"] or None,
+            "reason": row["reason"],
+            "observed_at": row["observed_at"],
+            "directory_revision": int(row["directory_revision"]),
+            "extra": json.loads(row["extra_json"]),
+        }
+
+    def invalidate_not_found_cache(
+        self,
+        *,
+        target_key: Optional[str] = None,
+        guild_id: Optional[str] = None,
+        forum_id: Optional[str] = None,
+    ) -> int:
+        """Invalidate cached not-found observations for one target or an entire mirror scope."""
+        meta = self._get_meta(self._scope_key_from(guild_id, forum_id))
+        with self._conn:
+            if target_key is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM not_found_cache WHERE scope_key = ? AND target_key = ?",
+                    (meta["scope_key"], target_key.strip()),
+                )
+            else:
+                cur = self._conn.execute(
+                    "DELETE FROM not_found_cache WHERE scope_key = ?",
+                    (meta["scope_key"],),
+                )
+        return int(cur.rowcount or 0)

@@ -154,6 +154,13 @@ def cmd_seed_index(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
+    discover_mode = bool(getattr(args, "discover", False))
+    if discover_mode and not getattr(args, "thread", None):
+        print("--discover requires --thread", file=sys.stderr)
+        return 2
+    if discover_mode and args.backfill:
+        print("--discover and --backfill cannot be combined", file=sys.stderr)
+        return 2
     if getattr(args, "thread", None) and args.backfill:
         print("--thread and --backfill cannot be combined", file=sys.stderr)
         return 2
@@ -169,7 +176,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         provider, use_seed = _select_provider(args.provider, prof, desktop, session_desc)
         ctrl = _session_controller_for(prof)
         reader = ForumReader(prof, store, provider, session_controller=ctrl)
-        if getattr(args, "thread", None):
+        if discover_mode:
+            res = reader.discover_topic(args.thread)
+        elif getattr(args, "thread", None):
             res = reader.refresh_topic(args.thread)
         elif args.backfill:
             res = reader.initial_backfill(max_topics_per_run=args.max_topics)
@@ -186,7 +195,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             )
 
         exported: dict[str, Any] = {}
-        if args.export and not res.get("paused"):
+        if args.export and not res.get("paused") and (not discover_mode or res.get("discovered")):
             exported = store.export_exchange_dir(
                 prof.exchange_dir,
                 force_snapshot=getattr(args, "snapshot", False),
@@ -208,11 +217,20 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         )
     finally:
         store.close()
+    if discover_mode:
+        complete = (
+            not res.get("paused")
+            and bool(res.get("discovered"))
+            and bool(res.get("topic_complete"))
+            and bool(res.get("requirements_complete"))
+            and not res.get("errors")
+        )
+        return 0 if complete else 2
     if getattr(args, "thread", None):
         complete = (
             not res.get("paused")
-            and res.get("topic_complete")
-            and res.get("requirements_complete")
+            and bool(res.get("topic_complete"))
+            and bool(res.get("requirements_complete"))
             and not res.get("errors")
         )
         return 0 if complete else 2
@@ -307,19 +325,40 @@ def cmd_stage(args: argparse.Namespace) -> int:
             session_controller=_session_controller_for(prof),
             exchange_dir=prof.exchange_dir,
         )
+        do_refresh = bool(getattr(args, "refresh_before_stage", True))
         if bundle_dir:
-            receipt = mgr.stage_draft_bundle(bundle_dir, prof, source_kind=args.source_kind)
+            receipt = mgr.stage_draft_bundle(
+                bundle_dir,
+                prof,
+                source_kind=args.source_kind,
+                refresh_before_stage=do_refresh,
+            )
         else:
             df = Path(draft_file)
             if df.is_dir():
-                receipt = mgr.stage_draft_bundle(df, prof, source_kind=args.source_kind)
+                receipt = mgr.stage_draft_bundle(
+                    df,
+                    prof,
+                    source_kind=args.source_kind,
+                    refresh_before_stage=do_refresh,
+                )
             elif df.name == "draft.request.json" and (
                 (df.parent / "transfer").exists() or len(df.parent.name) == 64
             ):
-                receipt = mgr.stage_draft_bundle(df.parent, prof, source_kind=args.source_kind)
+                receipt = mgr.stage_draft_bundle(
+                    df.parent,
+                    prof,
+                    source_kind=args.source_kind,
+                    refresh_before_stage=do_refresh,
+                )
             else:
                 draft = read_record(df)
-                receipt = mgr.stage_draft_request(draft, prof, source_kind=args.source_kind)
+                receipt = mgr.stage_draft_request(
+                    draft,
+                    prof,
+                    source_kind=args.source_kind,
+                    refresh_before_stage=do_refresh,
+                )
         if args.receipt_out:
             write_record_atomic(args.receipt_out, receipt)
         _print_json(receipt)
@@ -568,7 +607,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ref.add_argument("--profile", required=True)
     p_ref.add_argument("--provider", choices=["auto", "desktop", "seed"], default="auto")
     p_ref.add_argument("--backfill", action="store_true")
-    p_ref.add_argument("--thread", help="Refresh one already mirrored topic and guidance without a directory scan")
+    p_ref.add_argument("--thread", help="Refresh one mirrored (or with --discover, supplied) topic and guidance")
+    p_ref.add_argument("--discover", action="store_true", help="Discover and ingest a supplied --thread URL/ID if not yet mirrored")
     p_ref.add_argument("--deep-reread", type=int, default=2)
     p_ref.add_argument("--max-topics", type=int)
     p_ref.add_argument("--export", action="store_true")
@@ -605,6 +645,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_stg.add_argument("--draft-file", help="Path to draft.request.v1 JSON or bundle dir/draft.request.json")
     p_stg.add_argument("--bundle-dir", "--bundle", dest="bundle_dir", help="Path to <draft-record-hash>/ selected-file bundle directory")
     p_stg.add_argument("--source-kind", choices=["external", "promotion"], default="external")
+    p_stg.add_argument(
+        "--refresh-before-stage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refresh target/guidance before staging (use --no-refresh-before-stage to skip)",
+    )
     p_stg.add_argument("--receipt-out")
 
     p_rec = sub.add_parser("reconcile", help="Reconcile submission or mark user-confirmed")

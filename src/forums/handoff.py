@@ -450,6 +450,7 @@ class HandoffManager:
         source_kind: str = "external",
         expected_actor: Optional[dict[str, Any]] = None,
         require_hash_dirname: bool = True,
+        refresh_before_stage: bool = False,
     ) -> dict[str, Any]:
         """Validate an immutable <draft-record-hash>/ selected-file bundle and stage it."""
         draft, transfer_dir = ingest_draft_bundle(
@@ -462,6 +463,7 @@ class HandoffManager:
             source_kind=source_kind,
             expected_actor=expected_actor,
             transfer_root=transfer_dir,
+            refresh_before_stage=refresh_before_stage,
         )
 
     def _baseline_thread_messages(self, thread_id: Optional[str]) -> tuple[list[str], Optional[str]]:
@@ -488,6 +490,7 @@ class HandoffManager:
         source_kind: str = "external",
         expected_actor: Optional[dict[str, Any]] = None,
         transfer_root: Optional[str | Path] = None,
+        refresh_before_stage: bool = False,
     ) -> dict[str, Any]:
         """Stage a validated draft.request.v1 into Discord without pressing Send."""
         validate_exchange_record(draft_record)
@@ -569,6 +572,61 @@ class HandoffManager:
                     actor=obs_actor,
                     status="needs_review",
                     reason=f"cooldown_active_for_{cooldown_key}",
+                    exchange_dir=profile.exchange_dir,
+                )
+
+        if refresh_before_stage:
+            if hasattr(self.provider, "_session_cache"):
+                self.provider._session_cache = None  # Guarantee fresh session inspection without TTL bypass
+            from .reader import ForumReader
+
+            reader = ForumReader(
+                profile,
+                self.store,
+                self.provider,
+                session_controller=self.session,
+            )
+            dest_tid = draft_record["destination"].get("thread_id")
+            if draft_record.get("action") in ("reply_existing", "edit_own_message") and dest_tid:
+                ref_res = reader.refresh_topic(dest_tid)
+                ref_ok = (
+                    not ref_res.get("paused")
+                    and bool(ref_res.get("topic_complete"))
+                    and bool(ref_res.get("requirements_complete"))
+                    and not ref_res.get("errors")
+                )
+            else:
+                ref_res = reader.refresh_guidance_only()
+                ref_ok = (
+                    not ref_res.get("paused")
+                    and bool(ref_res.get("requirements_complete"))
+                    and not ref_res.get("errors")
+                )
+            out_ex_dir = profile.exchange_dir or (str(self.exchange_dir) if self.exchange_dir else None)
+            if not ref_res.get("paused") and out_ex_dir:
+                self.store.export_exchange_dir(
+                    out_ex_dir,
+                    guild_id=profile.guild_id,
+                    forum_id=profile.forum_id,
+                )
+            if not ref_ok:
+                if ref_res.get("paused"):
+                    reason = f"pre_stage_refresh_paused:{ref_res.get('reason') or 'paused'}"
+                else:
+                    err_parts = [
+                        str(e.get("code") or e.get("message") or "error")
+                        for e in (ref_res.get("errors") or [])
+                        if isinstance(e, dict)
+                    ]
+                    reason = "; ".join(err_parts) if err_parts else "pre_stage_refresh_incomplete"
+                self.store.update_draft_status(
+                    draft_id, draft_rev, "needs_review", needs_recheck=True, recheck_reason=reason
+                )
+                return self._make_receipt(
+                    draft_record=draft_record,
+                    actor=obs_actor,
+                    status="needs_review",
+                    reason=reason,
                     exchange_dir=profile.exchange_dir,
                 )
 
