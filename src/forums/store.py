@@ -28,6 +28,7 @@ from .models import (
 )
 
 DEFAULT_PRODUCER_ID = "discord-promo-helper"
+TERMINAL_DRAFT_STATUSES = ("rejected", "submission_observed", "user_confirmed_submitted")
 
 
 def _sqlite_ts_sort_key(value: Optional[str]) -> str:
@@ -2544,11 +2545,14 @@ class ForumStore:
         ).fetchone()[0]
         drafts_cnt = 0
         pending_recheck = 0
-        for dr in self._conn.execute("SELECT needs_recheck, record_json FROM drafts").fetchall():
+        for dr in self._conn.execute("SELECT status, needs_recheck, record_json FROM drafts").fetchall():
             rec_scope = json.loads(dr["record_json"]).get("scope") or {}
             if rec_scope.get("guild_id") == gid and rec_scope.get("forum_id") == fid:
                 drafts_cnt += 1
-                if int(dr["needs_recheck"] or 0) == 1:
+                if (
+                    int(dr["needs_recheck"] or 0) == 1
+                    and str(dr["status"]) not in TERMINAL_DRAFT_STATUSES
+                ):
                     pending_recheck += 1
         return {
             "snapshot_id": meta["snapshot_id"],
@@ -2827,7 +2831,14 @@ class ForumStore:
             lr = latest_receipts.get((did, rev))
             eff_status = str(lr.get("status") if lr else dr["status"])
             needs_recheck = bool(int(dr["needs_recheck"] or 0) == 1)
-            if eff_status in ("staged", "in_discord_review", "needs_review", "failed") or needs_recheck:
+            if (
+                str(dr["status"]) != "rejected"
+                and eff_status not in TERMINAL_DRAFT_STATUSES
+                and (
+                    eff_status in ("staged", "in_discord_review", "needs_review", "failed")
+                    or needs_recheck
+                )
+            ):
                 drafts_attention.append(
                     {
                         "draft_id": did,

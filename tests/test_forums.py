@@ -5386,6 +5386,23 @@ class TestBackfillPaginationAndTopicFilters(unittest.TestCase):
                 sess_ctrl.release_review()
                 with store._conn:
                     store._conn.execute("DELETE FROM export_outbox WHERE record_id = 'chg-outbox-test'")
+
+                # Terminal drafts must stay excluded from drafts_attention and drafts_needing_review even when needs_recheck=1
+                for terminal_st, r_reason in (("rejected", "superseded"), ("user_confirmed_submitted", "old_warning")):
+                    store.update_draft_status(
+                        "draft-queue-1",
+                        1,
+                        terminal_st,
+                        needs_recheck=True,
+                        recheck_reason=r_reason,
+                    )
+                    q_term = ctrl.get_attention_queue()
+                    self.assertEqual(q_term["counts"]["drafts_attention"], 0)
+                    self.assertEqual(q_term["drafts_attention"], [])
+                    self.assertEqual(q_term["next_action"]["action"], "idle")
+                    f_term = store.get_forum_status(guild_id=GUILD_ID, forum_id=FORUM_ID)
+                    self.assertEqual(f_term["counts"]["drafts_needing_review"], 0)
+
                 # Clean up synthetic bundle/draft for sync test
                 import shutil
                 shutil.rmtree(bad_bdir)
