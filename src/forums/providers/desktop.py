@@ -44,6 +44,15 @@ try:
 except Exception:
     pyautogui = None
 
+_REAL_PYAUTOGUI = pyautogui
+_MACOS_CMD_KEYCODES: dict[str, int] = {
+    "a": 0x00,
+    "c": 0x08,
+    "v": 0x09,
+    "x": 0x07,
+    "z": 0x06,
+}
+
 try:
     import pyperclip
 except Exception:
@@ -240,6 +249,33 @@ class DesktopDiscordProvider(DiscordViewProvider):
             raise RuntimeError(f"Refusing to press forbidden send-triggering key {key!r}")
         if pyautogui is not None:
             pyautogui.press(key)
+
+    def _safe_hotkey(self, *keys: str) -> None:
+        """Execute a keyboard shortcut safely; use explicit Quartz Command flags on macOS."""
+        for key in keys:
+            if str(key).lower() in self._FORBIDDEN_SEND_KEYS:
+                raise RuntimeError(f"Refusing to press forbidden send-triggering key in hotkey {keys!r}")
+        if (
+            sys.platform.startswith("darwin")
+            and Quartz is not None
+            and len(keys) == 2
+            and str(keys[0]).lower() in ("command", "cmd")
+            and str(keys[1]).lower() in _MACOS_CMD_KEYCODES
+            and (pyautogui is None or pyautogui is _REAL_PYAUTOGUI)
+        ):
+            keycode = _MACOS_CMD_KEYCODES[str(keys[1]).lower()]
+            cmd_flag = int(getattr(Quartz, "kCGEventFlagMaskCommand", 0x100000))
+            tap = int(getattr(Quartz, "kCGHIDEventTap", 0))
+            for is_down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, keycode, is_down)
+                if ev is not None:
+                    Quartz.CGEventSetFlags(ev, cmd_flag)
+                    Quartz.CGEventPost(tap, ev)
+                if is_down:
+                    time.sleep(0.02)
+            return
+        if pyautogui is not None:
+            pyautogui.hotkey(*keys)
 
     def describe_session(self, force_refresh: bool = False) -> SessionDescription:
         now_mono = time.monotonic()
@@ -1829,7 +1865,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 subprocess.run(["osascript", "-e", script], check=True, timeout=5.0)
                 time.sleep(0.1)
                 self._focus_element(composer_elem)
-                pyautogui.hotkey(paste_mod, "v")
+                self._safe_hotkey(paste_mod, "v")
                 deadline = time.monotonic() + 3.5
                 retried_paste = False
                 step = 0
@@ -1850,7 +1886,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
                         subprocess.run(["osascript", "-e", script], check=True, timeout=5.0)
                         time.sleep(0.1)
                         self._focus_element(cur_comp or composer_elem)
-                        pyautogui.hotkey(paste_mod, "v")
+                        self._safe_hotkey(paste_mod, "v")
             except Exception:
                 pass
         return False
@@ -1866,7 +1902,7 @@ class DesktopDiscordProvider(DiscordViewProvider):
         comp_elem, existing = self._inspect_composer(cur_win)
         if comp_elem is not None and existing:
             self._focus_element(comp_elem)
-            pyautogui.hotkey(mod, "a")
+            self._safe_hotkey(mod, "a")
             time.sleep(0.1)
             self._safe_key_press("backspace")
             time.sleep(0.25)
@@ -2125,13 +2161,15 @@ class DesktopDiscordProvider(DiscordViewProvider):
                 if title_elem is not None and not title_existing.strip():
                     self._focus_element(title_elem)
                     pyperclip.copy(draft_request["title"])
-                    pyautogui.hotkey(paste_mod, "v")
+                    time.sleep(0.08)
+                    self._safe_hotkey(paste_mod, "v")
                     time.sleep(0.2)
 
             # Focus body composer explicitly and paste exact multiline Unicode text (NEVER press Return/Send)
             self._focus_element(composer_elem)
             pyperclip.copy(draft_request["body"])
-            pyautogui.hotkey(paste_mod, "v")
+            time.sleep(0.08)
+            self._safe_hotkey(paste_mod, "v")
             time.sleep(0.35)
 
             latest_win = self._get_ax_window() or ax_win

@@ -1857,6 +1857,55 @@ class TestCompletionHandoffPriorities(unittest.TestCase):
             self.assertEqual(pid_mock.call_count, 2)
             self.assertFalse(s3.capabilities.get("can_read_ocr"))
 
+    def test_safe_hotkey_macos_quartz_and_guards(self):
+        from src.forums.providers import desktop as desktop_mod
+
+        provider = desktop_mod.DesktopDiscordProvider()
+        recorded_events = []
+
+        class FakeQuartz:
+            kCGEventFlagMaskCommand = 0x100000
+            kCGHIDEventTap = 0
+
+            @staticmethod
+            def CGEventCreateKeyboardEvent(_src, keycode, is_down):
+                ev = {"keycode": keycode, "is_down": is_down, "flags": None}
+                return ev
+
+            @staticmethod
+            def CGEventSetFlags(ev, flags):
+                ev["flags"] = flags
+
+            @staticmethod
+            def CGEventPost(tap, ev):
+                recorded_events.append((tap, dict(ev)))
+
+        with patch.object(desktop_mod.sys, "platform", "darwin"), \
+             patch.object(desktop_mod, "Quartz", FakeQuartz), \
+             patch.object(desktop_mod.time, "sleep"):
+            provider._safe_hotkey("command", "v")
+            provider._safe_hotkey("command", "a")
+
+        self.assertEqual(
+            recorded_events,
+            [
+                (0, {"keycode": 0x09, "is_down": True, "flags": 0x100000}),
+                (0, {"keycode": 0x09, "is_down": False, "flags": 0x100000}),
+                (0, {"keycode": 0x00, "is_down": True, "flags": 0x100000}),
+                (0, {"keycode": 0x00, "is_down": False, "flags": 0x100000}),
+            ],
+        )
+
+        with self.assertRaises(RuntimeError):
+            provider._safe_hotkey("command", "return")
+
+        linux_calls = []
+        fake_gui = SimpleNamespace(hotkey=lambda *args: linux_calls.append(args))
+        with patch.object(desktop_mod.sys, "platform", "linux"), \
+             patch.object(desktop_mod, "pyautogui", fake_gui):
+            provider._safe_hotkey("ctrl", "v")
+        self.assertEqual(linux_calls, [("ctrl", "v")])
+
 
 class TestContractAlignmentSecurityAndCorrectness(unittest.TestCase):
     def test_baseline_conflict_checks_and_target_constraints(self):
